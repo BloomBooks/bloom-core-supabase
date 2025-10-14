@@ -1,0 +1,35 @@
+{
+  "name": "bloom-supabase-bloom-core",
+  "version": "1.0.0",
+  "description": "Bloom Core Supabase project (supabase-bloom-core)",
+  "scripts": {
+    "dev": "supabase start && yarn dev:functions",
+    "dev:debug": "supabase start && yarn dev:functions:debug",
+    "dev:functions": "supabase functions serve",
+    "dev:functions:debug": "supabase functions serve --inspect",
+    "stop": "supabase stop",
+    "restart": "bash scripts/clean-restart.sh",
+    "status": "supabase status",
+    "reset": "supabase db reset",
+    "deploy": "supabase functions deploy",
+    "deploy:fs": "supabase functions deploy fs",
+    "supabase": "supabase",
+    "test": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local",
+    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts",
+    "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local"
+  },
+  "keywords": [
+    "supabase",
+    "edge-functions",
+    "api"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.74.0",
+    "supabase": "^2.45.5"
+  },
+  "volta": {
+    "node": "22.20.0",
+    "yarn": "1.22.22"
+  }
+}
