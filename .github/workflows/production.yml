@@ -40,4 +40,4 @@ jobs:
       - name: Deploy Edge Functions to Production
         run: supabase functions deploy --project-ref ${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}
         env:
-          BLOOM_SUPABASE_ACCESS_TOKEN: ${{ secrets.BLOOM_SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.BLOOM_SUPABASE_ACCESS_TOKEN }}
