@@ -7,7 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  test-and-deploy:
+    name: Test and Deploy to Staging
     runs-on: ubuntu-latest
     
     steps:
@@ -31,24 +32,6 @@ jobs:
           BLOOM_PARSE_APP_ID_PROD: ${{ secrets.BLOOM_PARSE_APP_ID_PROD }}
           BLOOM_PARSE_APP_ID_DEV: ${{ secrets.BLOOM_PARSE_APP_ID_DEV }}
           BLOOM_PARSE_APP_ID_UNIT_TEST: ${{ secrets.BLOOM_PARSE_APP_ID_UNIT_TEST }}
-
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: test
-    environment:
-      name: staging
-      url: https://${{ secrets.BLOOM_SUPABASE_STAGING_PROJECT_ID }}.supabase.co
-    
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'yarn'
-
-      - run: yarn install --frozen-lockfile
 
       - uses: supabase/setup-cli@v1
         with:
