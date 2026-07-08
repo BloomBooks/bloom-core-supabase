@@ -1,0 +1,38 @@
+# Replaces the Azure timer trigger for bookCleanup (12:40 UTC daily).
+#
+# IMPORTANT: the schedule is commented out until the Azure bookCleanup timer is
+# disabled. Both versions delete abandoned-upload files and records, and running
+# both risks double-delete races on the same books. Sequence:
+#   1. Trigger this workflow manually with safeMode until output is trusted
+#      (compare with what the Azure run deletes).
+#   2. Disable the Azure timer.
+#   3. Uncomment the schedule below.
+#
+# Required repository secrets:
+#   BLOOM_SUPABASE_PRODUCTION_PROJECT_ID - the production Supabase project ref
+#   BLOOM_CRON_SECRET - shared secret; must match the function's BLOOM_CRON_SECRET
+
+name: "Cron: bookCleanup"
+
+on:
+  # schedule:
+  #   - cron: "40 12 * * *"
+  workflow_dispatch:
+    inputs:
+      safeMode:
+        description: "Safe mode: log what would be deleted without deleting"
+        type: boolean
+        default: true
+
+jobs:
+  invoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Invoke bookCleanup edge function
+        run: |
+          status=$(curl -s -o response.txt -w "%{http_code}" -X POST \
+            "https://${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}.supabase.co/functions/v1/bookCleanup?safeMode=${{ inputs.safeMode || 'false' }}" \
+            -H "x-bloom-cron-secret: ${{ secrets.BLOOM_CRON_SECRET }}")
+          echo "HTTP $status"
+          cat response.txt
+          test "$status" = "200"

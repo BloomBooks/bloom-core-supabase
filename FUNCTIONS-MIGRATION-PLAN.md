@@ -392,6 +392,12 @@ same daily 22:30 UTC schedule — but the port changed several things:
   Never run both live simultaneously (double-delete races on the same books).
 - Needs `BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_{PROD,DEV,UNIT_TEST}` and the
   `BLOOM_UPLOAD_PERMISSION_MANAGER_S3_*` secrets.
+- Status: **implemented** (`supabase/functions/bookCleanup/` + the full S3 helper port in
+  `_shared/s3.ts`). Invoked by GitHub Actions like the other timer, but the workflow's
+  `schedule:` is **deliberately commented out** — enable it only after safe-mode runs are
+  verified and the Azure timer is disabled (running both risks double-delete races). Safe mode
+  is a `?safeMode=true` query param (and the workflow_dispatch default) instead of Azure's
+  hardcoded constant.
 
 ### Phase 8 — `books` + `status` + the durable-function machinery (highest risk, do last)
 - The core book upload/query/delete API: Parse session-token auth, uploader/collection-editor/
