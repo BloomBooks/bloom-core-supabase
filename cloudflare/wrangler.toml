@@ -1,0 +1,40 @@
+# Wrangler config for the Bloom API routing worker.
+# Two deployments of the same script:
+#   Staging:    npx wrangler deploy --env staging
+#   Production: npx wrangler deploy
+# (or paste worker.js into the dashboard editor twice — see README.md)
+
+name = "bloom-api-router"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+routes = [
+  { pattern = "api.bloomlibrary.org/v1/*", zone_name = "bloomlibrary.org" },
+  # Phase 1 (social function) will add:
+  # { pattern = "social.bloomlibrary.org/v1/*", zone_name = "bloomlibrary.org" },
+]
+
+[vars]
+# Hostname of the PRODUCTION Supabase project's edge-functions endpoint.
+SUPABASE_FUNCTIONS_HOST = "sekpsuviwfhzzznzrdgx.supabase.co"
+# ORIGIN_HOST deliberately NOT set in production: non-migrated paths fall
+# through to the zone's existing origin config for api.bloomlibrary.org
+# (the Azure Functions app), exactly as today.
+
+# ---------------------------------------------------------------------------
+# Staging: same script on a test hostname, pointed at the STAGING Supabase
+# project. Deploy and verify this one first (see README.md).
+[env.staging]
+name = "bloom-api-router-staging"
+routes = [
+  { pattern = "staging-api.bloomlibrary.org/v1/*", zone_name = "bloomlibrary.org" },
+]
+
+[env.staging.vars]
+# The STAGING Supabase project (the one the `develop` branch deploys to);
+# same host the existing "supabase edge functions - staging" redirect rule
+# points at.
+SUPABASE_FUNCTIONS_HOST = "mwatyhkxsprxgnkcbalq.supabase.co"
+# The Azure Functions app (the DNS target of api.bloomlibrary.org). Needed on
+# staging so non-fs paths on staging-api.bloomlibrary.org reach Azure.
+ORIGIN_HOST = "bloom-functions.azurewebsites.net"
