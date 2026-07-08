@@ -87,6 +87,34 @@ export function getCorsHeaders(request: Request): Record<string, string> {
   return headers;
 }
 
+// Hostnames we are willing to present as our own public URL (see getPublicUrl).
+function isAllowedPublicHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "bloomlibrary.org" || host.endsWith(".bloomlibrary.org");
+}
+
+// When a request comes through the Cloudflare worker that fronts api.bloomlibrary.org,
+// the URL the function sees is the Supabase one
+// (https://<project>.supabase.co/functions/v1/<fn>...). The worker sets X-Forwarded-Host
+// to the original hostname; use it to reconstruct the public URL so that any URLs we
+// generate (og:url, OPDS links) don't leak the Supabase project URL.
+// Only bloomlibrary.org hostnames are honored: a caller who bypasses the worker and sets
+// X-Forwarded-Host itself must not be able to spoof an arbitrary domain into those URLs.
+export function getPublicUrl(request: Request): URL {
+  const url = new URL(request.url);
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  if (forwardedHost && isAllowedPublicHost(forwardedHost)) {
+    url.hostname = forwardedHost;
+    url.protocol = "https:";
+    url.port = "";
+    // /functions/v1/<fn> (Supabase) is /v1/<fn> on the public hostname
+    if (url.pathname.startsWith("/functions/v1/")) {
+      url.pathname = url.pathname.substring("/functions".length);
+    }
+  }
+  return url;
+}
+
 export function checkForRequiredEnvVars(envVars: string[]): void {
   const missing = envVars.filter((envVar) => !Deno.env.get(envVar));
   if (missing.length > 0) {

@@ -157,6 +157,11 @@ state, verification curls, and the per-function extension process.
 - Watch-outs: preserve exact OpenGraph output (test with Facebook's sharing debugger);
   `social.bloomlibrary.org` needs its own Cloudflare rule in addition to
   `api.bloomlibrary.org/v1/social`.
+- Status: **implemented** (`supabase/functions/social/`), awaiting staging verification and
+  worker cutover. Two deliberate changes from the Azure version: parameters are HTML-escaped
+  (the Azure version interpolated them raw — an injection vector), and `og:url` is
+  reconstructed from the `X-Forwarded-Host` header the routing worker now sends (otherwise it
+  would leak the Supabase URL).
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
