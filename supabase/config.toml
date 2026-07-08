@@ -343,6 +343,9 @@ BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD = "env(BLOOM_CONTENTFUL_TO_CROWDIN_ENA
 BLOOM_CRON_SECRET = "env(BLOOM_CRON_SECRET)"
 # opds function (value from Azure; name standardized — mapping in MIGRATION-PLAN.md)
 BLOOM_PARSE_CATALOG_SERVICE_PASSWORD = "env(BLOOM_PARSE_CATALOG_SERVICE_PASSWORD)"
+# books function (values from Azure; names standardized — mapping in MIGRATION-PLAN.md)
+BLOOM_PARSE_SUPER_USER_PASSWORD_PROD = "env(BLOOM_PARSE_SUPER_USER_PASSWORD_PROD)"
+BLOOM_PARSE_SUPER_USER_PASSWORD_DEV = "env(BLOOM_PARSE_SUPER_USER_PASSWORD_DEV)"
 # bookCleanup function (values from Azure; names standardized — mapping in MIGRATION-PLAN.md)
 BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_PROD = "env(BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_PROD)"
 BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_DEV = "env(BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_DEV)"
@@ -402,4 +405,10 @@ verify_jwt = false
 
 # Not a public API: requires the x-bloom-cron-secret header (see the function).
 [functions.bookCleanup]
+verify_jwt = false
+
+[functions.books]
+verify_jwt = false
+
+[functions.status]
 verify_jwt = false

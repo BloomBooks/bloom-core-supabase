@@ -1,3 +1,9 @@
+import {
+  getAllContentfulCollectionFiltersForUser,
+  IContentfulCollectionFilter,
+  kAllBooksFilter,
+  validateContentfulEnvironmentVariables,
+} from "./contentful.ts";
 import { Environment } from "./utils.ts";
 
 export type User = {
@@ -429,6 +435,111 @@ export default class BloomParseServer {
     return bookInfo.uploader.objectId === userInfo.objectId;
   }
 
+  public static bookMatchesAtLeastOneFilter(
+    bookInfo: Book,
+    filters: IContentfulCollectionFilter[]
+  ): boolean {
+    if (filters.includes(kAllBooksFilter)) return true;
+
+    // In theory, we could write more generic code to handle more (or all potential) use cases.
+    // (And basically duplicate much of the logic in BloomLibrary2's LibraryQueryHooks.ts.)
+    // But we expect the collections we list super-users for will always be defined using one of these two
+    // filters (tag or brandingProjectName).
+    // If we put a super-user on some other collection it will fail immediately and be easy to debug.
+    // Another advantage of this approach is that by just doing these two simple checks, we avoid
+    // another parse query because we're just taking a simple look at the information we already have
+    // in the bookInfo object.
+    for (let i = 0; i < filters.length; i++) {
+      const filter = filters[i] as Record<string, string>;
+      // By far, the most common filters are {tag: "bookshelf:someBookshelf"} or {tag: "list:someList"}
+      const tag = filter["tag"];
+      if (tag) {
+        if (bookInfo.tags && bookInfo.tags.includes(tag)) {
+          return true;
+        } else {
+          continue; // We didn't match the given tag, so we don't match the filter.
+        }
+      }
+      const brandingProjectName = filter["brandingProjectName"];
+      if (brandingProjectName) {
+        if (
+          bookInfo.brandingProjectName &&
+          bookInfo.brandingProjectName === brandingProjectName
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Check if user has permission to modify the book
+  // either due to being the uploader or having collection editor permission.
+  public static async isUploaderOrCollectionEditor(
+    userInfo: User,
+    bookInfo: Book
+  ) {
+    if (!bookInfo?.uploader) return false;
+
+    if (this.isUploader(userInfo, bookInfo)) return true;
+
+    if (!validateContentfulEnvironmentVariables()) {
+      // This will result in a 500 error, which is appropriate.
+      throw Error("Contentful environment variables are not set");
+    }
+
+    const filters = await getAllContentfulCollectionFiltersForUser(
+      userInfo.email
+    );
+
+    return BloomParseServer.bookMatchesAtLeastOneFilter(bookInfo, [...filters]);
+  }
+
+  public async isModerator(userInfo: User): Promise<boolean> {
+    const url = new URL(`${this.getParseUrlBase()}/roles`);
+    url.searchParams.append(
+      "where",
+      JSON.stringify({
+        name: "moderator",
+        users: {
+          __type: "Pointer",
+          className: "_User",
+          objectId: userInfo.objectId,
+        },
+      })
+    );
+    const response = await fetch(url.toString(), {
+      headers: {
+        "X-Parse-Application-Id": this.getParseAppId(),
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to check moderator role: ${response.statusText}`);
+    }
+    const data = await response.json();
+    return data?.results?.length > 0;
+  }
+
+  public static isValidDatabaseId(databaseId: string): boolean {
+    // Check that it's a valid database ID; 10-character alphanumeric string
+    return /^[0-9a-z]{10}$/i.test(databaseId);
+  }
+
+  public async getMinDesktopVersion(): Promise<string> {
+    const response = await fetch(this.getParseTableUrl("version"), {
+      headers: {
+        "X-Parse-Application-Id": this.getParseAppId(),
+      },
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to get min desktop version: ${response.statusText}`
+      );
+    }
+    const data = await response.json();
+    return data.results[0].minDesktopVersion;
+  }
+
   public async getLanguages() {
     const url = new URL(this.getParseTableUrl("language"));
     url.searchParams.append("limit", "10000");
@@ -737,7 +848,12 @@ export default class BloomParseServer {
     );
 
     if (!response.ok) {
-      throw new Error(`Failed to delete book record: ${response.statusText}`);
+      // carry the HTTP status so callers can distinguish a 404 (already deleted)
+      const error = new Error(
+        `Failed to delete book record: ${response.statusText}`
+      ) as Error & { status: number };
+      error.status = response.status;
+      throw error;
     }
 
     return await response.json();

@@ -414,6 +414,22 @@ same daily 22:30 UTC schedule — but the port changed several things:
   - keep the orchestration piece on Azure last, migrating the simple `books` GET/permissions
     endpoints first (the `books` routes can be split at Cloudflare by method/action if needed).
 - `status` migrates *with* this phase — it's meaningless apart from the orchestration store.
+- Status: **implemented** (`supabase/functions/books/`, `supabase/functions/status/`).
+  Orchestration design chosen: an `operations` table in this project's Postgres (this repo's
+  first migration) plus `EdgeRuntime.waitUntil` background work
+  (`_shared/longRunningOperations.ts`). The 202 + `Operation-Location` + poll-`status` contract
+  and response shapes are preserved exactly. Known differences from Azure Durable Functions,
+  accepted for now (fallback plan is Supabase Queues if they bite):
+  - background work is bounded by the edge runtime's wall clock (~400s) vs Azure's 10-minute
+    `functionTimeout` — could matter for very large book copies in `upload-start`;
+  - if the worker dies mid-operation the row stays `Running` forever (no retry), so Desktop
+    would poll until its own timeout.
+  Contentful editor-collections permission checks are ported with manual link resolution
+  (the REST API doesn't resolve entry links the way the SDK did). Requires the
+  `BLOOM_PARSE_SUPER_USER_PASSWORD_{PROD,DEV}` secrets and the migration
+  (`supabase db push`) before deployment. Cutover should still be staged: `books` GETs
+  (blorg queries) can be verified first, uploads exercised from a real Bloom Desktop against
+  staging before flipping production.
 - Both current Bloom Desktop releases and blorg depend on this; Desktop versions in the field
   can't be patched, so the API contract (including error shapes and `Operation-Location`
   headers) must be preserved exactly.
