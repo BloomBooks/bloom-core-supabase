@@ -323,6 +323,24 @@ same daily 22:30 UTC schedule — but the port changed several things:
 - Note: `stats/events.ts` builds some SQL by string interpolation with only a crude injection
   guard — fix that (parameterized queries) during the port rather than copying it.
 - Consumed by blorg's book-stats UI; low write risk, moderate visibility.
+- Status: **implemented** (`supabase/functions/stats/`, Postgres via `npm:pg`, same libpq env
+  vars as Azure, including `PGSSLMODE`). Three deliberate changes:
+  1. SQL is parameterized (fixing the injection-prone interpolation flagged above).
+  2. The function answers CORS preflights itself — Azure did CORS at the Functions-host level
+     (Azure portal → the function app → API → CORS; not in the repo), so blorg's JSON POST
+     would otherwise fail once proxied to Supabase. Where Azure's host config enumerated the
+     `*.bloomlibrary.org` subdomains individually, `_shared/utils.ts` allows `bloomlibrary.org`
+     and any https subdomain of it, so new subdomains don't need a config change; the
+     `functions.azure.com` / `portal.azure.com` entries were Azure portal tooling and were not
+     carried over.
+  3. Absent `branding`/`country` are sent as SQL NULL. Azure interpolated them into the SQL
+     string, sending the literal text `'undefined'`; the stored procedures are written as
+     `p_branding IS NULL OR ...` (see `analytics-postgreSQL/schemas/common/functions/`), so
+     `'undefined'` could only ever match nothing in the no-temp-table branch. NULL is what the
+     SQL was designed for; watch for result differences during staging verification.
+- Pre-cutover check: the analytics DB firewall (`bloom-analytics.postgres.database.azure.com`)
+  must accept connections from Supabase egress IPs; it may currently allowlist only Azure
+  services.
 
 ### Phase 6 — `dailyTimer` (small, but first *writing* function) ✅ done
 - One job: call `common.refresh_materialized_views()` in the analytics Postgres as the admin
@@ -421,8 +439,18 @@ api-spec, host/deploy config, READMEs — has been ported here or superseded):
   marker) so functions work both at their native Supabase URL and behind
   `api.bloomlibrary.org/v1/...`.
 - **Secrets:** each phase moves its secrets into Supabase project secrets (staging + prod) and
-  GitHub Actions secrets for CI. Full inventory is in the Azure repo (`local.settings.json`
-  keys); map naming to the `BLOOM_*` convention started here.
+  GitHub Actions secrets for CI. Where a secret already existed in Azure, its *value* is copied from the
+  Azure app settings, but the *name* here follows the standardized
+  `BLOOM_<SERVICE>_<WHAT>[_<ENV>]` convention instead of the Azure name. Provisioning checklist (all via
+  `supabase secrets set` on both projects; also listed per function in `.env.example` and
+  `supabase/config.toml`):
+
+  | Phase | Function | Secrets |
+  | --- | --- | --- |
+  | 2 | `subscriptionInfo` | `BLOOM_GOOGLE_SERVICE_ACCOUNT_EMAIL`, `BLOOM_GOOGLE_SERVICE_PRIVATE_KEY`, `BLOOM_SUBSCRIPTION_SPREADSHEET_ID` |
+  | 3 | `contentfulToCrowdin` | `BLOOM_CONTENTFUL_READ_ONLY_TOKEN`, `BLOOM_CROWDIN_API_TOKEN`, `BLOOM_CRON_SECRET` (new — any random string; must also be a **GitHub repo secret** for the cron workflow) |
+  | 4 | `opds` | `BLOOM_PARSE_CATALOG_SERVICE_PASSWORD` |
+  | 5 | `stats` | `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` (read-only analytics user) |
 - **JWT:** each new public function needs `verify_jwt = false` in `supabase/config.toml`
   (or an explicit auth design if we ever want Supabase-native auth).
 - **Testing:** keep the ported Jest tests as Deno tests (pattern established in

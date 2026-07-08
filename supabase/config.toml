@@ -343,6 +343,13 @@ BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD = "env(BLOOM_CONTENTFUL_TO_CROWDIN_ENA
 BLOOM_CRON_SECRET = "env(BLOOM_CRON_SECRET)"
 # opds function (value from Azure; name standardized — mapping in MIGRATION-PLAN.md)
 BLOOM_PARSE_CATALOG_SERVICE_PASSWORD = "env(BLOOM_PARSE_CATALOG_SERVICE_PASSWORD)"
+# stats function: analytics Postgres, standard libpq variables (read-only user)
+PGHOST = "env(PGHOST)"
+PGPORT = "env(PGPORT)"
+PGDATABASE = "env(PGDATABASE)"
+PGUSER = "env(PGUSER)"
+PGPASSWORD = "env(PGPASSWORD)"
+PGSSLMODE = "env(PGSSLMODE)"
 
 [analytics]
 enabled = true
@@ -378,4 +385,7 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.opds]
+verify_jwt = false
+
+[functions.stats]
 verify_jwt = false

@@ -32,6 +32,7 @@ const SUPABASE_FUNCTIONS = new Set([
   "social",
   "subscriptionInfo",
   "opds",
+  "stats",
 ]);
 
 // Fetch `url`, carrying over the incoming request's method, headers, and
