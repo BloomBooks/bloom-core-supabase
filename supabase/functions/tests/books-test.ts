@@ -237,3 +237,101 @@ Deno.test("books - OPTIONS preflight gets CORS headers", async () => {
     "https://bloomlibrary.org"
   );
 });
+
+// --- ported from the Azure parseAdapters.test.ts / books utils.test.ts ---
+
+Deno.test("books - getIdAndAction pathological cases", () => {
+  assertEquals(getIdAndAction(""), [null, null]);
+  assertEquals(getIdAndAction(":action"), [null, null]);
+});
+
+Deno.test("books - exact where strings for each query param", () => {
+  assertEquals(
+    convertApiQueryParamsIntoParseWhere({ lang: "en" }),
+    '{"langPointers":{"$inQuery":{"where":{"isoCode":{"$in":["en"]}},"className":"language"}}}'
+  );
+  assertEquals(
+    convertApiQueryParamsIntoParseWhere({ lang: "en,fr,de" }),
+    '{"langPointers":{"$inQuery":{"where":{"isoCode":{"$in":["en","fr","de"]}},"className":"language"}}}'
+  );
+  assertEquals(
+    convertApiQueryParamsIntoParseWhere({ uploader: "bob@example.com" }),
+    '{"uploader":{"$inQuery":{"where":{"email":{"$in":["bob@example.com"]}},"className":"_User"}}}'
+  );
+  assertEquals(
+    convertApiQueryParamsIntoParseWhere({
+      uploader: "bob@example.com,sue@ex.com",
+    }),
+    '{"uploader":{"$inQuery":{"where":{"email":{"$in":["bob@example.com","sue@ex.com"]}},"className":"_User"}}}'
+  );
+  assertEquals(
+    convertApiQueryParamsIntoParseWhere({
+      lang: "en",
+      uploader: "bob@example.com",
+    }),
+    '{"langPointers":{"$inQuery":{"where":{"isoCode":{"$in":["en"]}},"className":"language"}},"uploader":{"$inQuery":{"where":{"email":{"$in":["bob@example.com"]}},"className":"_User"}}}'
+  );
+});
+
+// the Azure fixture; note the raw newline inside the allTitles JSON string,
+// which exercises the lenient-parsing fallback
+const kAzureFixtureBook = {
+  objectId: "123",
+  title: "The Title",
+  allTitles: '{ "en": "The Title", "fr": "Le Titre\n"}',
+  langPointers: [
+    {
+      objectId: "456",
+      isoCode: "fr",
+      name: "français",
+      englishName: "French",
+      usageCount: 10,
+    },
+    {
+      objectId: "789",
+      isoCode: "en",
+      name: "English",
+      englishName: "English",
+      usageCount: 1,
+    },
+  ],
+  uploader: { objectId: "123", username: "bob@example.com" },
+} as any;
+
+Deno.test("books - reshape does not expand languages by default", () => {
+  const result = reshapeBookRecord(kAzureFixtureBook);
+  assertEquals(result["languages"], [{ tag: "fr" }, { tag: "en" }]);
+});
+
+Deno.test("books - reshape expands languages when asked", () => {
+  const result = reshapeBookRecord(kAzureFixtureBook, "languages");
+  assertEquals(result["languages"], [
+    {
+      id: "456",
+      tag: "fr",
+      name: "français",
+      englishName: "French",
+      usageCount: 10,
+    },
+    {
+      id: "789",
+      tag: "en",
+      name: "English",
+      englishName: "English",
+      usageCount: 1,
+    },
+  ]);
+});
+
+Deno.test("books - reshape creates titles from allTitles with raw newline", () => {
+  const result = reshapeBookRecord(kAzureFixtureBook);
+  assertEquals(result["titles"], [
+    { lang: "en", title: "The Title" },
+    { lang: "fr", title: "Le Titre\n" },
+  ]);
+});
+
+Deno.test("books - reshape returns properly shaped uploader object", () => {
+  const result = reshapeBookRecord(kAzureFixtureBook);
+  assertEquals(result["uploader"], { email: "bob@example.com" });
+});
