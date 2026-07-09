@@ -15,7 +15,8 @@
     "deploy:fs": "supabase functions deploy fs",
     "supabase": "supabase",
     "test": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local",
-    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts",
+    "test:secrets-optional": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local -- --secrets-optional",
+    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts -- --secrets-optional",
     "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local"
   },
   "keywords": [
