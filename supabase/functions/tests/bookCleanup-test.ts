@@ -96,3 +96,133 @@ Deno.test("bookCleanup - queries with a cutoff about one day ago", async () => {
   const expected = Date.now() - 24 * 60 * 60 * 1000;
   assert(Math.abs(cutoff - expected) < 60 * 1000); // within a minute
 });
+
+// --- Live end-to-end test against the unit-test Parse server and the      ---
+// --- BloomLibraryBooks-UnitTests bucket (ported from the Azure            ---
+// --- bookCleanup.test.ts). Skipped unless the required env vars are       ---
+// --- present.                                                             ---
+
+import BloomParseServer from "../_shared/BloomParseServer.ts";
+import {
+  deleteFilesByPrefix,
+  listPrefixContentsKeys,
+  uploadTestFileToS3,
+} from "../_shared/s3.ts";
+import { testRequiringSecrets } from "./testSecrets.ts";
+
+const kLiveCleanupSecrets = [
+  "BLOOM_PARSE_APP_ID_UNIT_TEST",
+  "BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_UNIT_TEST",
+  "BLOOM_UPLOAD_PERMISSION_MANAGER_S3_ACCESS_KEY_ID_UNIT_TEST",
+  "BLOOM_UPLOAD_PERMISSION_MANAGER_S3_SECRET_ACCESS_KEY_UNIT_TEST",
+];
+
+testRequiringSecrets({
+  name: "bookCleanup - live: cleans up old failed uploads, leaves recent and completed ones",
+  secrets: kLiveCleanupSecrets,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const env = Environment.UNITTEST;
+    const testBookInstanceId = "supabaseFunctionBookCleanupTests";
+    const oldTimestamp = Date.now() - 2 * 24 * 60 * 60 * 1000; // 2 days ago
+    const recentTimestamp = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
+
+    const parseServer = new BloomParseServer(env);
+    const sessionToken = await parseServer.loginAsUser(
+      "unittest@example.com",
+      "unittest"
+    );
+
+    const makeBookEntry = (
+      title: string,
+      uploadPendingTimestamp: number,
+      baseUrl?: string
+    ) => ({
+      title,
+      bookInstanceId: testBookInstanceId,
+      updateSource: "SupabaseFunctionsUnitTest",
+      uploadPendingTimestamp,
+      inCirculation: false,
+      uploader: {
+        __type: "Pointer",
+        className: "_User",
+        objectId: "testUserId",
+      },
+      ...(baseUrl ? { baseUrl } : {}),
+    });
+
+    const cleanupParse = async () => {
+      const remaining = (
+        await parseServer.getBooks(
+          `{"bookInstanceId":{"$eq":"${testBookInstanceId}"}}`
+        )
+      ).books;
+      for (const book of remaining) {
+        await parseServer.deleteBookRecord(book.objectId, sessionToken);
+      }
+    };
+
+    const bookIds: string[] = [];
+    try {
+      await cleanupParse();
+
+      // A: old failed upload of a new book -> record and files deleted
+      // B: recent incomplete upload of a new book -> untouched
+      // C: old failed re-upload of an existing book -> timestamp cleared,
+      //    pending files deleted, original files kept
+      const entries = [
+        makeBookEntry("unit test book A", oldTimestamp),
+        makeBookEntry("unit test book B", recentTimestamp),
+        makeBookEntry(
+          "unit test book C",
+          oldTimestamp,
+          "https://s3.amazonaws.com/BloomLibraryBooks/testBookId/someTimestamp/"
+        ),
+      ];
+      for (const entry of entries) {
+        const bookId = await parseServer.createBookRecord(entry, sessionToken);
+        assert(bookId);
+        bookIds.push(bookId);
+        await uploadTestFileToS3(
+          `${bookId}/${entry.uploadPendingTimestamp}`,
+          env
+        );
+      }
+      const [idA, idB, idC] = bookIds;
+      // book C imitates a preexisting book getting modified; upload an "old"
+      // book file to make sure it doesn't get deleted
+      await uploadTestFileToS3(`${idC}/someOtherTimestamp`, env);
+
+      await bookCleanupInternal(env, false, () => {});
+
+      // A: gone entirely
+      assertEquals(await parseServer.getBookByDatabaseId(idA), undefined);
+      assertEquals((await listPrefixContentsKeys(idA, env)).length, 0);
+
+      // B: untouched
+      const bookB = await parseServer.getBookByDatabaseId(idB);
+      assert(bookB);
+      assert(bookB!.uploadPendingTimestamp);
+      assert((await listPrefixContentsKeys(idB, env)).length > 0);
+
+      // C: record kept without the timestamp; pending files gone; originals kept
+      const bookC = await parseServer.getBookByDatabaseId(idC);
+      assert(bookC);
+      assert(!bookC!.uploadPendingTimestamp);
+      assertEquals(
+        (await listPrefixContentsKeys(`${idC}/${oldTimestamp}`, env)).length,
+        0
+      );
+      assert(
+        (await listPrefixContentsKeys(`${idC}/someOtherTimestamp`, env)).length >
+          0
+      );
+    } finally {
+      await cleanupParse();
+      for (const bookId of bookIds) {
+        await deleteFilesByPrefix(bookId, Environment.UNITTEST);
+      }
+    }
+  },
+});
