@@ -44,12 +44,17 @@ All values are pre-filled in `wrangler.toml`; the Azure Functions app is
 
 ### Stage 1 — staging worker (no live traffic affected)
 
-1. **Create the worker**: Workers & Pages → Create → name it `bloom-api-router-staging` → paste
-   the contents of `worker.js` (it's an ES-module worker) → Deploy.
+1. **Create the worker**. Worker scripts live at the *account* level, not the zone — from
+   inside the `bloomlibrary.org` zone, click the account name in the breadcrumb (or the
+   "Manage Workers" button on the zone's Workers Routes page). Then: **Workers & Pages →
+   Create application → Workers tab → Create Worker** → name it `bloom-api-router-staging` →
+   **Deploy** the starter (code can't be pasted at this step) → **Edit code** → replace the
+   starter with the contents of `worker.js` (it's an ES-module worker) → **Save and deploy**.
 2. **Variables** (worker → Settings → Variables and Secrets, plaintext):
    - `SUPABASE_FUNCTIONS_HOST` = `mwatyhkxsprxgnkcbalq.supabase.co` (staging Supabase project)
    - `ORIGIN_HOST` = `bloom-functions.azurewebsites.net`
-3. **Route**: add `staging-api.bloomlibrary.org/v1/*` on zone `bloomlibrary.org`.
+3. **Route**: add `staging-api.bloomlibrary.org/v1/*` on zone `bloomlibrary.org`
+   (zone sidebar → **Workers Routes** → Add route, or the worker's Settings → Domains & Routes).
    (The DNS record for that hostname already exists — the staging redirect rule uses it.)
 4. **Disable or delete the Redirect Rule named `supabase edge functions - staging`.** This is
    required: Redirect Rules execute before Workers in Cloudflare's traffic sequence, so while
@@ -61,7 +66,9 @@ All values are pre-filled in `wrangler.toml`; the Azure Functions app is
 
 ```bash
 # fs proxied to staging Supabase: expect HTTP 200 PNG, no 302, no supabase.co in headers
-curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/fs/dev-harvest/U4KS7uOBBC/thumbnails/thumbnail-256.png"
+# (dev-harvest serves *dev* data; if this returns 400, the example book was deleted from the
+# dev site — substitute any book id from dev.bloomlibrary.org)
+curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
 
 # Range request through the proxy: expect HTTP 206
 curl -sD - -o /dev/null -H "Range: bytes=0-1023" "https://staging-api.bloomlibrary.org/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
@@ -73,7 +80,7 @@ curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/subscriptionInf
 
 ### Stage 2 — production worker (after staging is confirmed)
 
-1. **Create the worker**: same script, named `bloom-api-router`.
+1. **Create the worker**: same steps as Stage 1, same script, named `bloom-api-router`.
 2. **Variable**: `SUPABASE_FUNCTIONS_HOST` = `sekpsuviwfhzzznzrdgx.supabase.co`
    (the production Supabase project; same host the current production redirect rule points at).
    **Do NOT set `ORIGIN_HOST` on production** — non-migrated paths must fall through to the

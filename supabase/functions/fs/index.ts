@@ -1,7 +1,7 @@
 import BookData, { ContentUrlParams } from "./BookData.ts";
 
 // This function allows us to request a file in a book on S3 without knowing [it is on s3, who the uploader is, etc].
-// Example use: https://api.bloomlibrary.org/v1/fs/dev-harvest/U4KS7uOBBC/thumbnails/thumbnail-256.png
+// Example use: https://api.bloomlibrary.org/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png
 Deno.serve(async (req: Request) => {
   // Parse the URL to extract path parameters
   // Expected URL format: /fs/{bucket}/{bookid}/{path segments...}
