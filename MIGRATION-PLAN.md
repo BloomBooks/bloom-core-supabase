@@ -5,7 +5,8 @@ This document is the plan for migrating the Bloom Library API from
 Node/TypeScript) to this repo (Supabase Edge Functions, Deno/TypeScript).
 
 Status as of July 2026: **`fs` is migrated** (this repo's first function) and serving production
-traffic. Everything else still runs on Azure.
+traffic through the proxying Cloudflare Worker (Phase 0.5, deployed 2026-07-10). Everything
+else still runs on Azure.
 
 ---
 
@@ -52,7 +53,11 @@ All clients call `https://api.bloomlibrary.org/v1/<function>`. Known consumers:
 
 ## 2. The Cloudflare situation
 
-**What we know (verified by inspecting live traffic, 2026-07-08):**
+> **2026-07-10 update:** the 302 Redirect Rules described below have since been replaced by
+> the proxying Worker (Phase 0.5 ✅ — see Appendix A for the current routing). This section is
+> kept as background on why the replacement was necessary.
+
+**What we knew (verified by inspecting live traffic, 2026-07-08):**
 
 - All `api.bloomlibrary.org` traffic goes through Cloudflare.
 - **The `fs` split is a redirect ("forwarding"), not a proxy.** It is implemented as two
@@ -82,9 +87,9 @@ the redirect with a true proxy before migrating anything beyond `fs`.**
 (needed for Phase 1); everything else is now documented in Appendix A.
 
 This routing layer is the cutover/rollback lever for the whole migration: each function migrates
-by adding one path rule, and rolls back by deleting it. It is currently not version-controlled
-anywhere — at minimum keep Appendix A current; consider moving the logic into a Cloudflare Worker
-managed by Wrangler in a repo so it's reviewable.
+by adding one entry to the worker's `SUPABASE_FUNCTIONS` list, and rolls back by removing it.
+It is version-controlled in [`cloudflare/worker.js`](cloudflare/worker.js) (deployed by the ops
+team); keep Appendix A current as routes change.
 
 ### §2a. Why the current redirect approach must change before Phase 1+
 
@@ -114,11 +119,12 @@ ever see, preserve method/headers/CORS semantics, and give us a per-path routing
 version-control with Wrangler. Migrating `fs` from the 302 rule into that Worker is the proof
 step, and becomes **Phase 0.5** — a prerequisite for every later phase.
 
-**The worker is written and ready to hand off**: code, Wrangler config, and step-by-step
-deployment/verification/rollback instructions for the ops team are in
-[`cloudflare/`](cloudflare/README.md). (The dev team has only domain-level Cloudflare
-permissions, so the ops team must deploy it; each later phase is a one-line change to the
-worker's routing list.)
+**The worker is deployed (2026-07-10)**: `bloom-api-router-staging` and `bloom-api-router`
+are live on `staging-api.bloomlibrary.org/v1/*` and `api.bloomlibrary.org/v1/*`, currently
+routing only `fs` to Supabase. Code, Wrangler config, current state, and
+verification/rollback instructions are in [`cloudflare/`](cloudflare/README.md). (The dev
+team has only domain-level Cloudflare permissions, so the ops team deploys changes; each
+later phase is a one-line change to the worker's routing list, staging worker first.)
 
 ---
 
@@ -132,15 +138,18 @@ rule; timers roll back by re-enabling the Azure timer).
 Serving production. Remaining follow-ups: document the Cloudflare rule (Appendix A), and confirm
 Azure `fs` traffic has actually dropped to zero before deleting the Azure function.
 
-### Phase 0.5 — Replace the 302 redirects with a proxying Worker (prerequisite)
+### Phase 0.5 — Replace the 302 redirects with a proxying Worker ✅ done
 Stand up the Cloudflare Worker described in §2a in two stages: first replace the **staging**
 redirect rule (`staging-api.bloomlibrary.org` → staging Supabase project) and verify proxying
 behavior there (headers, range requests, caching, Azure fall-through); then replace the
 production rule on `api.bloomlibrary.org`. Every subsequent phase is then "add a path to the
 Worker's routing table," rolled out staging-first the same way.
 
-Status: **worker written, awaiting ops deployment** — see [`cloudflare/`](cloudflare/README.md)
-for the code and the ops handoff instructions (deploy steps, verification curls, rollback).
+Status: **✅ deployed by ops 2026-07-10** — both workers live, routing only `fs` for now; both
+redirect rules disabled (kept for rollback). Verified staging and production: 200 PNG through
+the proxy with no 302, 206 on Range requests, and Azure fall-through intact
+(`Request-Context` header present). See [`cloudflare/`](cloudflare/README.md) for current
+state, verification curls, and the per-function extension process.
 
 ### Phase 1 — `social` (trivial, no dependencies)
 - Pure HTML generation with a `bloomlibrary.org` domain allow-list; no external services, no
@@ -287,11 +296,13 @@ any credentials that lived in Azure app settings, archive the repo with a pointe
 
 ## Appendix A — Cloudflare routing rules
 
-Rule definitions confirmed from the Cloudflare dashboard + live traffic, 2026-07-08.
+Confirmed from the Cloudflare dashboard + live traffic. Updated 2026-07-10, when the Workers
+replaced the 302 Redirect Rules (Phase 0.5).
 
 | Hostname / path | Mechanism | Destination | Notes |
 | --- | --- | --- | --- |
-| `api.bloomlibrary.org/v1/fs/*` | Redirect Rule `supabase edge functions` — **302** | `https://sekpsuviwfhzzznzrdgx.supabase.co/functions/v1/fs/*` (prod Supabase) | path rewritten `/v1/` → `/functions/v1/` via `concat(...)`; to be replaced by proxying Worker (Phase 0.5) |
-| `staging-api.bloomlibrary.org/v1/fs/*` | Redirect Rule `supabase edge functions - staging` — **302** | `https://mwatyhkxsprxgnkcbalq.supabase.co/functions/v1/fs/*` (staging Supabase) | to be replaced by the staging Worker first (Phase 0.5, Stage 1) |
-| `api.bloomlibrary.org/*` (rest) | proxied DNS record | `bloom-functions.azurewebsites.net` (Azure Functions app) | Azure `Request-Context` header visible in responses |
+| `api.bloomlibrary.org/v1/*` | Worker `bloom-api-router` — server-side **proxy** | `fs` → `sekpsuviwfhzzznzrdgx.supabase.co` (prod Supabase); everything else falls through to the zone origin (Azure) | path rewritten `/v1/<fn>` → `/functions/v1/<fn>` in [`cloudflare/worker.js`](cloudflare/worker.js) |
+| `staging-api.bloomlibrary.org/v1/*` | Worker `bloom-api-router-staging` — **proxy** | `fs` → `mwatyhkxsprxgnkcbalq.supabase.co` (staging Supabase); everything else → Azure via `ORIGIN_HOST` | same script as production |
+| *(disabled)* Redirect Rules `supabase edge functions` / `... - staging` | **302** on `/v1/fs/*` | prod / staging Supabase | disabled 2026-07-10; kept in the dashboard for instant rollback |
+| `api.bloomlibrary.org/*` (rest) | proxied DNS record | `bloom-functions.azurewebsites.net` (Azure Functions app) | Azure `Request-Context` header visible in responses; the Worker's fall-through relies on this record |
 | `social.bloomlibrary.org/*` | not yet inspected | Azure `social` function | needs updating in Phase 1 |

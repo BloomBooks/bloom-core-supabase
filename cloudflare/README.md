@@ -9,22 +9,28 @@ need you to deploy it. Contact: andrew_polk@sil.org.
 Bloom Library is migrating its API (`api.bloomlibrary.org/v1/*`) from Azure Functions to
 Supabase Edge Functions, one function at a time (full plan: [`../MIGRATION-PLAN.md`](../MIGRATION-PLAN.md)).
 
-Today the split is done with two **Redirect Rules** (Rules → Redirect Rules on the
-`bloomlibrary.org` zone):
-
-| Rule name | Match | Action |
-| --- | --- | --- |
-| `supabase edge functions` | host `api.bloomlibrary.org`, path starts with `/v1/fs/` | 302 to `https://sekpsuviwfhzzznzrdgx.supabase.co/functions/v1/fs/...` |
-| `supabase edge functions - staging` | host `staging-api.bloomlibrary.org`, path starts with `/v1/fs/` | 302 to `https://mwatyhkxsprxgnkcbalq.supabase.co/functions/v1/fs/...` |
-
-All other `/v1/*` traffic is reverse-proxied to the Azure Functions app. The 302 approach
-happens to work for `fs` (public, GET-only) but will break the functions we migrate next: CORS
-preflights can't follow redirects, 302 turns POST into GET, and auth headers get dropped on
-cross-origin redirects.
-
-This worker replaces those redirects with a **proxy**: requests for migrated functions are
-fetched from Supabase server-side and the response is returned on the bloomlibrary.org
+This worker is the routing layer for that migration: requests for migrated functions are
+**proxied** server-side to Supabase and the response is returned on the bloomlibrary.org
 hostname; everything else passes through to the Azure origin exactly as before.
+
+## Current state — deployed 2026-07-10 ✅
+
+Both workers are live:
+
+| Worker | Route | `SUPABASE_FUNCTIONS_HOST` | `ORIGIN_HOST` |
+| --- | --- | --- | --- |
+| `bloom-api-router-staging` | `staging-api.bloomlibrary.org/v1/*` | `mwatyhkxsprxgnkcbalq.supabase.co` (staging project) | `bloom-functions.azurewebsites.net` |
+| `bloom-api-router` | `api.bloomlibrary.org/v1/*` | `sekpsuviwfhzzznzrdgx.supabase.co` (production project) | (not set — falls through to the zone's origin) |
+
+Both currently route **only `fs`** to Supabase; all other `/v1/*` traffic still goes to the
+Azure Functions app. Each function we migrate is a one-line addition — see
+[Ongoing changes](#ongoing-changes-adding-a-function) below.
+
+The workers replaced two 302 **Redirect Rules** (`supabase edge functions` and
+`supabase edge functions - staging`, now disabled but kept in the dashboard for rollback).
+The 302 approach happened to work for `fs` (public, GET-only) but would have broken the
+functions migrating next: CORS preflights can't follow redirects, 302 turns POST into GET, and
+auth headers get dropped on cross-origin redirects.
 
 ## Files
 
@@ -32,12 +38,13 @@ hostname; everything else passes through to the Azure origin exactly as before.
 - [`wrangler.toml`](wrangler.toml) — config if you deploy with Wrangler; also the reference for
   the routes/variables listed below if you use the dashboard
 
-## Rollout: staging first, then production
+## How they were deployed (reference)
 
-The same script is deployed twice. **Stage 1** replaces the staging redirect rule on
+Completed 2026-07-10; kept for reference (e.g. re-creating a worker from scratch). The same
+script is deployed twice. **Stage 1** replaced the staging redirect rule on
 `staging-api.bloomlibrary.org` with the worker, pointed at our *staging* Supabase project, where
-we verify the proxying behavior without touching live traffic. Only after we confirm it do we do
-**Stage 2** on `api.bloomlibrary.org`.
+we verified the proxying behavior without touching live traffic; **Stage 2** then did the same
+on `api.bloomlibrary.org`. The verification curls remain useful any time a worker changes.
 
 All values are pre-filled in `wrangler.toml`; the Azure Functions app is
 `bloom-functions.azurewebsites.net` (the DNS target of `api.bloomlibrary.org`).
@@ -117,9 +124,9 @@ Also load https://bloomlibrary.org and confirm book thumbnails render (they come
 - **Staging**: remove the route and re-enable the `supabase edge functions - staging` rule.
   No live traffic either way.
 
-## Ongoing changes (heads-up)
+## Ongoing changes: adding a function
 
-Each future migration phase is a one-line change to the `SUPABASE_FUNCTIONS` list in
+Each migration phase is a one-line change to the `SUPABASE_FUNCTIONS` list in
 `worker.js` plus a redeploy — staging worker first, production after we verify. Phase 1 will
 also add the route `social.bloomlibrary.org/v1/*` (that hostname currently routes to Azure). If
 it's possible to give the dev team deploy rights scoped to just these two workers (or a CI API
