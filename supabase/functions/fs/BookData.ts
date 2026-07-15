@@ -7,34 +7,32 @@ export interface ContentUrlParams {
   pathSegments: string[];
 }
 
+// The bucket names accepted in fs URLs, mapped to the real S3 bucket and the
+// Parse environment whose book records point into it.
+const kBuckets = new Map<
+  string,
+  { s3Bucket: string; environment: Environment }
+>([
+  ["upload", { s3Bucket: "BloomLibraryBooks", environment: Environment.PRODUCTION }],
+  ["dev-upload", { s3Bucket: "BloomLibraryBooks-Sandbox", environment: Environment.DEVELOPMENT }],
+  ["harvest", { s3Bucket: "bloomharvest", environment: Environment.PRODUCTION }],
+  ["dev-harvest", { s3Bucket: "bloomharvest-sandbox", environment: Environment.DEVELOPMENT }],
+]);
+
+export function isValidBucket(bucketKey: string): boolean {
+  return kBuckets.has(bucketKey);
+}
+
 export default class BookData {
   // Get the real URL for the content based on the input URL parameters.
   public static async getContentUrl(
     params: ContentUrlParams
   ): Promise<string | null> {
-    const bucketKey = params.bucket;
-    let s3Bucket: string;
-    let environment: Environment;
-    switch (bucketKey) {
-      case "upload":
-        s3Bucket = "BloomLibraryBooks";
-        environment = Environment.PRODUCTION;
-        break;
-      case "dev-upload":
-        s3Bucket = "BloomLibraryBooks-Sandbox";
-        environment = Environment.DEVELOPMENT;
-        break;
-      case "harvest":
-        s3Bucket = "bloomharvest";
-        environment = Environment.PRODUCTION;
-        break;
-      case "dev-harvest":
-        s3Bucket = "bloomharvest-sandbox";
-        environment = Environment.DEVELOPMENT;
-        break;
-      default:
-        return null;
+    const bucketInfo = kBuckets.get(params.bucket);
+    if (!bucketInfo) {
+      return null;
     }
+    const { s3Bucket, environment } = bucketInfo;
 
     const parseServer = new BloomParseServer(environment);
     const bookInfo: Book | undefined = await parseServer.getBookByDatabaseId(

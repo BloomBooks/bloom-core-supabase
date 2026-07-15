@@ -9,6 +9,7 @@ import { Environment } from "../_shared/utils.ts";
 const testUpdateSource = "SupabaseFunctionsUnitTest";
 
 const testBookInstanceId = "supabaseFunctionBloomParseServerTests";
+const testBookCountInstanceId = "testGetBookCountByLanguage";
 
 // Every test in this file talks to live Parse servers.
 const kRequiredSecrets = [
@@ -29,11 +30,20 @@ const setupTests = async () => {
   myUserId = userInfo!.objectId;
 };
 
-// Cleanup function to run after all tests
+// Cleanup function to run after all tests.
+// Matches on bookInstanceId as well as updateSource because the cloud-code
+// test's book ends up with a "BloomDesktop ..." updateSource and would
+// otherwise be left behind on the unittest server after every run.
 const cleanupTests = async () => {
   const testBooks = (
     await parseServer.getBooks(
-      `{"updateSource":{"$eq":"${testUpdateSource}"}}`,
+      JSON.stringify({
+        $or: [
+          { updateSource: testUpdateSource },
+          { bookInstanceId: testBookInstanceId },
+          { bookInstanceId: testBookCountInstanceId },
+        ],
+      }),
     )
   ).books;
 
@@ -209,7 +219,7 @@ testRequiringSecrets({
     );
     const oldBooksWithTestLang = (
       await parseServer.getBooks(
-        `{"langPointers":{"$in":[{"__type":"Pointer","className":"language","objectId":"${testLangParams.isoCode}"}]}}`,
+        `{"langPointers":{"$in":[{"__type":"Pointer","className":"language","objectId":"${testLanguageId}"}]}}`,
       )
     ).books;
 
@@ -221,13 +231,17 @@ testRequiringSecrets({
     for (let i = 0; i < 3; i++) {
       const newBookRecord = {
         title: `testGetBookCountByLanguage book ${i}`,
-        bookInstanceId: "testGetBookCountByLanguage",
+        bookInstanceId: testBookCountInstanceId,
         updateSource: `${testUpdateSource}`,
         uploader: {
           __type: "Pointer",
           className: "_User",
           objectId: myUserId,
         },
+        // getBookCountByLanguage only counts books where these are set this way
+        inCirculation: true,
+        rebrand: false,
+        draft: false,
         langPointers: [
           {
             __type: "Pointer",
