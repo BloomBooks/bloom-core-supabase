@@ -2,12 +2,20 @@ import { assert, assertEquals, assertExists } from "jsr:@std/assert@1";
 import "jsr:@std/dotenv/load";
 
 import BloomParseServer from "../_shared/BloomParseServer.ts";
+import { testRequiringSecrets } from "./testSecrets.ts";
 import { Environment } from "../_shared/utils.ts";
 
 // A common updateSource used to delete books after tests run:
 const testUpdateSource = "SupabaseFunctionsUnitTest";
 
 const testBookInstanceId = "supabaseFunctionBloomParseServerTests";
+const testBookCountInstanceId = "testGetBookCountByLanguage";
+
+// Every test in this file talks to live Parse servers.
+const kRequiredSecrets = [
+  "BLOOM_PARSE_APP_ID_UNIT_TEST",
+  "BLOOM_PARSE_APP_ID_PROD",
+];
 
 let parseServer: BloomParseServer;
 let token: string;
@@ -22,11 +30,20 @@ const setupTests = async () => {
   myUserId = userInfo!.objectId;
 };
 
-// Cleanup function to run after all tests
+// Cleanup function to run after all tests.
+// Matches on bookInstanceId as well as updateSource because the cloud-code
+// test's book ends up with a "BloomDesktop ..." updateSource and would
+// otherwise be left behind on the unittest server after every run.
 const cleanupTests = async () => {
   const testBooks = (
     await parseServer.getBooks(
-      `{"updateSource":{"$eq":"${testUpdateSource}"}}`,
+      JSON.stringify({
+        $or: [
+          { updateSource: testUpdateSource },
+          { bookInstanceId: testBookInstanceId },
+          { bookInstanceId: testBookCountInstanceId },
+        ],
+      }),
     )
   ).books;
 
@@ -41,12 +58,14 @@ const testLangParams = {
   ethnologueCode: "baz",
 };
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name: "BloomParseServer - Setup",
   fn: setupTests,
 });
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name:
     "BloomParseServer - getLanguages() returns a reasonable number of languages",
   fn: async () => {
@@ -63,7 +82,8 @@ Deno.test({
 // This is actually testing parse cloud code; we didn't find a good way to test the logic there.
 // Originally, this test lived in BloomDesktop but we moved it here so we could get rid of all traces of parse server from the editor.
 // Eventually, we will likely move the code which handles setting the tag and harvestState out of cloud code into uploadFinish. But we can't do that until all upload clients are using the API.
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name:
     "BloomParseServer - parse cloud code sets system:Incoming and harvestState",
   fn: async () => {
@@ -107,7 +127,8 @@ Deno.test({
   },
 });
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name:
     "BloomParseServer - successfully creates, modifies, and deletes Book records",
   fn: async () => {
@@ -161,7 +182,8 @@ Deno.test({
   },
 });
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name: "BloomParseServer - can get, create and delete languages",
   fn: async () => {
     const testLangParamString = JSON.stringify(testLangParams);
@@ -187,7 +209,8 @@ Deno.test({
   },
 });
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name:
     "BloomParseServer - getBookCountByLanguage returns expected number of books",
   fn: async () => {
@@ -196,7 +219,7 @@ Deno.test({
     );
     const oldBooksWithTestLang = (
       await parseServer.getBooks(
-        `{"langPointers":{"$in":[{"__type":"Pointer","className":"language","objectId":"${testLangParams.isoCode}"}]}}`,
+        `{"langPointers":{"$in":[{"__type":"Pointer","className":"language","objectId":"${testLanguageId}"}]}}`,
       )
     ).books;
 
@@ -208,13 +231,17 @@ Deno.test({
     for (let i = 0; i < 3; i++) {
       const newBookRecord = {
         title: `testGetBookCountByLanguage book ${i}`,
-        bookInstanceId: "testGetBookCountByLanguage",
+        bookInstanceId: testBookCountInstanceId,
         updateSource: `${testUpdateSource}`,
         uploader: {
           __type: "Pointer",
           className: "_User",
           objectId: myUserId,
         },
+        // getBookCountByLanguage only counts books where these are set this way
+        inCirculation: true,
+        rebrand: false,
+        draft: false,
         langPointers: [
           {
             __type: "Pointer",
@@ -233,7 +260,8 @@ Deno.test({
   },
 });
 
-Deno.test({
+testRequiringSecrets({
+  secrets: kRequiredSecrets,
   name: "BloomParseServer - Cleanup",
   fn: cleanupTests,
 });

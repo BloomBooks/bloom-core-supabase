@@ -8,14 +8,15 @@
     "dev:functions": "supabase functions serve",
     "dev:functions:debug": "supabase functions serve --inspect",
     "stop": "supabase stop",
-    "restart": "bash scripts/clean-restart.sh",
+    "restart": "supabase stop && supabase start",
     "status": "supabase status",
     "reset": "supabase db reset",
     "deploy": "supabase functions deploy",
     "deploy:fs": "supabase functions deploy fs",
     "supabase": "supabase",
     "test": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local",
-    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts",
+    "test:secrets-optional": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local -- --secrets-optional",
+    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts -- --secrets-optional",
     "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local"
   },
   "keywords": [

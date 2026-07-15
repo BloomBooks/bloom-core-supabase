@@ -7,6 +7,7 @@ import {
   getEnvironment,
   getNumberFromQuery,
   getBooleanFromQueryAsOneOrZero,
+  isAllowedCorsOrigin,
 } from "../_shared/utils.ts";
 
 // Test setDefaultEnvironment and getEnvironment
@@ -53,6 +54,16 @@ Deno.test({
   name: "utils - getEnvironment returns default when env param not in request",
   fn: () => {
     const request = new Request("http://localhost:54321?other=value");
+    assertEquals(getEnvironment(request), Environment.PRODUCTION);
+  },
+});
+
+Deno.test({
+  name: "utils - getEnvironment rejects unknown env values, using the default",
+  fn: () => {
+    // An arbitrary string must not leak through the Environment cast; it
+    // should be treated the same as no env param at all.
+    const request = new Request("http://localhost:54321?env=bogus");
     assertEquals(getEnvironment(request), Environment.PRODUCTION);
   },
 });
@@ -140,6 +151,31 @@ Deno.test({
 
     const params2 = new URLSearchParams("active=FALSE");
     assertEquals(getBooleanFromQueryAsOneOrZero(params2, "active"), undefined);
+  },
+});
+
+// Test isAllowedCorsOrigin
+Deno.test({
+  name: "utils - isAllowedCorsOrigin allows bloomlibrary.org and subdomains over https",
+  fn: () => {
+    assertEquals(isAllowedCorsOrigin("https://bloomlibrary.org"), true);
+    assertEquals(isAllowedCorsOrigin("https://embed.bloomlibrary.org"), true);
+    assertEquals(isAllowedCorsOrigin("https://a.b.bloomlibrary.org"), true);
+    assertEquals(isAllowedCorsOrigin("https://BloomLibrary.org"), true);
+  },
+});
+
+Deno.test({
+  name: "utils - isAllowedCorsOrigin rejects other origins",
+  fn: () => {
+    assertEquals(isAllowedCorsOrigin("https://example.com"), false);
+    // suffix attack: ends with bloomlibrary.org but is a different domain
+    assertEquals(isAllowedCorsOrigin("https://evilbloomlibrary.org"), false);
+    // https only
+    assertEquals(isAllowedCorsOrigin("http://bloomlibrary.org"), false);
+    // malformed Origin header must not throw
+    assertEquals(isAllowedCorsOrigin("not a url"), false);
+    assertEquals(isAllowedCorsOrigin(""), false);
   },
 });
 

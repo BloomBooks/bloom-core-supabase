@@ -63,7 +63,7 @@ Streams book files from S3 without exposing bucket details.
 **Example**:
 ```bash
 # Get thumbnail
-curl "http://localhost:54321/functions/v1/fs/dev-harvest/U4KS7uOBBC/thumbnails/thumbnail-256.png"
+curl "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
 
 # Download book (streams, no buffering)
 curl "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub

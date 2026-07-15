@@ -127,7 +127,7 @@ export default class BloomParseServer {
     fieldsToExpand: string[] = []
   ): Promise<Book | undefined> {
     return await this.getBook(
-      `{"objectId":{"$eq":"${objectId}"}}`,
+      JSON.stringify({ objectId: { $eq: objectId } }),
       fieldsToExpand
     );
   }
@@ -201,7 +201,7 @@ export default class BloomParseServer {
     const env = (globalThis as any).Deno?.env;
     return await this.loginAsUser(
       "catalog-service",
-      env?.get("bloomParseServerCatalogServicePassword") // should be the same for dev and production
+      env?.get("BLOOM_PARSE_CATALOG_SERVICE_PASSWORD") // should be the same for dev and production
     );
   }
 
@@ -233,13 +233,13 @@ export default class BloomParseServer {
     let password;
     switch (this.environment) {
       case Environment.PRODUCTION:
-        password = Deno.env.get("bloomParseServerProdBookCleanupPassword");
+        password = Deno.env.get("BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_PROD");
         break;
       case Environment.DEVELOPMENT:
-        password = Deno.env.get("bloomParseServerDevBookCleanupPassword");
+        password = Deno.env.get("BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_DEV");
         break;
       case Environment.UNITTEST:
-        password = Deno.env.get("bloomParseServerUnitTestBookCleanupPassword");
+        password = Deno.env.get("BLOOM_PARSE_BOOK_CLEANUP_PASSWORD_UNIT_TEST");
         break;
     }
     return await this.loginAsUser("book-cleanup", password || "");
@@ -253,10 +253,10 @@ export default class BloomParseServer {
     let password;
     switch (this.environment) {
       case Environment.PRODUCTION:
-        password = Deno.env.get("bloomParseServerProdApiSuperUserPassword");
+        password = Deno.env.get("BLOOM_PARSE_SUPER_USER_PASSWORD_PROD");
         break;
       case Environment.DEVELOPMENT:
-        password = Deno.env.get("bloomParseServerDevApiSuperUserPassword");
+        password = Deno.env.get("BLOOM_PARSE_SUPER_USER_PASSWORD_DEV");
         break;
     }
     return await this.loginAsUser("api-super-user", password || "");
@@ -339,10 +339,15 @@ export default class BloomParseServer {
       body: body,
     });
 
-    if (!response.ok && response.status !== 201) {
+    if (!response.ok) {
+      // Full Parse response goes to the server log only; the thrown message
+      // stays minimal in case a caller echoes it to an HTTP client.
       const errorText = await response.text();
-      throw new Error(
+      console.error(
         `Failed to create language record: ${response.status} ${errorText}`
+      );
+      throw new Error(
+        `Failed to create language record: ${response.status}`
       );
     }
 
@@ -407,7 +412,17 @@ export default class BloomParseServer {
     url.searchParams.append("limit", "0");
     url.searchParams.append(
       "where",
-      `{"langPointers":{"$inQuery":{"where":{"isoCode":"${languageTag}"},"className":"language"}},"rebrand":false,"inCirculation":true,"draft":false}`
+      JSON.stringify({
+        langPointers: {
+          $inQuery: {
+            where: { isoCode: languageTag },
+            className: "language",
+          },
+        },
+        rebrand: false,
+        inCirculation: true,
+        draft: false,
+      })
     );
 
     const response = await fetch(url.toString(), {
@@ -437,7 +452,13 @@ export default class BloomParseServer {
     });
 
     if (response.status !== 201) {
-      throw new Error(`Failed to create book record`);
+      // Full Parse response goes to the server log only; the thrown message
+      // stays minimal in case a caller echoes it to an HTTP client.
+      const errorText = await response.text();
+      console.error(
+        `Failed to create book record: ${response.status} ${errorText}`
+      );
+      throw new Error(`Failed to create book record: ${response.status}`);
     }
 
     const data = await response.json();
