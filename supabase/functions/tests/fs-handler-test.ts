@@ -376,6 +376,30 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name: "fs handler - Parse lookup failure returns 500 with CORS headers",
+  fn: async () => {
+    const original = BloomParseServer.prototype.getBookByDatabaseId;
+    BloomParseServer.prototype.getBookByDatabaseId = () =>
+      Promise.reject(new Error("parse server unreachable"));
+    try {
+      const response = await handleFsRequest(
+        request("/v1/fs/upload/validBookId/test.pdf", {
+          headers: { origin: "https://bloomlibrary.org" },
+        })
+      );
+      assertEquals(response.status, 500);
+      assertEquals(
+        response.headers.get("access-control-allow-origin"),
+        "https://bloomlibrary.org",
+        "even unexpected failures must carry CORS headers"
+      );
+    } finally {
+      BloomParseServer.prototype.getBookByDatabaseId = original;
+    }
+  },
+});
+
 // ---------------------------------------------------------------------------
 // S3 header hygiene
 // ---------------------------------------------------------------------------

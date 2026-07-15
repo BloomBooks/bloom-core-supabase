@@ -96,7 +96,14 @@ export async function handleFsRequest(req: Request): Promise<Response> {
         statusText: "Bad Request",
       });
     }
-    throw error;
+    // e.g. the Parse server is unreachable. Answer through respond() so even
+    // this failure carries CORS headers; a bare rethrow would surface to a
+    // cross-origin caller as an opaque CORS error instead of a 500.
+    console.error("Error in fs function:", error);
+    return respond("Internal Server Error", {
+      status: 500,
+      statusText: "Internal Server Error",
+    });
   }
 
   if (!urlArtifact) {
