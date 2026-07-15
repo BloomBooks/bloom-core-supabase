@@ -35,7 +35,6 @@ BLOOM_PARSE_APP_ID_PROD=your_production_parse_app_id
 BLOOM_PARSE_APP_ID_DEV=your_development_parse_app_id
 BLOOM_PARSE_APP_ID_UNIT_TEST=your_unittest_parse_app_id
 ```
-```
 
 ## Authentication
 

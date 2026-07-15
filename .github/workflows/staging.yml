@@ -26,6 +26,11 @@ jobs:
         with:
           deno-version: v2.x
 
+      # Type-check everything, including entry points like fs/index.ts that
+      # no test imports (deno test only checks the test files' import graphs).
+      - name: Type-check functions
+        run: deno check $(find supabase/functions -name '*.ts')
+
       - name: Run tests
         run: yarn test:ci
         env:

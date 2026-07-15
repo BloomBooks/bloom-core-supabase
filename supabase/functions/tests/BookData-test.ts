@@ -300,6 +300,67 @@ Deno.test({
   },
 });
 
+// ---------------------------------------------------------------------------
+// getS3LinkBase (pure function, tested directly)
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "getS3LinkBase - upload bucket keeps full path, drops trailing slash",
+  fn: () => {
+    const result = BloomParseServer.getS3LinkBase(
+      "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/",
+      "BloomLibraryBooks"
+    );
+    assertEquals(
+      result,
+      "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title"
+    );
+  },
+});
+
+Deno.test({
+  name: "getS3LinkBase - harvest bucket swaps bucket name and drops the title",
+  fn: () => {
+    const result = BloomParseServer.getS3LinkBase(
+      "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/",
+      "bloomharvest"
+    );
+    assertEquals(
+      result,
+      "https://s3.amazonaws.com/bloomharvest/user@example.com/book-guid"
+    );
+  },
+});
+
+Deno.test({
+  name:
+    "getS3LinkBase - harvest-sandbox bucket swaps sandbox bucket name and drops the title",
+  fn: () => {
+    const result = BloomParseServer.getS3LinkBase(
+      "https://s3.amazonaws.com/BloomLibraryBooks-Sandbox/user@example.com/book-guid/Book+Title/",
+      "bloomharvest-sandbox"
+    );
+    assertEquals(
+      result,
+      "https://s3.amazonaws.com/bloomharvest-sandbox/user@example.com/book-guid"
+    );
+  },
+});
+
+Deno.test({
+  name: "getS3LinkBase - decodes %2f in the incoming baseUrl",
+  fn: () => {
+    const result = BloomParseServer.getS3LinkBase(
+      "https://s3.amazonaws.com%2fBloomLibraryBooks%2fuser@example.com%2fbook-guid%2fBook+Title%2f",
+      "BloomLibraryBooks"
+    );
+    assertEquals(
+      result,
+      "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title"
+    );
+  },
+});
+
 Deno.test({
   name: "BookData - URL encoding handles Unicode characters",
   fn: async () => {
