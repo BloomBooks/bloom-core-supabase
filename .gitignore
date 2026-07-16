@@ -1,11 +1,9 @@
 # Dependencies
 node_modules/
-yarn-debug.log*
-yarn-error.log*
 
-# Lock files (keep yarn.lock, ignore others)
+# Lock files (keep pnpm-lock.yaml and deno.lock, ignore others)
 package-lock.json
-pnpm-lock.yaml
+yarn.lock
 .pnpm-debug.log*
 
 # Supabase

@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertExists } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertExists } from "@std/assert";
 
 import BookData from "../fs/BookData.ts";
 import BloomParseServer, { Book } from "../_shared/BloomParseServer.ts";

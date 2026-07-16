@@ -6,17 +6,17 @@ Supabase Core Functionality for Bloom
 
 ```bash
 # Install dependencies
-yarn
+pnpm install
 
 # Configure environment
 cp .env.example .env.local
 # Edit .env.local with your Parse Server credentials
 
 # Start local development (requires Docker)
-yarn dev
+pnpm dev
 
 # Run tests
-yarn test
+pnpm test
 ```
 
 Test the fs function:
@@ -26,9 +26,24 @@ curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" 
 
 ## 📋 Prerequisites
 
-- [Volta](https://volta.sh/) (manages Node.js v22.20.0 and Yarn v1.22.22)
+- [pnpm](https://pnpm.io/) v11+ (pins its own version via `packageManager` and downloads
+  Node.js v22.20.0 via `devEngines.runtime` in `package.json` — no Volta or manual Node install needed)
+- [Deno](https://deno.com/) v2.9+ (runs and tests the edge functions)
 - [Docker Desktop](https://docs.docker.com/desktop/) (local development only)
 - [Supabase account](https://supabase.com/)
+
+### Dependency policy
+
+Both package resolvers enforce a **7-day cooldown**: a version published less than 7 days
+ago will not be installed (mitigates compromised-package supply-chain attacks).
+
+- npm side (dev tooling): `minimumReleaseAge` in [`pnpm-workspace.yaml`](pnpm-workspace.yaml)
+- Deno side (edge function imports): `minimumDependencyAge` in [`deno.json`](deno.json)
+
+Dependencies are pinned to exact versions (`savePrefix: ""` for pnpm; exact versions in the
+`deno.json` import map), and CI installs with frozen lockfiles. To update deps, run
+`pnpm update` / `deno outdated --update` — both respect the cooldown — and commit the
+lockfile changes.
 
 ## 📁 Project Structure
 
@@ -47,11 +62,11 @@ supabase/functions/
 ## 🔧 Scripts
 
 ```bash
-yarn dev           # Start Supabase
-yarn dev:debug     # Start with debugger
-yarn test          # Run tests
-yarn test:watch    # Run tests in watch mode
-yarn deploy        # Deploy to production
+pnpm dev           # Start Supabase
+pnpm dev:debug     # Start with debugger
+pnpm test          # Run tests
+pnpm test:watch    # Run tests in watch mode
+pnpm run deploy    # Deploy to production ("run" needed: deploy is a pnpm built-in)
 ```
 
 ## 🗃️ fs Function

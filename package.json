@@ -2,9 +2,17 @@
   "name": "bloom-supabase-bloom-core",
   "version": "1.0.0",
   "description": "Bloom Core Supabase project (supabase-bloom-core)",
+  "packageManager": "pnpm@11.5.2",
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "22.20.0",
+      "onFail": "download"
+    }
+  },
   "scripts": {
-    "dev": "supabase start && yarn dev:functions",
-    "dev:debug": "supabase start && yarn dev:functions:debug",
+    "dev": "supabase start && pnpm dev:functions",
+    "dev:debug": "supabase start && pnpm dev:functions:debug",
     "dev:functions": "supabase functions serve",
     "dev:functions:debug": "supabase functions serve --inspect",
     "stop": "supabase stop",
@@ -16,7 +24,7 @@
     "supabase": "supabase",
     "test": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local",
     "test:secrets-optional": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local -- --secrets-optional",
-    "test:ci": "deno test --allow-all supabase/functions/tests/*-test.ts -- --secrets-optional",
+    "test:ci": "deno test --allow-all --frozen supabase/functions/tests/*-test.ts -- --secrets-optional",
     "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local"
   },
   "keywords": [
@@ -26,11 +34,6 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@supabase/supabase-js": "^2.74.0",
-    "supabase": "^2.45.5"
-  },
-  "volta": {
-    "node": "22.20.0",
-    "yarn": "1.22.22"
+    "supabase": "2.109.1"
   }
 }

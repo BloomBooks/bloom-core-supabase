@@ -47,7 +47,7 @@ main (production environment)
 
 2. **Make changes and test locally**:
    ```bash
-   yarn test
+   pnpm test
    ```
 
 3. **Open a PR to `develop`**:
@@ -108,10 +108,10 @@ The workflows don't affect local development. Continue using:
 supabase start
 
 # Run tests locally
-yarn test
+pnpm test
 
 # Deploy functions locally
-yarn dev:functions
+pnpm dev:functions
 ```
 
 ## Deployment Commands
