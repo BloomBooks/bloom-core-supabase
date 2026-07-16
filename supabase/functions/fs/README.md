@@ -46,10 +46,10 @@ The `fs` function is **publicly accessible** and does not require JWT authentica
 
 ```bash
 # Start all Supabase services
-yarn dev
+pnpm dev
 
 # Or start with debugging enabled
-yarn dev:debug
+pnpm dev:debug
 
 # Test the function
 curl -I "http://127.0.0.1:54321/functions/v1/fs/dev-harvest/U4KS7uOBBC/thumbnails/thumbnail-256.png"
@@ -58,12 +58,12 @@ curl -I "http://127.0.0.1:54321/functions/v1/fs/dev-harvest/U4KS7uOBBC/thumbnail
 ### Deployment
 
 ```bash
-# Deploy all functions
-yarn deploy
+# Deploy all functions ("run" needed: deploy is a pnpm built-in command)
+pnpm run deploy
 
 # Deploy only fs function
-yarn deploy:fs
+pnpm deploy:fs
 
 # Deploy to specific project
-yarn deploy --project-ref your-project-id
+pnpm run deploy --project-ref your-project-id
 ```

@@ -14,12 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'yarn'
+          cache: 'pnpm'
 
-      - run: yarn install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
@@ -29,18 +31,19 @@ jobs:
       # Type-check everything, including entry points like fs/index.ts that
       # no test imports (deno test only checks the test files' import graphs).
       - name: Type-check functions
-        run: deno check $(find supabase/functions -name '*.ts')
+        run: deno check --frozen $(find supabase/functions -name '*.ts')
 
       - name: Run tests
-        run: yarn test:ci
+        run: pnpm test:ci
         env:
           BLOOM_PARSE_APP_ID_PROD: ${{ secrets.BLOOM_PARSE_APP_ID_PROD }}
           BLOOM_PARSE_APP_ID_DEV: ${{ secrets.BLOOM_PARSE_APP_ID_DEV }}
           BLOOM_PARSE_APP_ID_UNIT_TEST: ${{ secrets.BLOOM_PARSE_APP_ID_UNIT_TEST }}
 
+      # Keep in sync with the supabase version pinned in package.json.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.109.1
 
       - name: Deploy Edge Functions to Staging
         run: supabase functions deploy --project-ref ${{ secrets.BLOOM_SUPABASE_STAGING_PROJECT_ID }}

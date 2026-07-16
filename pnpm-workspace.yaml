@@ -1,0 +1,13 @@
+# Only the supabase CLI may run install scripts (its postinstall downloads
+# the platform binary); everything else is blocked by pnpm's default.
+allowBuilds:
+  supabase: true
+
+# Supply-chain policy: never install a package version published less than
+# 7 days ago (org-wide cooldown to mitigate dependency-chain attacks).
+# The Deno-resolved dependencies have the same policy via minimumDependencyAge
+# in the root deno.json.
+minimumReleaseAge: 10080 # minutes (= 7 days)
+
+# Save new dependencies with exact versions (no ^ range).
+savePrefix: ""

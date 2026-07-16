@@ -1,5 +1,5 @@
-import { assert, assertEquals, assertExists } from "jsr:@std/assert@1";
-import "jsr:@std/dotenv/load";
+import { assert, assertEquals, assertExists } from "@std/assert";
+import "@std/dotenv/load";
 
 import BloomParseServer from "../_shared/BloomParseServer.ts";
 import { testRequiringSecrets } from "./testSecrets.ts";
