@@ -159,17 +159,16 @@ the proxy with no 302, 206 on Range requests, and Azure fall-through intact
 (`Request-Context` header present). See [`cloudflare/`](cloudflare/README.md) for current
 state, verification curls, and the per-function extension process.
 
-### Phase 1 — `social` (trivial to implement, but cut over LAST — see below)
+### Phase 1 — `social` (trivial, no dependencies)
 - Pure HTML generation with a `bloomlibrary.org` domain allow-list; no external services, no
   secrets, read-only.
 - Watch-outs: preserve exact OpenGraph output (test with Facebook's sharing debugger);
   `social.bloomlibrary.org` needs its own Cloudflare rule in addition to
   `api.bloomlibrary.org/v1/social`.
-- Status: **implemented** (`supabase/functions/social/`), but its **production cutover is
-  deferred to last** because of the `og:url` finding below. One deliberate change from the Azure
-  version: parameters are HTML-escaped (the Azure version interpolated them raw — an injection
-  vector). It is trivial code, hence ordered first to build; the deferral is purely about *when*
-  we point traffic at it.
+- Status: **implemented** (`supabase/functions/social/`) and merged to `develop`. Two changes
+  from the Azure version: parameters are HTML-escaped (the Azure version interpolated them raw —
+  an injection vector), and the public `og:url` is reconstructed from a custom header the worker
+  sends (see the `og:url` finding below). No special cutover ordering is needed.
 
 #### The `og:url` / host-rewrite problem (verified on staging 2026-07-17)
 When the worker proxies a migrated function it must rewrite the request host to
@@ -196,37 +195,27 @@ Second, latent bug found the same way: `getPublicUrl` strips a `/functions/v1/` 
 the function's actual `req.url` path is `/social` (no such prefix), so even a surviving header
 would rebuild `/social`, not the `/v1/social` Azure emits.
 
-**Resolution (chosen approach): let the end-state DNS switch fix it, and cut `social` over
-last.** In the migration's end state — every function on `api.bloomlibrary.org` moved to
-Supabase — the worker's Azure fall-through is no longer needed, so `api.bloomlibrary.org` (and
-`social.bloomlibrary.org`) can point **directly at Supabase via a custom domain**, retiring the
-host rewrite. Then `req.url` *is* the public URL, `og:url` is correct with no header at all, and
-`getPublicUrl` plus the whole `X-Forwarded-Host` mechanism become dead code to delete. To avoid
-a broken interim in production, `social` is cut over **last**, coinciding with that DNS switch;
-until then it keeps serving from Azure at no cost (blorg previews stay correct throughout).
+**Resolution (implemented): carry the public URL in a custom header.** `X-Forwarded-*` is
+stripped, but a *non-proxy-managed* header rides through the Supabase edge untouched. Verified on
+staging 2026-07-17: with `X-Bloom-Public-Url` set to a `social.bloomlibrary.org` URL, `og:url`
+came back as that public URL with **no `*.supabase.co`** — both when routed through the existing
+worker (which copies client headers) and when sent directly to the Supabase function. So:
+- **Function side (merged to `develop`):** `getPublicUrl` prefers a full public URL supplied in
+  `X-Bloom-Public-Url`, validated against the `bloomlibrary.org` allowlist, before falling back to
+  the legacy `X-Forwarded-Host` path and then `req.url`. Carrying the *full* URL also disposes of
+  the `/functions/v1/` vs `/v1/social` path bug above, since the worker sends the already-correct
+  public path.
+- **Worker side (needs an ops deploy of `cloudflare/worker.js`):** the routing worker sets
+  `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
+  `X-Forwarded-Host`.
 
-**Scope — which host actually matters.** Ideally `social` produces a correct `og:url` for *both*
-entry points, but the only caller we care about is blorg, and it uses
-**`social.bloomlibrary.org`**. So a perfectly-preserved `og:url` on `api.bloomlibrary.org/v1/social`
-is not critical — getting `social.bloomlibrary.org` right is what matters. That makes pointing
-`social.bloomlibrary.org` directly at Supabase sufficient on its own; the `api.…/v1/social` path
-would only need the header workaround if we later decide its `og:url` matters.
+This supersedes the earlier idea of a DNS/custom-domain switch: **no Supabase custom domain is
+needed, and `social` need not be cut over last** — it works correctly through the worker like any
+other migrated function, on both `api.bloomlibrary.org` and `social.bloomlibrary.org` (each
+mirrors its own host, since the worker forwards whichever public URL the request arrived on).
 
-**Open assumption — must verify before committing to this.** The approach depends on a
-`bloomlibrary.org` custom domain on the Supabase project actually presenting the *public* host
-(and routing the `/v1/social` path) to the edge function — some platforms still hand the handler
-the internal `*.supabase.co` host. **Verification step:** stand up
-**`staging-social.bloomlibrary.org` as a Supabase custom domain** on the staging project (a host
-dedicated to `social`, so it doesn't disturb the other functions on `staging-api`) and `curl`
-it; confirm `og:url` shows the public host, and note what path the function receives.
-  - If confirmed → adopt this plan; no `social` code change needed; delete `getPublicUrl` at the
-    end of the migration.
-  - If not → fall back to carrying the public URL in a **custom, non-proxy-managed header** (e.g.
-    `X-Bloom-Public-Url`) that the worker sets and the function reads verbatim (this also fixes
-    the path bug in one move).
-
-The `social` code has merged to `develop` (PR #5); its `og:url` mechanism is deliberately left
-**as-is** pending this experiment, and is finalized only once the custom-domain behavior is known.
+Follow-up: once the worker change is deployed, remove the now-dead `X-Forwarded-Host` fallback
+from `getPublicUrl`.
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.

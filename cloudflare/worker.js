@@ -33,14 +33,16 @@ const SUPABASE_FUNCTIONS = new Set([
 ]);
 
 // Fetch `url`, carrying over the incoming request's method, headers, and
-// (streaming) body. When `forwardedHost` is given, it is passed along as
-// X-Forwarded-Host so the function can reconstruct the public URL in links
-// it generates.
-async function proxy(url, request, forwardedHost) {
+// (streaming) body. When `publicUrl` is given, it is passed along as
+// X-Bloom-Public-Url so the function can reconstruct the public URL in links
+// it generates (e.g. og:url). A custom header is used rather than
+// X-Forwarded-Host because Supabase's edge strips proxy-managed forwarding
+// headers before the function sees them.
+async function proxy(url, request, publicUrl) {
   try {
     const proxied = new Request(url, request);
-    if (forwardedHost) {
-      proxied.headers.set("X-Forwarded-Host", forwardedHost);
+    if (publicUrl) {
+      proxied.headers.set("X-Bloom-Public-Url", publicUrl);
     }
     return await fetch(proxied);
   } catch (err) {
@@ -54,9 +56,11 @@ async function proxy(url, request, forwardedHost) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const originalHost = url.hostname;
     url.protocol = "https:";
     url.port = "";
+    // The public URL the client used (normalized to https), captured before we
+    // rewrite the host/path to the Supabase target below.
+    const publicUrl = url.toString();
 
     const match = url.pathname.match(/^\/v1\/([^/]+)(\/.*)?$/);
 
@@ -65,7 +69,7 @@ export default {
       //     to https://<project>.supabase.co/functions/v1/<fn>/<rest>?<query>
       url.hostname = env.SUPABASE_FUNCTIONS_HOST;
       url.pathname = `/functions/v1/${match[1]}${match[2] ?? ""}`;
-      return proxy(url, request, originalHost);
+      return proxy(url, request, publicUrl);
     }
 
     // Not migrated: send to the Azure Functions app.
