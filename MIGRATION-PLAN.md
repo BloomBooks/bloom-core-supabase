@@ -134,6 +134,14 @@ Risk here combines: implementation complexity, blast radius if it breaks, whethe
 data, and how easily it rolls back (all HTTP functions roll back instantly via the Cloudflare
 rule; timers roll back by re-enabling the Azure timer).
 
+**The API contract.** [`api-spec.yml`](api-spec.yml) — the OpenAPI spec for the public API at
+`https://api.bloomlibrary.org/v1`, ported from the Azure repo — is landed **first**, ahead of
+every phase below, as the reference each migration must preserve. The phases move each endpoint's
+*implementation* from Azure to Supabase; the contract they honor does not change. Everything in
+`api-spec.yml` is live; planned-but-unimplemented endpoints (currently only `/languages/{tag}`,
+never implemented in either repo) live in [`api-spec-next.yml`](api-spec-next.yml) and graduate
+to `api-spec.yml` when built.
+
 ### Phase 0 — `fs` ✅ done
 Serving production. Remaining follow-ups: document the Cloudflare rule (Appendix A), and confirm
 Azure `fs` traffic has actually dropped to zero before deleting the Azure function.
