@@ -151,17 +151,74 @@ the proxy with no 302, 206 on Range requests, and Azure fall-through intact
 (`Request-Context` header present). See [`cloudflare/`](cloudflare/README.md) for current
 state, verification curls, and the per-function extension process.
 
-### Phase 1 — `social` (trivial, no dependencies)
+### Phase 1 — `social` (trivial to implement, but cut over LAST — see below)
 - Pure HTML generation with a `bloomlibrary.org` domain allow-list; no external services, no
   secrets, read-only.
 - Watch-outs: preserve exact OpenGraph output (test with Facebook's sharing debugger);
   `social.bloomlibrary.org` needs its own Cloudflare rule in addition to
   `api.bloomlibrary.org/v1/social`.
-- Status: **implemented** (`supabase/functions/social/`), awaiting staging verification and
-  worker cutover. Two deliberate changes from the Azure version: parameters are HTML-escaped
-  (the Azure version interpolated them raw — an injection vector), and `og:url` is
-  reconstructed from the `X-Forwarded-Host` header the routing worker now sends (otherwise it
-  would leak the Supabase URL).
+- Status: **implemented** (`supabase/functions/social/`), but its **production cutover is
+  deferred to last** because of the `og:url` finding below. One deliberate change from the Azure
+  version: parameters are HTML-escaped (the Azure version interpolated them raw — an injection
+  vector). It is trivial code, hence ordered first to build; the deferral is purely about *when*
+  we point traffic at it.
+
+#### The `og:url` / host-rewrite problem (verified on staging 2026-07-17)
+When the worker proxies a migrated function it must rewrite the request host to
+`<ref>.supabase.co` — you cannot reach Supabase under the `bloomlibrary.org` host. So the
+function sees its own URL as the Supabase one and can't build a public `og:url` from `req.url`.
+The code tries to carry the original host across in an `X-Forwarded-Host` header the worker
+sets — **but that header does not survive.** `X-Forwarded-*` are proxy-managed headers, and the
+Cloudflare/gateway layer in front of the Supabase runtime strips or overwrites them before the
+Deno function sees them. Verified on staging: a `curl` that set `X-Forwarded-Host` **by hand,
+directly at `*.supabase.co` (bypassing the worker entirely), still didn't reach the function** —
+so the loss is at the Supabase edge, not in our worker. Result: `og:url` silently falls back to
+the `*.supabase.co` URL — exactly the leak §2a-5 warns about.
+
+**Current production behavior (verified 2026-07-17).** Production is unaffected today because it
+is still on Azure. Both public entry points — `api.bloomlibrary.org/v1/social` and
+`social.bloomlibrary.org/v1/social` — hit the *same* Azure function (identical `Request-Context`
+appId) and differ in exactly one way: each **mirrors its own host into `og:url`** (`api.…` →
+`https://api.bloomlibrary.org/v1/social?...`, `social.…` →
+`https://social.bloomlibrary.org/v1/social?...`). Azure gets this for free because the request
+reaches it already bearing the public host. Preserving that per-host mirror is the target
+behavior for the migrated version.
+
+Second, latent bug found the same way: `getPublicUrl` strips a `/functions/v1/` path prefix, but
+the function's actual `req.url` path is `/social` (no such prefix), so even a surviving header
+would rebuild `/social`, not the `/v1/social` Azure emits.
+
+**Resolution (chosen approach): let the end-state DNS switch fix it, and cut `social` over
+last.** In the migration's end state — every function on `api.bloomlibrary.org` moved to
+Supabase — the worker's Azure fall-through is no longer needed, so `api.bloomlibrary.org` (and
+`social.bloomlibrary.org`) can point **directly at Supabase via a custom domain**, retiring the
+host rewrite. Then `req.url` *is* the public URL, `og:url` is correct with no header at all, and
+`getPublicUrl` plus the whole `X-Forwarded-Host` mechanism become dead code to delete. To avoid
+a broken interim in production, `social` is cut over **last**, coinciding with that DNS switch;
+until then it keeps serving from Azure at no cost (blorg previews stay correct throughout).
+
+**Scope — which host actually matters.** Ideally `social` produces a correct `og:url` for *both*
+entry points, but the only caller we care about is blorg, and it uses
+**`social.bloomlibrary.org`**. So a perfectly-preserved `og:url` on `api.bloomlibrary.org/v1/social`
+is not critical — getting `social.bloomlibrary.org` right is what matters. That makes pointing
+`social.bloomlibrary.org` directly at Supabase sufficient on its own; the `api.…/v1/social` path
+would only need the header workaround if we later decide its `og:url` matters.
+
+**Open assumption — must verify before committing to this.** The approach depends on a
+`bloomlibrary.org` custom domain on the Supabase project actually presenting the *public* host
+(and routing the `/v1/social` path) to the edge function — some platforms still hand the handler
+the internal `*.supabase.co` host. **Verification step:** stand up
+**`staging-social.bloomlibrary.org` as a Supabase custom domain** on the staging project (a host
+dedicated to `social`, so it doesn't disturb the other functions on `staging-api`) and `curl`
+it; confirm `og:url` shows the public host, and note what path the function receives.
+  - If confirmed → adopt this plan; no `social` code change needed; delete `getPublicUrl` at the
+    end of the migration.
+  - If not → fall back to carrying the public URL in a **custom, non-proxy-managed header** (e.g.
+    `X-Bloom-Public-Url`) that the worker sets and the function reads verbatim (this also fixes
+    the path bug in one move).
+
+The `social` code has merged to `develop` (PR #5); its `og:url` mechanism is deliberately left
+**as-is** pending this experiment, and is finalized only once the custom-domain behavior is known.
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
