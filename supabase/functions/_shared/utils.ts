@@ -101,6 +101,26 @@ function isAllowedPublicHost(hostname: string): boolean {
 // Only bloomlibrary.org hostnames are honored: a caller who bypasses the worker and sets
 // X-Forwarded-Host itself must not be able to spoof an arbitrary domain into those URLs.
 export function getPublicUrl(request: Request): URL {
+  // Preferred: the routing worker forwards the original public request URL in
+  // this custom header. We use a non-standard name (not X-Forwarded-*) because
+  // Supabase's edge strips proxy-managed forwarding headers before the function
+  // sees them (verified on staging; see FUNCTIONS-MIGRATION-PLAN.md). Only
+  // bloomlibrary.org hosts are honored, so a caller that sets the header itself
+  // cannot spoof an arbitrary domain into the URLs we generate.
+  const publicUrl = request.headers.get("x-bloom-public-url");
+  if (publicUrl) {
+    try {
+      const parsed = new URL(publicUrl);
+      if (isAllowedPublicHost(parsed.hostname)) {
+        return parsed;
+      }
+    } catch {
+      // malformed header; fall through to the fallbacks below
+    }
+  }
+
+  // Fallback (legacy): X-Forwarded-Host. Retained for now, but in practice it
+  // does not survive Supabase's edge, so real traffic falls through to req.url.
   const url = new URL(request.url);
   const forwardedHost = request.headers.get("x-forwarded-host");
   if (forwardedHost && isAllowedPublicHost(forwardedHost)) {
