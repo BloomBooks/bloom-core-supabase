@@ -231,6 +231,9 @@ then, production stays on Azure; and on staging, any not-yet-wired host simply f
   specifiers, or swap for a plain JWT + fetch call to the Sheets REST API.
 - Consumed by Bloom Desktop for subscription/branding codes, so verify against a released
   Desktop build before cutover.
+- Status: **implemented** (`supabase/functions/subscriptionInfo/` — named for its URL segment,
+  not the Azure folder name `subscriptions`). Uses a hand-rolled service-account JWT +
+  Sheets REST call instead of the googleapis npm package.
 
 ### Phase 3 — `contentfulToCrowdin` (first timer; not user-facing)
 - Daily one-way sync: Contentful → three l10n JSON files → Crowdin. No Bloom data touched;
