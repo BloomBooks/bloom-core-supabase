@@ -334,6 +334,15 @@ When Azure traffic is zero (verify via Azure metrics/logs over ≥30 days, remem
 timers and long-tail OPDS clients): disable the functions app, retire the Kudu deployment, rotate
 any credentials that lived in Azure app settings, archive the repo with a pointer to this one.
 
+**What remains relevant in the Azure repo** (everything else — functions, shared code, tests,
+api-spec, host/deploy config, READMEs — has been ported here or superseded):
+1. The **secret values** in the Function App's settings (portal → Configuration → Application
+   settings; also on dev machines in `local.settings.json`) — the source when provisioning the
+   checklist in §4. Never in git.
+2. The **running app itself** until cutover completes.
+3. The unit-test Parse server (`bloom-parse-server-unittest.azurewebsites.net`) is a separate
+   Azure App Service from the `bloom-parse-server` repo — out of scope; it stays.
+
 ---
 
 ## 4. Cross-cutting concerns
@@ -361,6 +370,47 @@ any credentials that lived in Azure app settings, archive the repo with a pointe
   the Azure app deployed and warm until the very end.
 - **Monitoring:** decide per-phase how we'll know it broke — Supabase function logs/metrics at
   minimum; consider forwarding errors to whatever alerting the team already watches.
+
+---
+
+## 5. Cutover runbook (the order of operations from here)
+
+All code is implemented (phases 1–5, 7, 8, the worker, and the spec). What remains is
+operational, in this order:
+
+1. **Merge the branch stack** bottom-up into `develop` (`api-spec` → `phase2-subscriptions` →
+   `phase3-contentful-to-crowdin` → `phase4-opds` → `phase5-stats` → `phase7-book-cleanup` →
+   `phase8-books`; `phase1-social` is already on `develop`). Each merge auto-deploys functions
+   **and migrations** to the staging project. Before the first merge, provision the secrets
+   checklist (§4) on the staging Supabase project and the GitHub repo secrets (`BLOOM_CRON_SECRET`,
+   `BLOOM_SUPABASE_{STAGING,PRODUCTION}_DB_PASSWORD`) — the contentfulToCrowdin cron activates on
+   merge and will report failures until its secrets exist.
+2. **Ops deploys the staging worker** (Stage 1 of [`cloudflare/README.md`](cloudflare/README.md)).
+3. **Verify on `staging-api.bloomlibrary.org`**: every function's smoke tests; the OPDS
+   byte-diff against Azure output (`lang`/`tag`/`epub`/`src` matrix); a real Bloom Desktop
+   upload (upload-start → S3 sync → upload-finish → status polling); `stats` against the
+   analytics DB (confirms the firewall accepts Supabase egress); safe-mode `bookCleanup` runs
+   compared against what the Azure timer deletes.
+4. **Ops deploys the production worker** (Stage 2). ⚠️ The checked-in `cloudflare/worker.js`
+   lists **all** migrated functions, so deploying it verbatim cuts everything over at once.
+   For production, start `SUPABASE_FUNCTIONS` with just `"fs"` and extend it one function at a
+   time as each passes staging verification; each extension is an instant-rollback one-line
+   change. Extend `social` **last of all** — its production cutover is deferred to the end-state
+   DNS switch described in §3 (Phase 1), when the `bloomlibrary.org` hosts point directly at
+   Supabase and the worker is retired.
+5. **Timers**: uncomment the bookCleanup workflow schedule only after step 3's safe-mode
+   comparison and after disabling the Azure timer (never both live). Disable the Azure
+   contentfulToCrowdin timer once the GitHub cron has succeeded a few days in a row.
+6. **Phase 6** (materialized views): set up pg_cron + the `refresh_log` change + the freshness
+   watchdog in the analytics DB (see Phase 6 above) and disable the Azure `dailyTimer`.
+7. **Provision production secrets** and repeat the per-function worker extension on
+   `api.bloomlibrary.org` (step 4's list and ordering — `social` last).
+8. **Decommission** Azure per the checklist above.
+
+Note on tests: the suite includes live tests ported from Azure (Google Sheet lookups, prod-Parse
+OPDS queries, S3 bucket round-trips, the end-to-end bookCleanup scenario). They skip themselves
+unless their credentials are present in the environment — same env-var names as the functions
+(see `.env.example`) — so a bare `pnpm test:ci` run only exercises what its secrets allow.
 
 ---
 
