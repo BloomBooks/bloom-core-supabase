@@ -48,6 +48,14 @@ jobs:
         with:
           version: 2.109.1
 
+      - name: Apply database migrations to Production
+        run: |
+          supabase link --project-ref ${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}
+          supabase db push
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.BLOOM_SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.BLOOM_SUPABASE_PRODUCTION_DB_PASSWORD }}
+
       - name: Deploy Edge Functions to Production
         run: supabase functions deploy --project-ref ${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}
         env:

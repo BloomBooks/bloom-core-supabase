@@ -48,6 +48,14 @@ jobs:
         with:
           version: 2.109.1
 
+      - name: Apply database migrations to Staging
+        run: |
+          supabase link --project-ref ${{ secrets.BLOOM_SUPABASE_STAGING_PROJECT_ID }}
+          supabase db push
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.BLOOM_SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.BLOOM_SUPABASE_STAGING_DB_PASSWORD }}
+
       - name: Deploy Edge Functions to Staging
         run: supabase functions deploy --project-ref ${{ secrets.BLOOM_SUPABASE_STAGING_PROJECT_ID }}
         env:
