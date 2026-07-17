@@ -7,7 +7,13 @@ project_id = "bloom-supabase-bloom-core"
 [api]
 enabled = true
 # Port to use for the API URL.
-port = 54321
+# NOTE: we deliberately use ports below 49152 (Supabase defaults are 543xx).
+# Windows reserves semi-random "excluded port ranges" for Hyper-V/WSL inside
+# the dynamic range (49152+), and the Supabase defaults landed inside one on a
+# dev machine, silently making the whole stack unreachable from the host
+# (check yours with: netsh interface ipv4 show excludedportrange protocol=tcp).
+# Ports below 49152 are never dynamically excluded.
+port = 44321
 # Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
 # endpoints. `public` and `graphql_public` schemas are included by default.
 schemas = ["public", "graphql_public"]
@@ -26,9 +32,9 @@ enabled = false
 
 [db]
 # Port to use for the local database URL.
-port = 54322
+port = 44322
 # Port used by db diff command to initialize the shadow database.
-shadow_port = 54320
+shadow_port = 44320
 # The database major version to use. This has to be the same as your remote database's. Run `SHOW
 # server_version;` on the remote database to check.
 major_version = 17
@@ -36,7 +42,7 @@ major_version = 17
 [db.pooler]
 enabled = false
 # Port to use for the local connection pooler.
-port = 54329
+port = 44329
 # Specifies when a server connection can be reused by other clients.
 # Configure one of the supported pooler modes: `transaction`, `session`.
 pool_mode = "transaction"
@@ -82,7 +88,7 @@ enabled = true
 [studio]
 enabled = true
 # Port to use for Supabase Studio.
-port = 54323
+port = 44323
 # External URL of the API server that frontend connects to.
 api_url = "http://127.0.0.1"
 # OpenAI API Key to use for Supabase AI in the Supabase Studio.
@@ -93,7 +99,7 @@ openai_api_key = "env(OPENAI_API_KEY)"
 [inbucket]
 enabled = true
 # Port to use for the email testing server web interface.
-port = 54324
+port = 44324
 # Uncomment to expose additional ports for testing user applications that send emails.
 # smtp_port = 54325
 # pop3_port = 54326
@@ -333,7 +339,7 @@ BLOOM_PARSE_APP_ID_UNIT_TEST = "env(BLOOM_PARSE_APP_ID_UNIT_TEST)"
 
 [analytics]
 enabled = true
-port = 54327
+port = 44327
 # Configure one of the supported backends: `postgres`, `bigquery`.
 backend = "postgres"
 

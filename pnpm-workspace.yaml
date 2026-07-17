@@ -1,3 +1,6 @@
+packages:
+  - "packages/*"
+
 # Only the supabase CLI may run install scripts (its postinstall downloads
 # the platform binary); everything else is blocked by pnpm's default.
 allowBuilds:

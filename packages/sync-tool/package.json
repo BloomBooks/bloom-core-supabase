@@ -1,0 +1,13 @@
+{
+  "name": "@bloom/sync-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Parse -> Supabase data import. v0: imports a diverse sample of production books into a local Supabase for the 'Local Supabase + Blorg' milestone. Grows into the full incremental sync tool.",
+  "scripts": {
+    "import-sample": "node src/import-sample.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.110.2"
+  }
+}
