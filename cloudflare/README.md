@@ -109,7 +109,7 @@ curl -sD - -o /dev/null -H "Range: bytes=0-1023" "https://api.bloomlibrary.org/v
 # Azure passthrough unchanged: expect a 404 with a "Request-Context: appId=..." header
 curl -sD - -o /dev/null "https://api.bloomlibrary.org/v1/subscriptionInfo/not-a-real-code"
 
-# Another non-migrated function: expect HTML from Azure, not an error
+# social now proxies to Supabase (migrated in this repo): expect HTTP 200 with HTML
 curl -sD - -o /dev/null "https://api.bloomlibrary.org/v1/social?link=https://bloomlibrary.org/test&title=t"
 ```
 

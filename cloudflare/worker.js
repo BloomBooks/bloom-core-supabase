@@ -29,13 +29,20 @@
 // (e.g. the "subscriptions" function is reached at /v1/subscriptionInfo).
 const SUPABASE_FUNCTIONS = new Set([
   "fs",
+  "social",
 ]);
 
 // Fetch `url`, carrying over the incoming request's method, headers, and
-// (streaming) body.
-async function proxy(url, request) {
+// (streaming) body. When `forwardedHost` is given, it is passed along as
+// X-Forwarded-Host so the function can reconstruct the public URL in links
+// it generates.
+async function proxy(url, request, forwardedHost) {
   try {
-    return await fetch(new Request(url, request));
+    const proxied = new Request(url, request);
+    if (forwardedHost) {
+      proxied.headers.set("X-Forwarded-Host", forwardedHost);
+    }
+    return await fetch(proxied);
   } catch (err) {
     return new Response(`Error proxying to ${url.hostname}: ${err.message}`, {
       status: 502,
@@ -47,6 +54,7 @@ async function proxy(url, request) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const originalHost = url.hostname;
     url.protocol = "https:";
     url.port = "";
 
@@ -57,7 +65,7 @@ export default {
       //     to https://<project>.supabase.co/functions/v1/<fn>/<rest>?<query>
       url.hostname = env.SUPABASE_FUNCTIONS_HOST;
       url.pathname = `/functions/v1/${match[1]}${match[2] ?? ""}`;
-      return proxy(url, request);
+      return proxy(url, request, originalHost);
     }
 
     // Not migrated: send to the Azure Functions app.

@@ -353,3 +353,6 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 # The fs function doesn't require a JWT token for access
 [functions.fs]
 verify_jwt = false
+
+[functions.social]
+verify_jwt = false
