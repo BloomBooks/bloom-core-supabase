@@ -1,0 +1,2 @@
+# Keeps this directory in git: the Supabase CLI bind-mounts it and Podman,
+# unlike Docker, refuses to start containers whose bind-mount source is missing.
