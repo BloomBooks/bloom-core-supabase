@@ -5,8 +5,12 @@
 -- rows created in Supabase get a legacy-style 10-char alphanumeric id.
 --
 -- Deliberately NOT here yet (post-milestone): derivation triggers replacing
--- Parse beforeSave (search string, tag normalization, ...), write RLS
--- policies, auth wiring, apiAccount and the app* / downloadHistory classes.
+-- Parse beforeSave (search string, tag normalization, ...), updated_at
+-- triggers (an update trigger stamping now() would overwrite the Parse
+-- timestamps the importer/sync writes on every re-run; updated_at triggers
+-- arrive together with the sync-gating mechanism when the write path lands),
+-- write RLS policies, auth wiring, apiAccount and the app* / downloadHistory
+-- classes.
 
 create extension if not exists pgcrypto;
 
@@ -22,16 +26,6 @@ as $$
            regexp_replace(encode(gen_random_bytes(24), 'base64'), '[^0-9A-Za-z]', '', 'g')
            from 1 for 10
          );
-$$;
-
-create or replace function public.handle_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -122,7 +116,10 @@ create table public.books (
   keyword_stems text[],
   keywords text[],
   lang_pointers text[], -- language ids; kept alongside book_languages for sync fidelity
-  languages text[],     -- legacy Parse field, distinct from langPointers
+  -- Parse's legacy `languages` array is deliberately NOT ported: every
+  -- production row that has it holds [] (nothing has written it since Jan
+  -- 2015), and the name must stay free so PostgREST can embed language
+  -- records as `languages(*)` through book_languages.
   last_uploaded timestamptz,
   leveled_reader_level integer,
   librarian_note text,
@@ -170,20 +167,6 @@ create table public.related_books (
 );
 
 -- ---------------------------------------------------------------------------
--- updated_at triggers
--- ---------------------------------------------------------------------------
-create trigger on_users_updated before update on public.users
-  for each row execute procedure public.handle_updated_at();
-create trigger on_languages_updated before update on public.languages
-  for each row execute procedure public.handle_updated_at();
-create trigger on_tags_updated before update on public.tags
-  for each row execute procedure public.handle_updated_at();
-create trigger on_books_updated before update on public.books
-  for each row execute procedure public.handle_updated_at();
-create trigger on_related_books_updated before update on public.related_books
-  for each row execute procedure public.handle_updated_at();
-
--- ---------------------------------------------------------------------------
 -- Indexes for the anonymous read path (derived from blorg query patterns and
 -- the hot Mongo indexes on the books class)
 -- ---------------------------------------------------------------------------
@@ -210,10 +193,23 @@ alter table public.books enable row level security;
 alter table public.book_languages enable row level security;
 alter table public.related_books enable row level security;
 
-create policy "Public read" on public.users for select to anon, authenticated using (true);
+-- Uploader emails are shown publicly on bloomlibrary.org book pages, so the
+-- uploaders of visible books are readable (blorg embeds uploader:users(email)
+-- via books.uploader_id). But the users table must not be a listable email
+-- directory: rows without at least one visible book stay hidden.
+create policy "Public read" on public.users for select to anon, authenticated
+  using (
+    exists (
+      select 1 from public.books b
+      where b.uploader_id = users.id and not b.is_deleted
+    )
+  );
 create policy "Public read" on public.languages for select to anon, authenticated using (true);
 create policy "Public read" on public.tags for select to anon, authenticated using (true);
-create policy "Public read" on public.books for select to anon, authenticated using (true);
+-- Soft-deleted books (tombstones from the future incremental sync) must never
+-- be served to clients.
+create policy "Public read" on public.books for select to anon, authenticated
+  using (not is_deleted);
 create policy "Public read" on public.book_languages for select to anon, authenticated using (true);
 create policy "Public read" on public.related_books for select to anon, authenticated using (true);
 

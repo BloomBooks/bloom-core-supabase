@@ -14,7 +14,8 @@ Functions, phases F0–F8). This doc covers the *database* side.
 - **IDs**: `id TEXT PRIMARY KEY` preserving legacy Parse objectIds. New rows get a
   DB-generated legacy-style 10-char alphanumeric id (`generate_legacy_style_id()`).
 - **Names**: Parse camelCase → snake_case (`bookInstanceId` → `book_instance_id`).
-  One irregular mapping: `bloomPUBVersion` → `bloom_pub_version`.
+  The conversion is capital-run-aware, so `bloomPUBVersion` → `bloom_pub_version` with no
+  special-casing. (The `analytics_*` fields already carry underscores in Parse.)
 - **Types**: Parse String → `text`, Number → `integer`/`numeric`/`bigint` (timestamps),
   Boolean → `boolean`, Date → `timestamptz`, Array-of-strings → `text[]`,
   Object / Array-of-objects → `jsonb` (`show`, `internet_limits`, `tools`).
@@ -24,14 +25,21 @@ Functions, phases F0–F8). This doc covers the *database* side.
   PR #76).
 - **Relations**: `books.lang_pointers text[]` keeps the raw language ids for sync fidelity,
   AND `book_languages` (junction, FKs) exists so PostgREST/supabase-js can embed language
-  records with books (`select("*, languages:languages(*)")`) — the equivalent of Parse's
-  `include=langPointers`. `books.uploader_id` → `users(id)`.
+  records with books — the equivalent of Parse's `include=langPointers`:
+  `select("*, languages(*)")` (PostgREST resolves the many-to-many through the junction
+  automatically). This works because Parse's legacy `languages` array field is deliberately
+  not ported (see correction 8) — the name is reserved for the embed.
+  `books.uploader_id` → `users(id)`.
 - **RLS**: enabled everywhere; anonymous public read via `Public read` policies + table
   grants; no client write policies (the sync tool writes with the service role, which
-  bypasses RLS).
+  bypasses RLS). Two policies are row-gated: soft-deleted books (`is_deleted`, the future
+  sync's tombstones) are never served, and a `users` row is only readable while the user
+  has at least one visible book — uploader emails stay embeddable for book display without
+  the table being a listable email directory.
 - **Deliberately absent (post-milestone work)**: derivation triggers replacing Parse's
   `beforeSave` (search string, tag normalization, moderator-field preservation — these must
-  be gated off for sync connections when they arrive), write policies, Firebase third-party
+  be gated off for sync connections when they arrive), `updated_at` triggers (same gating
+  problem — see correction 7), write policies, Firebase third-party
   auth wiring, and the classes `apiAccount` (needed for the opds function),
   `appSpecification`/`appDetailsInLanguage`/`booksInApp` (verify they're used at all before
   porting), `downloadHistory`, `version`, `bookDeletion` tombstones.
@@ -58,7 +66,16 @@ or superseded here:
    `search`/tags would fight the Parse-computed values the sync delivers. When triggers
    arrive they must be gated (e.g. a `bloom.sync` session flag) so sync writes pass through
    verbatim — which also gives us a parity test (replay a synced row through the triggers,
-   diff against Parse's output).
+   diff against Parse's output). This bit immediately: the v0 schema shipped `updated_at`
+   triggers stamping `now()` on update, which meant every importer re-run (an upsert's
+   update path) silently replaced Parse's real timestamps with the import time. They're
+   removed until the gating mechanism exists.
+8. Parse's legacy `books.languages` array is not ported. Production evidence (2026-07-18):
+   only 146 books have the field, none created after Jan 2015, and every value is `[]` —
+   it carries zero information. Keeping it would also have collided with the natural
+   PostgREST embed name: a `languages` *column* on `books` and an embedded `languages`
+   *relation* can't both appear in one response, forcing every consumer to alias the embed
+   forever. `lang_pointers` + `book_languages` carry the real language data.
 
 ## Roadmap after this milestone (summary)
 

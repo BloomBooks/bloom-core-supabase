@@ -134,7 +134,7 @@ const BOOK_COLUMNS = new Set([
   "has_bloom_pub", "imported_book_source_url", "importer_major_version",
   "importer_minor_version", "importer_name", "in_circulation",
   "internet_limits", "isbn", "keyword_stems", "keywords", "lang_pointers",
-  "languages", "last_uploaded", "leveled_reader_level", "librarian_note",
+  "last_uploaded", "leveled_reader_level", "librarian_note",
   "license", "license_notes", "original_publisher", "original_title",
   "page_count", "phash_of_first_content_image", "province", "publisher",
   "publisher_book_id", "reader_tools_available", "rebrand", "search", "show",
@@ -143,11 +143,13 @@ const BOOK_COLUMNS = new Set([
   "upload_pending_timestamp",
 ]);
 
-// Fields whose generic camel->snake conversion doesn't match the column name.
-const NAME_OVERRIDES = { bloomPUBVersion: "bloom_pub_version" };
-
+// camelCase -> snake_case, aware of capital runs: bloomPUBVersion ->
+// bloom_pub_version (not bloom_pubversion).
 function toSnake(name) {
-  return name.replace(/(?<=[a-z0-9])([A-Z])/g, "_$1").toLowerCase();
+  return name
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
 }
 
 function plainValue(v) {
@@ -164,14 +166,19 @@ function transformBook(parseBook) {
     updated_at: parseBook.updatedAt,
     uploader_id: parseBook.uploader?.objectId ?? null,
   };
+  // `languages` is deliberately dropped: empty on every production row, and
+  // its column-name slot is reserved for the PostgREST languages(*) embed
+  // (see the schema migration).
+  const specialFields = [
+    "objectId", "createdAt", "updatedAt", "ACL", "uploader", "languages",
+  ];
   for (const [key, value] of Object.entries(parseBook)) {
-    if (["objectId", "createdAt", "updatedAt", "ACL", "uploader"].includes(key))
-      continue;
+    if (specialFields.includes(key)) continue;
     if (key === "langPointers") {
       row.lang_pointers = (value ?? []).map((p) => p.objectId);
       continue;
     }
-    const col = NAME_OVERRIDES[key] ?? toSnake(key);
+    const col = toSnake(key);
     if (!BOOK_COLUMNS.has(col)) {
       droppedFields.add(key);
       continue;
