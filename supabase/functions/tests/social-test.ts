@@ -120,21 +120,6 @@ Deno.test("social - default description and image sizes", async () => {
   assertStringIncludes(html, `content = "256"`);
 });
 
-Deno.test("social - og:url uses X-Forwarded-Host from the routing worker", async () => {
-  const response = await handleSocialRequest(
-    new Request(
-      "https://someproject.supabase.co/functions/v1/social?link=https://bloomlibrary.org/1&title=T",
-      { headers: { "X-Forwarded-Host": "api.bloomlibrary.org" } }
-    )
-  );
-  const html = await response.text();
-  assertStringIncludes(
-    html,
-    `content="https://api.bloomlibrary.org/v1/social?link=https://bloomlibrary.org/1&amp;title=T"`
-  );
-  assert(!html.includes("supabase.co"));
-});
-
 Deno.test("social - og:url uses X-Bloom-Public-Url from the routing worker", async () => {
   const response = await handleSocialRequest(
     new Request(
@@ -167,27 +152,6 @@ Deno.test("social - spoofed X-Bloom-Public-Url host is ignored in og:url", async
   // the real request URL rather than trusting an arbitrary domain.
   assert(!html.includes("phishing-domain.com"));
   assertStringIncludes(html, "someproject.supabase.co");
-});
-
-Deno.test("social - spoofed X-Forwarded-Host is ignored in og:url", async () => {
-  const response = await handleSocialRequest(
-    new Request(
-      "https://someproject.supabase.co/functions/v1/social?link=https://bloomlibrary.org/1&title=T",
-      { headers: { "X-Forwarded-Host": "phishing-domain.com" } }
-    )
-  );
-  const html = await response.text();
-  // The untrusted host must not appear; we fall back to the real request URL.
-  assert(!html.includes("phishing-domain.com"));
-  assertStringIncludes(html, "someproject.supabase.co");
-  // Lookalike domains don't pass the suffix check either.
-  const lookalike = await handleSocialRequest(
-    new Request(
-      "https://someproject.supabase.co/functions/v1/social?link=https://bloomlibrary.org/1&title=T",
-      { headers: { "X-Forwarded-Host": "evilbloomlibrary.org" } }
-    )
-  );
-  assert(!(await lookalike.text()).includes("evilbloomlibrary.org"));
 });
 
 Deno.test("social - escapes html in parameters", () => {

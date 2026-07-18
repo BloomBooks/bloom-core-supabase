@@ -200,11 +200,10 @@ stripped, but a *non-proxy-managed* header rides through the Supabase edge untou
 staging 2026-07-17: with `X-Bloom-Public-Url` set to a `social.bloomlibrary.org` URL, `og:url`
 came back as that public URL with **no `*.supabase.co`** — both when routed through the existing
 worker (which copies client headers) and when sent directly to the Supabase function. So:
-- **Function side (merged to `develop`):** `getPublicUrl` prefers a full public URL supplied in
-  `X-Bloom-Public-Url`, validated against the `bloomlibrary.org` allowlist, before falling back to
-  the legacy `X-Forwarded-Host` path and then `req.url`. Carrying the *full* URL also disposes of
-  the `/functions/v1/` vs `/v1/social` path bug above, since the worker sends the already-correct
-  public path.
+- **Function side:** `getPublicUrl` reads a full public URL from `X-Bloom-Public-Url`, validated
+  against the `bloomlibrary.org` allowlist, and otherwise falls back to `req.url`. Carrying the
+  *full* URL also disposes of the `/functions/v1/` vs `/v1/social` path bug above, since the worker
+  sends the already-correct public path. (The dead `X-Forwarded-Host` path has been removed.)
 - **Worker side (needs an ops deploy of `cloudflare/worker.js`):** the routing worker sets
   `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
   `X-Forwarded-Host`.
@@ -214,8 +213,8 @@ needed, and `social` need not be cut over last** — it works correctly through 
 other migrated function, on both `api.bloomlibrary.org` and `social.bloomlibrary.org` (each
 mirrors its own host, since the worker forwards whichever public URL the request arrived on).
 
-Follow-up: once the worker change is deployed, remove the now-dead `X-Forwarded-Host` fallback
-from `getPublicUrl`.
+Remaining step: an ops deploy of the updated `cloudflare/worker.js` to Cloudflare (staging, then
+production). Until then, deployed functions simply fall back to `req.url` (no regression).
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
