@@ -210,8 +210,24 @@ create policy "Public read" on public.tags for select to anon, authenticated usi
 -- be served to clients.
 create policy "Public read" on public.books for select to anon, authenticated
   using (not is_deleted);
-create policy "Public read" on public.book_languages for select to anon, authenticated using (true);
-create policy "Public read" on public.related_books for select to anon, authenticated using (true);
+-- Junction rows must not enumerate the ids of soft-deleted (invisible) books.
+create policy "Public read" on public.book_languages for select to anon, authenticated
+  using (
+    exists (
+      select 1 from public.books b
+      where b.id = book_id and not b.is_deleted
+    )
+  );
+-- Same principle: a related_books row is only served while at least one of
+-- its books is visible. (A mixed row can still contain a deleted book's id
+-- in book_ids — an opaque id whose book row stays unreadable.)
+create policy "Public read" on public.related_books for select to anon, authenticated
+  using (
+    exists (
+      select 1 from public.books b
+      where b.id = any (book_ids) and not b.is_deleted
+    )
+  );
 
 -- Table-level grants (RLS policies filter rows; grants allow the operation).
 grant select on public.users, public.languages, public.tags, public.books,
