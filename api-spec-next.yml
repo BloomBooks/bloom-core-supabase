@@ -34,6 +34,52 @@ components:
           type: integer
       required: [tag]
 paths:
+  # Implemented (supabase/functions/send-concern-email/) on the send-concern-email branch, but not
+  # yet merged/deployed, so it stays in api-spec-next.yml until it goes live. Replaces the Parse
+  # Cloud Code function `sendConcernEmail` used by blorg's "report a concern about this book" form.
+  /send-concern-email:
+    post:
+      description:
+        Emails the Bloom team a concern reported about a book, via a Mailgun
+        template. No auth (blorg gates this behind login client-side; there is
+        no Supabase JWT yet since blorg still authenticates via Parse).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fromAddress:
+                  description: the reporter's email address; used as the outgoing email's "from"
+                  type: string
+                  format: email
+                content:
+                  description: the reporter's free-text description of the concern (max 5000 chars)
+                  type: string
+                  maxLength: 5000
+                bookId:
+                  description: the database ID of the book being reported
+                  type: string
+              required: [fromAddress, content, bookId]
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                required: [success]
+        400:
+          description: Bad Request - missing/invalid fromAddress, content, or bookId
+        404:
+          description: Not Found - no book with that ID
+        500:
+          description: Internal Server Error - the book lookup or the Mailgun request failed
+
   # not needed yet (since we have the expanded form from /books)
   /languages/{tag}:
     get:

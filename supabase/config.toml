@@ -362,3 +362,10 @@ verify_jwt = false
 
 [functions.social]
 verify_jwt = false
+
+# blorg users still authenticate via Parse during the transition, so there is no
+# Supabase JWT to verify here. TODO: set this back to true (the default) once blorg
+# moves to Supabase Auth, and have the function derive fromAddress from the JWT
+# instead of trusting the request body.
+[functions.send-concern-email]
+verify_jwt = false
