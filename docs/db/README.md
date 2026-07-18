@@ -6,7 +6,7 @@ from production Parse, and blorg (branch `SupabaseMigration`) can browse it anon
 against a local stack. Parse remains the production system of record; nothing here is
 serving production traffic yet.
 
-See `MIGRATION-PLAN.md` at the repo root for the *functions* migration (Azure → Edge
+See `FUNCTIONS-MIGRATION-PLAN.md` at the repo root for the *functions* migration (Azure → Edge
 Functions, phases F0–F8). This doc covers the *database* side.
 
 ## Schema conventions
