@@ -20,6 +20,11 @@ export type Book = {
   inCirculation: boolean;
   ACL: Record<string, any>;
   harvestState: string;
+  // Optional because most callers don't request them; Parse returns whatever
+  // fields exist on the record regardless of this type, so any book that has
+  // them set will still populate these when read.
+  copyright?: string;
+  license?: string;
 };
 
 export default class BloomParseServer {
