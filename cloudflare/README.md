@@ -87,6 +87,12 @@ curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/subscriptionInf
 
 ### Stage 2 — production worker (after staging is confirmed)
 
+> ⚠️ `worker.js` in this folder lists **every** migrated function in
+> `SUPABASE_FUNCTIONS`, which is right for staging but would cut all production
+> traffic over at once. For the production worker, edit that list down to just
+> `"fs"` before deploying; we will then ask for one-line extensions as each
+> function passes staging verification (each is an instant rollback if needed).
+
 1. **Create the worker**: same steps as Stage 1, same script, named `bloom-api-router`.
 2. **Variable**: `SUPABASE_FUNCTIONS_HOST` = `sekpsuviwfhzzznzrdgx.supabase.co`
    (the production Supabase project; same host the current production redirect rule points at).

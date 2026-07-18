@@ -93,26 +93,30 @@ function isAllowedPublicHost(hostname: string): boolean {
   return host === "bloomlibrary.org" || host.endsWith(".bloomlibrary.org");
 }
 
-// When a request comes through the Cloudflare worker that fronts api.bloomlibrary.org,
-// the URL the function sees is the Supabase one
-// (https://<project>.supabase.co/functions/v1/<fn>...). The worker sets X-Forwarded-Host
-// to the original hostname; use it to reconstruct the public URL so that any URLs we
-// generate (og:url, OPDS links) don't leak the Supabase project URL.
-// Only bloomlibrary.org hostnames are honored: a caller who bypasses the worker and sets
-// X-Forwarded-Host itself must not be able to spoof an arbitrary domain into those URLs.
+// Recovers the original public URL a client used, for links we generate (og:url, OPDS links,
+// etc.). Requests reach the function bearing the internal Supabase URL because the routing
+// worker rewrites the host; the worker passes the real public URL alongside, which we prefer
+// here so those links don't leak the *.supabase.co project URL. Details inline below.
 export function getPublicUrl(request: Request): URL {
-  const url = new URL(request.url);
-  const forwardedHost = request.headers.get("x-forwarded-host");
-  if (forwardedHost && isAllowedPublicHost(forwardedHost)) {
-    url.hostname = forwardedHost;
-    url.protocol = "https:";
-    url.port = "";
-    // /functions/v1/<fn> (Supabase) is /v1/<fn> on the public hostname
-    if (url.pathname.startsWith("/functions/v1/")) {
-      url.pathname = url.pathname.substring("/functions".length);
+  // The routing worker forwards the original public request URL in this custom
+  // header. A non-standard name is used (not X-Forwarded-*) because Supabase's
+  // edge strips proxy-managed forwarding headers before the function sees them
+  // (verified on staging; see FUNCTIONS-MIGRATION-PLAN.md). Only bloomlibrary.org
+  // hosts are honored, so a caller that sets the header itself cannot spoof an
+  // arbitrary domain into the URLs we generate; if it is absent or untrusted we
+  // fall back to the request's own URL.
+  const publicUrl = request.headers.get("x-bloom-public-url");
+  if (publicUrl) {
+    try {
+      const parsed = new URL(publicUrl);
+      if (isAllowedPublicHost(parsed.hostname)) {
+        return parsed;
+      }
+    } catch {
+      // malformed header; fall through to the request URL
     }
   }
-  return url;
+  return new URL(request.url);
 }
 
 export function checkForRequiredEnvVars(envVars: string[]): void {

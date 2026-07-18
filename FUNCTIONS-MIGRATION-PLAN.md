@@ -134,6 +134,14 @@ Risk here combines: implementation complexity, blast radius if it breaks, whethe
 data, and how easily it rolls back (all HTTP functions roll back instantly via the Cloudflare
 rule; timers roll back by re-enabling the Azure timer).
 
+**The API contract.** [`api-spec.yml`](api-spec.yml) — the OpenAPI spec for the public API at
+`https://api.bloomlibrary.org/v1`, ported from the Azure repo — is landed **first**, ahead of
+every phase below, as the reference each migration must preserve. The phases move each endpoint's
+*implementation* from Azure to Supabase; the contract they honor does not change. Everything in
+`api-spec.yml` is live; planned-but-unimplemented endpoints (currently only `/languages/{tag}`,
+never implemented in either repo) live in [`api-spec-next.yml`](api-spec-next.yml) and graduate
+to `api-spec.yml` when built.
+
 ### Phase 0 — `fs` ✅ done
 Serving production. Remaining follow-ups: document the Cloudflare rule (Appendix A), and confirm
 Azure `fs` traffic has actually dropped to zero before deleting the Azure function.
@@ -157,11 +165,56 @@ state, verification curls, and the per-function extension process.
 - Watch-outs: preserve exact OpenGraph output (test with Facebook's sharing debugger);
   `social.bloomlibrary.org` needs its own Cloudflare rule in addition to
   `api.bloomlibrary.org/v1/social`.
-- Status: **implemented** (`supabase/functions/social/`), awaiting staging verification and
-  worker cutover. Two deliberate changes from the Azure version: parameters are HTML-escaped
-  (the Azure version interpolated them raw — an injection vector), and `og:url` is
-  reconstructed from the `X-Forwarded-Host` header the routing worker now sends (otherwise it
-  would leak the Supabase URL).
+- Status: **implemented** (`supabase/functions/social/`) and merged to `develop`. Two changes
+  from the Azure version: parameters are HTML-escaped (the Azure version interpolated them raw —
+  an injection vector), and the public `og:url` is reconstructed from a custom header the worker
+  sends (see the `og:url` finding below). No special cutover ordering is needed.
+
+#### The `og:url` / host-rewrite problem (verified on staging 2026-07-17)
+When the worker proxies a migrated function it must rewrite the request host to
+`<ref>.supabase.co` — you cannot reach Supabase under the `bloomlibrary.org` host. So the
+function sees its own URL as the Supabase one and can't build a public `og:url` from `req.url`.
+The code tries to carry the original host across in an `X-Forwarded-Host` header the worker
+sets — **but that header does not survive.** `X-Forwarded-*` are proxy-managed headers, and the
+Cloudflare/gateway layer in front of the Supabase runtime strips or overwrites them before the
+Deno function sees them. Verified on staging: a `curl` that set `X-Forwarded-Host` **by hand,
+directly at `*.supabase.co` (bypassing the worker entirely), still didn't reach the function** —
+so the loss is at the Supabase edge, not in our worker. Result: `og:url` silently falls back to
+the `*.supabase.co` URL — exactly the leak §2a-5 warns about.
+
+**Current production behavior (verified 2026-07-17).** Production is unaffected today because it
+is still on Azure. Both public entry points — `api.bloomlibrary.org/v1/social` and
+`social.bloomlibrary.org/v1/social` — hit the *same* Azure function (identical `Request-Context`
+appId) and differ in exactly one way: each **mirrors its own host into `og:url`** (`api.…` →
+`https://api.bloomlibrary.org/v1/social?...`, `social.…` →
+`https://social.bloomlibrary.org/v1/social?...`). Azure gets this for free because the request
+reaches it already bearing the public host. Preserving that per-host mirror is the target
+behavior for the migrated version.
+
+Second, latent bug found the same way: `getPublicUrl` strips a `/functions/v1/` path prefix, but
+the function's actual `req.url` path is `/social` (no such prefix), so even a surviving header
+would rebuild `/social`, not the `/v1/social` Azure emits.
+
+**Resolution (implemented): carry the public URL in a custom header.** `X-Forwarded-*` is
+stripped, but a *non-proxy-managed* header rides through the Supabase edge untouched. Verified on
+staging 2026-07-17: with `X-Bloom-Public-Url` set to a `social.bloomlibrary.org` URL, `og:url`
+came back as that public URL with **no `*.supabase.co`** — both when routed through the existing
+worker (which copies client headers) and when sent directly to the Supabase function. So:
+- **Function side:** `getPublicUrl` reads a full public URL from `X-Bloom-Public-Url`, validated
+  against the `bloomlibrary.org` allowlist, and otherwise falls back to `req.url`. Carrying the
+  *full* URL also disposes of the `/functions/v1/` vs `/v1/social` path bug above, since the worker
+  sends the already-correct public path. (The dead `X-Forwarded-Host` path has been removed.)
+- **Worker side (needs an ops deploy of `cloudflare/worker.js`):** the routing worker sets
+  `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
+  `X-Forwarded-Host`.
+
+This supersedes the earlier idea of a DNS/custom-domain switch: **no Supabase custom domain is
+needed, and `social` need not be cut over last** — it works correctly through the worker like any
+other migrated function, on both `api.bloomlibrary.org` and `social.bloomlibrary.org` (each
+mirrors its own host, since the worker forwards whichever public URL the request arrived on).
+
+Remaining step: an ops deploy of the updated `cloudflare/worker.js` to Cloudflare (staging, then
+production). Until then, deployed functions simply fall back to `req.url` (no regression).
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
@@ -269,6 +322,15 @@ When Azure traffic is zero (verify via Azure metrics/logs over ≥30 days, remem
 timers and long-tail OPDS clients): disable the functions app, retire the Kudu deployment, rotate
 any credentials that lived in Azure app settings, archive the repo with a pointer to this one.
 
+**What remains relevant in the Azure repo** (everything else — functions, shared code, tests,
+api-spec, host/deploy config, READMEs — has been ported here or superseded):
+1. The **secret values** in the Function App's settings (portal → Configuration → Application
+   settings; also on dev machines in `local.settings.json`) — the source when provisioning the
+   checklist in §4. Never in git.
+2. The **running app itself** until cutover completes.
+3. The unit-test Parse server (`bloom-parse-server-unittest.azurewebsites.net`) is a separate
+   Azure App Service from the `bloom-parse-server` repo — out of scope; it stays.
+
 ---
 
 ## 4. Cross-cutting concerns
@@ -296,6 +358,47 @@ any credentials that lived in Azure app settings, archive the repo with a pointe
   the Azure app deployed and warm until the very end.
 - **Monitoring:** decide per-phase how we'll know it broke — Supabase function logs/metrics at
   minimum; consider forwarding errors to whatever alerting the team already watches.
+
+---
+
+## 5. Cutover runbook (the order of operations from here)
+
+All code is implemented (phases 1–5, 7, 8, the worker, and the spec). What remains is
+operational, in this order:
+
+1. **Merge the branch stack** bottom-up into `develop` (`api-spec` → `phase2-subscriptions` →
+   `phase3-contentful-to-crowdin` → `phase4-opds` → `phase5-stats` → `phase7-book-cleanup` →
+   `phase8-books`; `phase1-social` is already on `develop`). Each merge auto-deploys functions
+   **and migrations** to the staging project. Before the first merge, provision the secrets
+   checklist (§4) on the staging Supabase project and the GitHub repo secrets (`BLOOM_CRON_SECRET`,
+   `BLOOM_SUPABASE_{STAGING,PRODUCTION}_DB_PASSWORD`) — the contentfulToCrowdin cron activates on
+   merge and will report failures until its secrets exist.
+2. **Ops deploys the staging worker** (Stage 1 of [`cloudflare/README.md`](cloudflare/README.md)).
+3. **Verify on `staging-api.bloomlibrary.org`**: every function's smoke tests; the OPDS
+   byte-diff against Azure output (`lang`/`tag`/`epub`/`src` matrix); a real Bloom Desktop
+   upload (upload-start → S3 sync → upload-finish → status polling); `stats` against the
+   analytics DB (confirms the firewall accepts Supabase egress); safe-mode `bookCleanup` runs
+   compared against what the Azure timer deletes.
+4. **Ops deploys the production worker** (Stage 2). ⚠️ The checked-in `cloudflare/worker.js`
+   lists **all** migrated functions, so deploying it verbatim cuts everything over at once.
+   For production, start `SUPABASE_FUNCTIONS` with just `"fs"` and extend it one function at a
+   time as each passes staging verification; each extension is an instant-rollback one-line
+   change. Extend `social` **last of all** — its production cutover is deferred to the end-state
+   DNS switch described in §3 (Phase 1), when the `bloomlibrary.org` hosts point directly at
+   Supabase and the worker is retired.
+5. **Timers**: uncomment the bookCleanup workflow schedule only after step 3's safe-mode
+   comparison and after disabling the Azure timer (never both live). Disable the Azure
+   contentfulToCrowdin timer once the GitHub cron has succeeded a few days in a row.
+6. **Phase 6** (materialized views): set up pg_cron + the `refresh_log` change + the freshness
+   watchdog in the analytics DB (see Phase 6 above) and disable the Azure `dailyTimer`.
+7. **Provision production secrets** and repeat the per-function worker extension on
+   `api.bloomlibrary.org` (step 4's list and ordering — `social` last).
+8. **Decommission** Azure per the checklist above.
+
+Note on tests: the suite includes live tests ported from Azure (Google Sheet lookups, prod-Parse
+OPDS queries, S3 bucket round-trips, the end-to-end bookCleanup scenario). They skip themselves
+unless their credentials are present in the environment — same env-var names as the functions
+(see `.env.example`) — so a bare `pnpm test:ci` run only exercises what its secrets allow.
 
 ---
 
