@@ -300,11 +300,18 @@ async function main() {
 
   // 5. Transform books and build the junction rows.
   const bookRows = parseBooks.map(transformBook);
-  const bookLanguageRows = parseBooks.flatMap((b) =>
-    (b.langPointers ?? [])
+  // Dedupe per book: a duplicated langPointer would put the same
+  // (book_id, language_id) twice in one upsert statement, which Postgres
+  // rejects ("ON CONFLICT DO UPDATE command cannot affect row a second time").
+  const bookLanguageRows = parseBooks.flatMap((b) => {
+    const langIds = (b.langPointers ?? [])
       .filter((lp) => lp?.objectId && languagesById.has(lp.objectId))
-      .map((lp) => ({ book_id: b.objectId, language_id: lp.objectId }))
-  );
+      .map((lp) => lp.objectId);
+    return [...new Set(langIds)].map((id) => ({
+      book_id: b.objectId,
+      language_id: id,
+    }));
+  });
   if (droppedFields.size > 0) {
     console.warn(
       `WARNING: Parse fields not in the books schema were dropped: ` +
