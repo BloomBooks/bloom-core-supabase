@@ -336,6 +336,9 @@ deno_version = 2
 BLOOM_PARSE_APP_ID_PROD = "env(BLOOM_PARSE_APP_ID_PROD)"
 BLOOM_PARSE_APP_ID_DEV = "env(BLOOM_PARSE_APP_ID_DEV)"
 BLOOM_PARSE_APP_ID_UNIT_TEST = "env(BLOOM_PARSE_APP_ID_UNIT_TEST)"
+# send-concern-email (optional locally; unset -> the function no-ops, see .env.example)
+MAILGUN_API_KEY = "env(MAILGUN_API_KEY)"
+EMAIL_REPORT_BOOK_RECIPIENT = "env(EMAIL_REPORT_BOOK_RECIPIENT)"
 
 [analytics]
 enabled = true
