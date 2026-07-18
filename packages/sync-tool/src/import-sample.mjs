@@ -214,7 +214,10 @@ async function main() {
     if (booksById.size >= SAMPLE_TARGET * 1.2) break;
     const results = await parseQuery("books", {
       where: { ...BASE_WHERE, ...q.where },
-      limit: q.limit,
+      // Per-category limits below assume SAMPLE_TARGET's ~100 default; scale
+      // them so a larger SAMPLE_TARGET actually grows the sample instead of
+      // just changing the early-exit threshold above.
+      limit: Math.ceil(q.limit * (SAMPLE_TARGET / 100)),
       ...(q.order ? { order: q.order } : {}),
       include: "uploader,langPointers",
     });
