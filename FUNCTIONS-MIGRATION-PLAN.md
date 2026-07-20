@@ -204,8 +204,8 @@ worker (which copies client headers) and when sent directly to the Supabase func
   against the `bloomlibrary.org` allowlist, and otherwise falls back to `req.url`. Carrying the
   *full* URL also disposes of the `/functions/v1/` vs `/v1/social` path bug above, since the worker
   sends the already-correct public path. (The dead `X-Forwarded-Host` path has been removed.)
-- **Worker side (needs an ops deploy of `cloudflare/worker.js`):** the routing worker sets
-  `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
+- **Worker side (deployed to staging 2026-07-17; production deploy pending):** the routing worker
+  sets `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
   `X-Forwarded-Host`.
 
 This supersedes the earlier idea of a DNS/custom-domain switch: **no Supabase custom domain is
@@ -213,8 +213,15 @@ needed, and `social` need not be cut over last** — it works correctly through 
 other migrated function, on both `api.bloomlibrary.org` and `social.bloomlibrary.org` (each
 mirrors its own host, since the worker forwards whichever public URL the request arrived on).
 
-Remaining step: an ops deploy of the updated `cloudflare/worker.js` to Cloudflare (staging, then
-production). Until then, deployed functions simply fall back to `req.url` (no regression).
+**End-to-end verified on staging (2026-07-17).** With the worker change deployed, a plain request
+through `staging-api.bloomlibrary.org/v1/social` (no client-set header) returned
+`og:url = https://staging-api.bloomlibrary.org/v1/social?...` with no `*.supabase.co` and the
+redirect intact — the worker injects the header on its own and the function honors it, matching
+Azure's current per-host behavior.
+
+Remaining step: deploy the same `cloudflare/worker.js` to **production** at cutover time. Until
+then, production stays on Azure; and on staging, any not-yet-wired host simply falls back to
+`req.url` (no regression).
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
