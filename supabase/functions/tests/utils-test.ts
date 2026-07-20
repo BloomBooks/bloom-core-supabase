@@ -7,6 +7,7 @@ import {
   getEnvironment,
   getNumberFromQuery,
   getBooleanFromQueryAsOneOrZero,
+  parseBooleanQueryParam,
   isAllowedCorsOrigin,
 } from "../_shared/utils.ts";
 
@@ -151,6 +152,20 @@ Deno.test({
 
     const params2 = new URLSearchParams("active=FALSE");
     assertEquals(getBooleanFromQueryAsOneOrZero(params2, "active"), undefined);
+  },
+});
+
+Deno.test({
+  name: "utils - parseBooleanQueryParam treats false/0/no/empty as false",
+  fn: () => {
+    for (const falsey of ["false", "FALSE", "0", "no", "", "  false  "]) {
+      assertEquals(parseBooleanQueryParam(falsey), false, `for ${falsey}`);
+    }
+    for (const truthy of ["true", "1", "yes", "anything"]) {
+      assertEquals(parseBooleanQueryParam(truthy), true, `for ${truthy}`);
+    }
+    assertEquals(parseBooleanQueryParam(undefined), undefined);
+    assertEquals(parseBooleanQueryParam(null), undefined);
   },
 });
 

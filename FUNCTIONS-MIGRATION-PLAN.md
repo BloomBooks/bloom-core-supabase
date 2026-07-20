@@ -306,6 +306,11 @@ same daily 22:30 UTC schedule — but the port changed several things:
   Mitigate with byte-level diffing of old vs. new output across a matrix of
   `lang`/`tag`/`epub`/`src` parameters before cutover.
 - Needs `BLOOM_PARSE_CATALOG_SERVICE_PASSWORD` (+ unit-test API-account id for tests).
+- Status: **implemented** (`supabase/functions/opds/`). XML generation, book filtering, and
+  api-account gating ported verbatim (the `entities` npm dependency replaced by an equivalent
+  local `encodeXML`). Links use the public URL from `X-Forwarded-Host`. The output-diffing
+  exercise against the Azure version (`lang`/`tag`/`epub`/`src` matrix) still needs to be done
+  on staging before cutover.
 
 ### Phase 5 — `stats` (read-only, adds the Postgres dependency)
 - Calls stored procedures in the analytics Postgres DB (read-only user), sometimes seeding a
