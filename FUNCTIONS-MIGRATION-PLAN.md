@@ -342,6 +342,15 @@ same daily 22:30 UTC schedule — but the port changed several things:
   to App Insights, which nobody is alerted on either.
 - Risk: needs the server-parameter change (restart) on the analytics DB. Failure mode is stale
   stats (detectable, recoverable), not data loss.
+- Status: **watchdog implemented** (`.github/workflows/cron-analytics-freshness-watchdog.yml`) —
+  a pure-`psql` GitHub Actions cron (daily, ~2h after the refresh) that asserts the latest
+  `refresh-materialized-views` pg_cron run succeeded within 25h, reading pg_cron's own
+  `cron.job_run_details` (no custom `refresh_log` table needed), and fails (→ GitHub failure
+  email) on staleness/failure/never-fired. The DB side (pg_cron enable + schedule + read-only
+  grants, with the non-superuser visibility caveat and `common.mv_refresh_status` fallback) is
+  documented as an ops/DBA runbook in [`analytics/README.md`](analytics/README.md). Remaining:
+  ops runs that runbook, then add the `BLOOM_ANALYTICS_READONLY_URL` repo secret and disable the
+  Azure `dailyTimer`.
 
 ### Phase 7 — `bookCleanup` (destructive timer)
 - Deletes abandoned-upload S3 files and Parse book records older than 24h. First function that

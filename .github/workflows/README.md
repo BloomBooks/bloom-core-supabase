@@ -86,6 +86,11 @@ You need to configure the following secrets in your GitHub repository settings:
 - `BLOOM_PARSE_APP_ID_DEV`
 - `BLOOM_PARSE_APP_ID_UNIT_TEST`
 
+### Analytics Freshness Watchdog
+- `BLOOM_ANALYTICS_READONLY_URL`: libpq connection URL for the **read-only** analytics DB user,
+  used only by `cron-analytics-freshness-watchdog.yml`. Format:
+  `postgresql://<readonly_user>:<pw>@bloom-analytics.postgres.database.azure.com:5432/<db>?sslmode=require`
+
 ## Setting Up GitHub Environments (Optional but Recommended)
 
 GitHub Environments provide additional protection and visibility:

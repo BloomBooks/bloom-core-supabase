@@ -1,0 +1,73 @@
+# Watchdog for the analytics materialized-view refresh (Phase 6 of the Azure->Supabase migration).
+#
+# The refresh itself runs inside the analytics Postgres via pg_cron under the job name
+# 'refresh-materialized-views' (that work lives in the external analytics-postgreSQL repo, not
+# here). pg_cron only RECORDS run outcomes -- it never pushes alerts -- so this workflow connects
+# with the read-only analytics user and asserts freshness: the most recent run of that job must
+# have succeeded within the last ~25h. A job that never fired (no rows) fails too. Any
+# failure/staleness exits non-zero and triggers GitHub's normal workflow-failure email.
+#
+# Required repository secret:
+#   BLOOM_ANALYTICS_READONLY_URL - libpq connection URL for the read-only analytics user, e.g.
+#     postgresql://<readonly_user>:<pw>@bloom-analytics.postgres.database.azure.com:5432/<db>?sslmode=require
+#
+# External dependency (Part A -- ops/DBA, in the analytics DB). Full runbook with exact SQL:
+#   ../../analytics/README.md. In short:
+#   * enable pg_cron (azure.extensions + shared_preload_libraries + cron.database_name; needs a
+#     server restart);
+#   * cron.schedule the 'refresh-materialized-views' job to match the Azure dailyTimer's 10:40 run
+#     (and timezone), plus a prune-cron-history job to bound cron.job_run_details growth;
+#   * grant the read-only analytics user access to cron.job_run_details.
+#   CAVEAT: pg_cron shows a NON-superuser only its OWN jobs, so verify the read-only user can
+#   actually see the admin-scheduled job's rows. If it can't, expose an admin-owned
+#   common.mv_refresh_status view (security definer) over cron.job_run_details and point the
+#   queries below at that view instead. (See the runbook for the exact view + grants.)
+
+name: "Cron: analytics MV freshness watchdog"
+
+on:
+  schedule:
+    - cron: "40 12 * * *"   # ~2h after the 10:40 refresh; adjust if the refresh time moves
+  workflow_dispatch:
+
+jobs:
+  check-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5   # bound the run; without it an unreachable DB would hang until GitHub's 6h cap
+    steps:
+      - name: Assert the materialized-view refresh ran successfully within the last 25h
+        env:
+          PGCONN: ${{ secrets.BLOOM_ANALYTICS_READONLY_URL }}
+          # libpq: fail fast (seconds, not the OS TCP default) when the analytics host is unreachable,
+          # so a broken DB surfaces as a clear failure rather than a long hang. Format-independent —
+          # no need to bake connect_timeout into the connection URL / secret.
+          PGCONNECT_TIMEOUT: "10"
+        run: |
+          set -euo pipefail
+
+          # Recent runs of the refresh job, for triage in the workflow log.
+          psql "$PGCONN" -v ON_ERROR_STOP=1 -c "
+            SELECT d.status, d.start_time, d.end_time, d.return_message
+            FROM cron.job_run_details d
+            JOIN cron.job j ON j.jobid = d.jobid
+            WHERE j.jobname = 'refresh-materialized-views'
+            ORDER BY d.start_time DESC
+            LIMIT 5;"
+
+          # 1 iff the LATEST run succeeded within the last 25h; an empty result set
+          # (job never fired) yields no row, so healthy defaults to 0 -> the job fails.
+          healthy=$(psql "$PGCONN" -v ON_ERROR_STOP=1 -tAc "
+            SELECT CASE
+                     WHEN d.status = 'succeeded'
+                          AND d.end_time > now() - interval '25 hours'
+                     THEN 1 ELSE 0
+                   END
+            FROM cron.job_run_details d
+            JOIN cron.job j ON j.jobid = d.jobid
+            WHERE j.jobname = 'refresh-materialized-views'
+            ORDER BY d.start_time DESC
+            LIMIT 1;")
+          healthy=${healthy:-0}
+
+          echo "refresh healthy (latest run succeeded within 25h): $healthy"
+          test "$healthy" = "1"
