@@ -27,7 +27,7 @@ curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" 
 ## 📋 Prerequisites
 
 - [pnpm](https://pnpm.io/) v11+ (pins its own version via `packageManager` and downloads
-  Node.js v22.20.0 via `devEngines.runtime` in `package.json` — no Volta or manual Node install needed)
+  Node.js v24.18.0 via `devEngines.runtime` in `package.json` — no Volta or manual Node install needed)
 - [Deno](https://deno.com/) v2.9+ (runs and tests the edge functions)
 - [Docker Desktop](https://docs.docker.com/desktop/) (local development only)
 - [Supabase account](https://supabase.com/)
