@@ -246,6 +246,51 @@ then, production stays on Azure; and on staging, any not-yet-wired host simply f
   Pick one and reuse it for the other timers.
 - Run both Azure and Supabase versions in parallel for a few days (Crowdin uploads are
   idempotent) before disabling the Azure timer.
+- Status: **implemented** (`supabase/functions/contentfulToCrowdin/`). Scheduling mechanism
+  chosen: **GitHub Actions cron** (`.github/workflows/cron-contentful-to-crowdin.yml`, daily
+  22:30 UTC, same as Azure). The function is gated by an `x-bloom-cron-secret` header matching
+  the `BLOOM_CRON_SECRET` secret.
+- **Cutover config.** Real Crowdin writes are opt-in (see "Differences from the Azure
+  implementation" below): set `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD=true` on the
+  **production** Supabase project only, and first do a dry run against staging to confirm the
+  logged high / low / church counts look sane.
+
+#### Differences from the Azure implementation
+
+Same inputs and outputs — the same Contentful space, the same three Crowdin files/ids, and the
+same daily 22:30 UTC schedule — but the port changed several things:
+
+- **Trigger.** Azure used a built-in timer trigger. Supabase Edge Functions have none, so a
+  GitHub Actions `schedule:` workflow (`cron-contentful-to-crowdin.yml`) POSTs to the deployed
+  function. The function runs with `verify_jwt = false` and authenticates the caller itself via an
+  `x-bloom-cron-secret` header (matching `BLOOM_CRON_SECRET`); the Azure timer needed no HTTP auth.
+- **Contentful access.** Azure used the `contentful` npm SDK (`client.getEntries`). We call the
+  Contentful Content Delivery REST API directly (`cdn.contentful.com/.../entries`) since we only
+  need flat fields. The query is identical (`content_type`, `fields.localization[ne]=No`,
+  `limit=1000`), so the server-side filtering behavior is the same.
+- **Crowdin upload — now awaited.** Azure used the Crowdin SDK and did **not** await the upload
+  promises (fire-and-forget), so a failed upload could pass silently. We call the Crowdin REST v2
+  API directly (the same two calls the SDK made — `storages` POST, then `files/{id}` PUT), `await`
+  both via `Promise.all`, check each response, and fail the run (throw → HTTP 500 → the workflow
+  job fails) on any error.
+- **When it writes — inverted to opt-in.** Azure ran for real unless it detected a local
+  environment (`if (!runEvenIfLocal && isLocalEnvironment()) return;`) — i.e. "run unless local",
+  which meant Azure *staging* also wrote to the real Crowdin and had to be disabled by hand in the
+  portal. We inverted this: uploads happen only when
+  `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD=true` (production). Local and staging default to a dry
+  run that reads Contentful and logs the counts but writes nothing — no manual disabling, and local
+  dev can't write by accident.
+- **Empty-file guard — new.** Azure had only the upper-bound `>= 1000` guard and uploaded each file
+  unconditionally, so a filter matching zero entries would blank a Crowdin file (this never fired
+  because production always has entries in every bucket). We added a lower-bound guard
+  (`assertNoEmptyFiles`) that throws before uploading if any of the three files would be empty. It
+  is all-or-nothing — any empty bucket aborts the whole run — and runs in dry runs too. (A future
+  refinement could make it per-file.)
+- **Not ported yet.** Azure's `common/contentful.ts` also holds the editor-collection permission
+  helpers used by the `books` function; those are deliberately left for the `books` migration.
+- **Naming / config.** Env var names were standardized (`BLOOM_CONTENTFUL_READ_ONLY_TOKEN`,
+  `BLOOM_CROWDIN_API_TOKEN`, `BLOOM_CRON_SECRET`, `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD`) and
+  supplied through the Supabase edge-runtime secrets (`config.toml`) instead of Azure app settings.
 
 ### Phase 4 — `opds` (read-only, but external contract)
 - ParseServer-only dependency, and `_shared/BloomParseServer.ts` already has the
