@@ -12,7 +12,7 @@ pnpm install
 cp .env.example .env.local
 # Edit .env.local with your Parse Server credentials
 
-# Start local development (requires Docker)
+# Start local development (requires a container runtime — see Prerequisites)
 pnpm dev
 
 # Run tests
@@ -21,7 +21,7 @@ pnpm test
 
 Test the fs function:
 ```bash
-curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
+curl "http://127.0.0.1:44321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
 ```
 
 ## 📋 Prerequisites
@@ -29,8 +29,45 @@ curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" 
 - [pnpm](https://pnpm.io/) v11+ (pins its own version via `packageManager` and downloads
   Node.js v22.20.0 via `devEngines.runtime` in `package.json` — no Volta or manual Node install needed)
 - [Deno](https://deno.com/) v2.9+ (runs and tests the edge functions)
-- [Docker Desktop](https://docs.docker.com/desktop/) (local development only)
+- A container runtime (local development only): [Podman](https://podman.io/) (see
+  [Windows + Podman setup](#-windows--podman-setup) below) or
+  [Docker Desktop](https://docs.docker.com/desktop/)
 - [Supabase account](https://supabase.com/)
+
+## 🪟 Windows + Podman setup
+
+Podman is the supported non-Docker-Desktop way to run the local stack (verified 2026-07):
+
+```powershell
+winget install RedHat.Podman
+podman machine init
+podman machine set --rootful   # required: rootless port forwarding doesn't reach the Windows host
+podman machine start
+```
+
+Then start the stack. If Docker Desktop is also installed, point the CLI at Podman's pipe
+explicitly, and exclude the analytics services (on Windows they require a TCP-exposed
+Docker daemon, which Podman doesn't provide):
+
+```powershell
+$env:DOCKER_HOST = "npipe:////./pipe/podman-machine-default"
+pnpm exec supabase start -x logflare,vector
+```
+
+Gotchas we hit so you don't have to:
+
+- **Local ports are 443xx, not Supabase's default 543xx** (API `44321`, DB `44322`,
+  Studio `44323`, Mailpit `44324`). Windows reserves semi-random "excluded port ranges"
+  for Hyper-V/WSL inside the dynamic range (49152+), and Supabase's defaults landed inside
+  one — every service unreachable from the host, with no error anywhere. Ports below 49152
+  can't be dynamically excluded. Check yours with
+  `netsh interface ipv4 show excludedportrange protocol=tcp`.
+- Podman (unlike Docker) doesn't auto-create missing bind-mount sources; the repo now
+  commits `supabase/snippets/` and `supabase/seed.sql` so `supabase start` has everything
+  it needs.
+- `supabase stop`'s volume prune trips over a Podman/Docker API difference
+  ("all" is an invalid volume filter) — harmless; use `supabase db reset` to get a truly
+  fresh database.
 
 ### Dependency policy
 
@@ -48,16 +85,36 @@ lockfile changes.
 ## 📁 Project Structure
 
 ```
-supabase/functions/
-├── _shared/              # Shared utilities
-│   ├── BloomParseServer.ts
-│   └── utils.ts
-├── fs/                   # S3 proxy function (streams book files)
-│   ├── index.ts
-│   ├── BookData.ts
-│   └── README.md
-└── tests/               # Deno tests
+supabase/
+├── migrations/           # SQL migrations (the database schema: books, languages, tags, ...)
+├── seed.sql              # Local-dev seed (real data comes from packages/sync-tool)
+└── functions/
+    ├── _shared/          # Shared utilities
+    │   ├── BloomParseServer.ts
+    │   └── utils.ts
+    ├── fs/               # S3 proxy function (streams book files)
+    │   ├── index.ts
+    │   ├── BookData.ts
+    │   └── README.md
+    └── tests/            # Deno tests
+packages/
+└── sync-tool/            # Parse -> Supabase data import (v0: sample importer)
+docs/
+└── db/                   # Database migration docs (field mapping, plan review, roadmap)
 ```
+
+## 📚 Importing sample data (local dev)
+
+With the local stack running, pull ~100 real books (plus their languages, tags, uploaders,
+and relatedBooks) from the production Parse server into your local database:
+
+```bash
+pnpm --filter @bloom/sync-tool import-sample
+```
+
+Idempotent — re-run any time to refresh. It refuses to write to a non-localhost Supabase
+unless you set `SYNC_ALLOW_REMOTE=1` (env vars are `SYNC_*`-prefixed on purpose; see
+`packages/sync-tool/src/import-sample.mjs`).
 
 ## 🔧 Scripts
 
@@ -78,13 +135,13 @@ Streams book files from S3 without exposing bucket details.
 **Example**:
 ```bash
 # Get thumbnail
-curl "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
+curl "http://localhost:44321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
 
 # Download book (streams, no buffering)
-curl "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
+curl "http://localhost:44321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
 
 # Range request
-curl -H "Range: bytes=0-1023" "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
+curl -H "Range: bytes=0-1023" "http://localhost:44321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
 ```
 
 See [`supabase/functions/fs/README.md`](supabase/functions/fs/README.md) for details.

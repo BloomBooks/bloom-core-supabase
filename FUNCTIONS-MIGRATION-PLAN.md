@@ -48,6 +48,21 @@ All clients call `https://api.bloomlibrary.org/v1/<function>`. Known consumers:
 - CI/CD: GitHub Actions. PRs run tests; push to `develop` deploys to the **staging** Supabase
   project; push to `main` deploys to **production** (`.github/workflows/`).
 - Secrets so far: `BLOOM_PARSE_APP_ID_{PROD,DEV,UNIT_TEST}` plus deploy credentials.
+- **`send-concern-email` (`supabase/functions/send-concern-email/`)** — implemented on the
+  `send-concern-email` branch, **not yet merged or deployed**. This isn't an Azure Function; it
+  replaces the Parse Cloud Code function `sendConcernEmail` (bloom-parse-server, `cloud/emails.js`),
+  called by blorg's "report a concern about this book" form. Same shape as `fs`: `verify_jwt =
+  false` (blorg still authenticates via Parse, not Supabase Auth, so there's no Supabase JWT to
+  check yet — see the TODO in `config.toml`), book data comes from `BloomParseServer` (there is no
+  Supabase `books` table on `develop` yet — see the note below), and it sends via the Mailgun REST
+  API directly (no `mailgun-js`). New secrets: `MAILGUN_API_KEY`, `EMAIL_REPORT_BOOK_RECIPIENT`
+  (both optional — unset means log-and-no-op, matching the legacy cloud function's behavior on
+  the unit-test Parse server).
+
+  Note on book data: a Postgres `books` table (with `title`/`copyright`/`license` etc.) exists on
+  the separate `parse-to-supabase-db-foundation` branch but has not merged to `develop` as of this
+  writing. Once it lands, this function's Parse lookup is a candidate to switch to a direct
+  Postgres query, consistent with wherever the rest of this repo's book-reading functions land.
 
 ---
 

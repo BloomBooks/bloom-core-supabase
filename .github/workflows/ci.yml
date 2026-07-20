@@ -36,3 +36,16 @@ jobs:
           BLOOM_PARSE_APP_ID_PROD: ${{ secrets.BLOOM_PARSE_APP_ID_PROD }}
           BLOOM_PARSE_APP_ID_DEV: ${{ secrets.BLOOM_PARSE_APP_ID_DEV }}
           BLOOM_PARSE_APP_ID_UNIT_TEST: ${{ secrets.BLOOM_PARSE_APP_ID_UNIT_TEST }}
+
+      # Keep in sync with the supabase version pinned in package.json.
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.109.1
+
+      # Prove the SQL migrations apply cleanly from scratch (catches broken
+      # or order-dependent migrations before they reach staging).
+      - name: Validate migrations apply from scratch
+        run: |
+          supabase start -x logflare,vector,studio,imgproxy,realtime,mailpit,edge-runtime,storage-api
+          supabase db reset
+          supabase stop --no-backup
