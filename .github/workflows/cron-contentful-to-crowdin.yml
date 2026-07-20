@@ -1,0 +1,29 @@
+# Replaces the Azure timer trigger for contentfulToCrowdin (daily at 22:30 UTC,
+# same schedule as the Azure function). Supabase edge functions have no timer
+# trigger, so this workflow invokes the deployed production function on a cron.
+#
+# Required repository secrets:
+#   BLOOM_SUPABASE_PRODUCTION_PROJECT_ID - the production Supabase project ref
+#   BLOOM_CRON_SECRET - shared secret; must match the function's BLOOM_CRON_SECRET
+#
+# A failed run triggers GitHub's normal workflow-failure notifications.
+
+name: "Cron: contentfulToCrowdin"
+
+on:
+  schedule:
+    - cron: "30 22 * * *"
+  workflow_dispatch:
+
+jobs:
+  invoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Invoke contentfulToCrowdin edge function
+        run: |
+          status=$(curl -s -o response.txt -w "%{http_code}" -X POST \
+            "https://${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}.supabase.co/functions/v1/contentfulToCrowdin" \
+            -H "x-bloom-cron-secret: ${{ secrets.BLOOM_CRON_SECRET }}")
+          echo "HTTP $status"
+          cat response.txt
+          test "$status" = "200"
