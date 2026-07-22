@@ -18,10 +18,12 @@
 #   * cron.schedule the 'refresh-materialized-views' job to match the Azure dailyTimer's 10:40 run
 #     (and timezone), plus a prune-cron-history job to bound cron.job_run_details growth;
 #   * grant the read-only analytics user access to cron.job_run_details.
-#   CAVEAT: pg_cron shows a NON-superuser only its OWN jobs, so verify the read-only user can
-#   actually see the admin-scheduled job's rows. If it can't, expose an admin-owned
-#   common.mv_refresh_status view (security definer) over cron.job_run_details and point the
-#   queries below at that view instead. (See the runbook for the exact view + grants.)
+#   CAVEAT: pg_cron shows a NON-superuser only its OWN jobs (RLS policy `username = current_user`),
+#   so the read-only user CANNOT see the admin-scheduled job's rows in cron.job_run_details. A plain
+#   view does NOT help -- `current_user` in the policy still resolves to the invoking (read-only)
+#   user through it. The queries below therefore go through an admin-owned SECURITY DEFINER FUNCTION,
+#   common.mv_refresh_status(), which runs as its owner so the policy matches. (See the runbook for
+#   the exact function + grants.)
 
 name: "Cron: analytics MV freshness watchdog"
 
@@ -46,26 +48,23 @@ jobs:
           set -euo pipefail
 
           # Recent runs of the refresh job, for triage in the workflow log.
+          # Goes through common.mv_refresh_status() (SECURITY DEFINER) -- see the CAVEAT above.
           psql "$PGCONN" -v ON_ERROR_STOP=1 -c "
-            SELECT d.status, d.start_time, d.end_time, d.return_message
-            FROM cron.job_run_details d
-            JOIN cron.job j ON j.jobid = d.jobid
-            WHERE j.jobname = 'refresh-materialized-views'
-            ORDER BY d.start_time DESC
+            SELECT status, start_time, end_time, return_message
+            FROM common.mv_refresh_status()
+            ORDER BY start_time DESC
             LIMIT 5;"
 
           # 1 iff the LATEST run succeeded within the last 25h; an empty result set
           # (job never fired) yields no row, so healthy defaults to 0 -> the job fails.
           healthy=$(psql "$PGCONN" -v ON_ERROR_STOP=1 -tAc "
             SELECT CASE
-                     WHEN d.status = 'succeeded'
-                          AND d.end_time > now() - interval '25 hours'
+                     WHEN status = 'succeeded'
+                          AND end_time > now() - interval '25 hours'
                      THEN 1 ELSE 0
                    END
-            FROM cron.job_run_details d
-            JOIN cron.job j ON j.jobid = d.jobid
-            WHERE j.jobname = 'refresh-materialized-views'
-            ORDER BY d.start_time DESC
+            FROM common.mv_refresh_status()
+            ORDER BY start_time DESC
             LIMIT 1;")
           healthy=${healthy:-0}
 

@@ -16,7 +16,7 @@ that emails us if a refresh fails or never fires.
 
 This file is the **DB side** (Part A) — the pg_cron setup and grants that must exist for the
 watchdog to work. The steps below run against the analytics DB, not this Supabase repo; the SQL is
-kept here as the version-controlled reference. The `common.refresh_materialized_views()` function
+kept here as the version-controlled reference. The `common.refresh_materialized_views()` procedure
 itself already lives in the analytics DB (source in the separate `analytics-postgreSQL` repo).
 
 ## 1. Enable pg_cron (one-time; requires a server restart)
@@ -46,7 +46,7 @@ Run as the admin role, connected to the database named in `cron.database_name`:
 SELECT cron.schedule(
   'refresh-materialized-views',           -- job name the watchdog looks for; do not rename
   '40 10 * * *',
-  $$ SELECT common.refresh_materialized_views() $$   -- use CALL if it is a PROCEDURE, not a function
+  $$ CALL common.refresh_materialized_views() $$   -- it's a PROCEDURE, so CALL (not SELECT)
 );
 
 -- Keep pg_cron's run history (which the watchdog reads) from growing without bound.
@@ -80,33 +80,41 @@ GRANT USAGE ON SCHEMA cron TO <readonly_user>;
 GRANT SELECT ON cron.job, cron.job_run_details TO <readonly_user>;
 ```
 
-> ⚠️ **Visibility caveat.** pg_cron applies row-level security so a **non-superuser sees only its
-> own jobs** — a plain `GRANT SELECT` may still return **zero rows** for the admin-owned
-> `refresh-materialized-views` job. After granting, verify as the read-only user:
+> ⚠️ **Visibility caveat (this WILL bite — expose a function, not the tables).** pg_cron enforces
+> row-level security with the policy `username = current_user`, so a **non-superuser sees only its
+> own jobs**. The read-only user is not the job owner, so the `GRANT SELECT` above returns **zero
+> rows** for the admin-owned `refresh-materialized-views` job. A plain **view does NOT fix this** —
+> `current_user` in the policy still resolves to the invoking (read-only) user through a view, so it
+> too returns zero rows. (Verified empirically on PostgreSQL 17.10 / Azure Flexible Server: the
+> admin role `silpgadmin` does not bypass RLS, so the view-owner trick has nothing to resolve.)
+>
+> The fix that works is an admin-owned **`SECURITY DEFINER` function** — it executes as its owner, so
+> `current_user` becomes the admin and the policy matches. Create it as the role that owns the job
+> (the `username` in `cron.job`, e.g. `silpgadmin`):
 > ```sql
-> SELECT d.status, d.end_time
-> FROM cron.job_run_details d JOIN cron.job j ON j.jobid = d.jobid
-> WHERE j.jobname = 'refresh-materialized-views'
-> ORDER BY d.start_time DESC LIMIT 1;
-> ```
-> If that returns nothing even after a real run, expose the rows through an **admin-owned
-> `SECURITY DEFINER` view** and point the watchdog at it instead:
-> ```sql
-> CREATE OR REPLACE VIEW common.mv_refresh_status AS
-> SELECT d.status, d.start_time, d.end_time, d.return_message
-> FROM cron.job_run_details d JOIN cron.job j ON j.jobid = d.jobid
-> WHERE j.jobname = 'refresh-materialized-views';
-> ALTER VIEW common.mv_refresh_status OWNER TO <admin_role>;   -- owner's privileges resolve the RLS
+> CREATE OR REPLACE FUNCTION common.mv_refresh_status()
+> RETURNS TABLE(status text, start_time timestamptz, end_time timestamptz, return_message text)
+> LANGUAGE sql SECURITY DEFINER AS $$
+>   SELECT d.status, d.start_time, d.end_time, d.return_message
+>   FROM cron.job_run_details d JOIN cron.job j ON j.jobid = d.jobid
+>   WHERE j.jobname = 'refresh-materialized-views';
+> $$;
+> ALTER FUNCTION common.mv_refresh_status() OWNER TO <admin_role>;   -- must equal cron.job.username
 > GRANT USAGE ON SCHEMA common TO <readonly_user>;
-> GRANT SELECT ON common.mv_refresh_status TO <readonly_user>;
+> GRANT EXECUTE ON FUNCTION common.mv_refresh_status() TO <readonly_user>;
 > ```
-> Then change both queries in the watchdog workflow to `SELECT ... FROM common.mv_refresh_status
-> ORDER BY start_time DESC` (dropping the `cron.*` join).
+> Verify as the read-only user (note the **parentheses** — it's a function, not a view):
+> ```sql
+> SELECT * FROM common.mv_refresh_status() ORDER BY start_time DESC LIMIT 1;
+> ```
+> The watchdog workflow already reads `common.mv_refresh_status()`. If you created a plain
+> `common.mv_refresh_status` **view** during earlier troubleshooting, `DROP VIEW` it — it returns
+> zero rows for the read-only user and only causes confusion.
 
 ## 4. Cutover
 
 1. Do steps 1–3, then let the refresh fire once (or run
-   `SELECT common.refresh_materialized_views();` manually) and confirm a `succeeded` row:
+   `CALL common.refresh_materialized_views();` manually) and confirm a `succeeded` row:
    ```sql
    SELECT status, start_time, end_time, return_message
    FROM cron.job_run_details d JOIN cron.job j ON j.jobid = d.jobid
