@@ -254,6 +254,12 @@ then, production stays on Azure; and on staging, any not-yet-wired host simply f
   implementation" below): set `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD=true` on the
   **production** Supabase project only, and first do a dry run against staging to confirm the
   logged high / low / church counts look sane.
+- **Scheduled target is temporarily staging.** The scheduled cron is meant to hit
+  **production**, but for now it falls back to staging because the function only exists on the
+  staging project. Once `contentfulToCrowdin` is deployed to production, switch the scheduled
+  branch of `TARGET_ENV` in `.github/workflows/cron-contentful-to-crowdin.yml` from `'staging'`
+  back to `'production'` (this is also flagged in a comment there). Manual `workflow_dispatch`
+  runs are unaffected — they still choose the deployment.
 
 #### Differences from the Azure implementation
 

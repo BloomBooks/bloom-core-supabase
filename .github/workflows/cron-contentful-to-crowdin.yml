@@ -2,10 +2,14 @@
 # same schedule as the Azure function). Supabase edge functions have no timer
 # trigger, so this workflow invokes the deployed function on a cron.
 #
-# The scheduled run always invokes the production deployment. You can also run
-# it manually ("Run workflow" in the Actions tab) and choose which deployment to
-# invoke: staging (the code deployed to the staging project) or production. It
-# defaults to staging so a manual run exercises the staging deployment.
+# The scheduled run is meant to invoke the production deployment. For now,
+# though, contentfulToCrowdin only exists on staging, so the scheduled run
+# falls back to staging until the function is deployed to production. Once it
+# is, switch TARGET_ENV's scheduled branch below back to 'production'. You can
+# also run it manually ("Run workflow" in the Actions tab) and choose which
+# deployment to invoke: staging (the code deployed to the staging project) or
+# production. It defaults to staging so a manual run exercises the staging
+# deployment.
 #
 # Whether an invocation actually uploads to Crowdin or just reports counts is a
 # separate matter, controlled per deployment by the BLOOM_CONTENTFUL_TO_CROWDIN_
@@ -42,9 +46,12 @@ jobs:
     steps:
       - name: Invoke contentfulToCrowdin edge function
         env:
-          # Scheduled runs always invoke production. Manual runs use the chosen
-          # deployment, defaulting to staging.
-          TARGET_ENV: ${{ github.event_name == 'schedule' && 'production' || inputs.environment }}
+          # Scheduled runs are meant to target production, but for now fall back
+          # to staging because that is the only place the function exists yet.
+          # When it's deployed to production, change 'staging' here to
+          # 'production'. Manual runs use the chosen deployment, defaulting to
+          # staging.
+          TARGET_ENV: ${{ github.event_name == 'schedule' && 'staging' || inputs.environment }}
           STAGING_PROJECT_ID: ${{ secrets.BLOOM_SUPABASE_STAGING_PROJECT_ID }}
           PRODUCTION_PROJECT_ID: ${{ secrets.BLOOM_SUPABASE_PRODUCTION_PROJECT_ID }}
           CRON_SECRET: ${{ secrets.BLOOM_CRON_SECRET }}
