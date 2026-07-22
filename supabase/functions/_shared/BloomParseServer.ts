@@ -105,6 +105,126 @@ export default class BloomParseServer {
     return url;
   }
 
+  // Get the URL where we find book thumbnails if they have not been harvested recently
+  // enough to have a harvester-produced thumbnail. Includes a fake query designed to defeat
+  // caching of the thumbnail if the book might have been modified since last cached.
+  private static getLegacyThumbnailUrl(book: any, apiBaseUrl: string) {
+    const baseUrl = this.getUploadBaseUrl(book, apiBaseUrl);
+    if (!baseUrl) {
+      return undefined;
+    }
+    return `${baseUrl}/thumbnail-256.png?version=${book.updatedAt}`;
+  }
+
+  // Get the URL where we find book thumbnails if they have been harvested recently
+  // enough to have a harvester-produced thumbnail. Includes a fake query designed to defeat
+  // caching of the thumbnail if the book might have been modified since last cached.
+  private static getHarvesterProducedThumbnailUrl(
+    book: any,
+    apiBaseUrl: string
+  ): string | undefined {
+    const harvestTime = book.harvestStartedAt;
+    if (!harvestTime || new Date(harvestTime.iso) < new Date(2020, 1, 11, 11)) {
+      // That date above is FEBRUARY 12! at 11am. If the harvest time is before that,
+      // the book was not harvested recently enough to have a useful harvester thumbnail.
+      // (We'd prefer to do this with harvester version, or even to just be
+      // able to assume that any harvested book has this, but it's not yet so.
+      // When it is, we can use harvestState === "Done" and remove harvestStartedAt from
+      // Book, IBasicBookInfo, and the keys for BookGroup queries.)
+      return undefined;
+    }
+    const harvesterBaseUrl = this.getHarvesterBaseUrl(book, apiBaseUrl);
+    if (!harvesterBaseUrl) {
+      return undefined;
+    }
+    return `${harvesterBaseUrl}/thumbnails/thumbnail-256.png?version=${book.updatedAt}`;
+  }
+
+  // Get the place we should look for a book thumbnail.
+  public static getThumbnailUrl(
+    book: any,
+    apiBaseUrl: string = BloomParseServer.DefaultApiBaseUrl
+  ) {
+    return (
+      this.getHarvesterProducedThumbnailUrl(book, apiBaseUrl) ||
+      this.getLegacyThumbnailUrl(book, apiBaseUrl)
+    );
+  }
+
+  private static isHarvested(book: any) {
+    return book && book.harvestState === "Done";
+  }
+
+  // The public base URL of this API, used when generating links to the fs function.
+  // Callers that know the URL the request actually arrived on (e.g. opds) pass it
+  // through the apiBaseUrl parameters instead of relying on this default.
+  public static readonly DefaultApiBaseUrl = "https://api.bloomlibrary.org/v1";
+
+  // typical book.baseUrl:
+  // https://s3.amazonaws.com/BloomLibraryBooks-Sandbox/ken%40example.com%2faa647178-ed4d-4316-b8bf-0dc94536347d%2fsign+language+test%2f
+  // want:
+  // https://api.bloomlibrary.org/v1/fs/dev-upload/U8INuhZHlU
+  // We come up with that URL by
+  //  (a) start new URL with "https://api.bloomlibrary.org/v1/fs"
+  //  (b) match BloomLibraryBooks{-Sandbox} in input URL to {dev-}upload in output URL
+  //  (c) append another / and book's objectId
+  public static getUploadBaseUrl(
+    book: any,
+    apiBaseUrl: string = BloomParseServer.DefaultApiBaseUrl
+  ): string | undefined {
+    if (!book) {
+      return undefined;
+    }
+    if (!book.baseUrl) {
+      return undefined;
+    }
+    if (book.baseUrl.includes("/BloomLibraryBooks-Sandbox/")) {
+      return `${apiBaseUrl}/fs/dev-upload/${book.objectId}`;
+    } else if (book.baseUrl.includes("/BloomLibraryBooks/")) {
+      return `${apiBaseUrl}/fs/upload/${book.objectId}`;
+    } else {
+      return undefined; // things have changed: we don't know what's what any longer...
+    }
+  }
+
+  // typical book.baseUrl:
+  // https://s3.amazonaws.com/BloomLibraryBooks-Sandbox/ken%40example.com%2faa647178-ed4d-4316-b8bf-0dc94536347d%2fsign+language+test%2f
+  // want:
+  // https://api.bloomlibrary.org/v1/fs/dev-harvest/U8INuhZHlU
+  // We come up with that URL by
+  //  (a) start new URL with "https://api.bloomlibrary.org/v1/fs/"
+  //  (b) match BloomLibraryBooks{-Sandbox} in input URL to {dev-}harvest in output URL
+  //  (c) append another / and book's objectId
+  public static getHarvesterBaseUrl(
+    book: any,
+    apiBaseUrl: string = BloomParseServer.DefaultApiBaseUrl
+  ): string | undefined {
+    if (!book) {
+      return undefined;
+    }
+    if (book.baseUrl === null) {
+      return undefined;
+    }
+    if (!this.isHarvested(book)) {
+      return undefined;
+    }
+    if (book.baseUrl.includes("/BloomLibraryBooks-Sandbox/")) {
+      return `${apiBaseUrl}/fs/dev-harvest/${book.objectId}`;
+    } else if (book.baseUrl.includes("/BloomLibraryBooks/")) {
+      return `${apiBaseUrl}/fs/harvest/${book.objectId}`;
+    } else {
+      return undefined; // things have changed: we don't know what's what any longer...
+    }
+  }
+
+  public static getImageContentType(href: string | undefined) {
+    let imageType = "image/jpeg";
+    if (href && href.toLowerCase().includes(".png")) {
+      imageType = "image/png";
+    }
+    return imageType;
+  }
+
   public static MakeUrlSafe(text: string): string {
     // This needs to match whatever Harvester is using. The first replace is probably enough.
     const text1 = text.replace("@", "%40");
@@ -118,8 +238,13 @@ export default class BloomParseServer {
   }
 
   private static extractBookFilename(baseUrl: string): string {
-    const parts = baseUrl.split("/");
-    return parts[parts.length - 1];
+    // Strip a trailing slash before taking the last path segment. The typical
+    // book.baseUrl ends in an encoded slash (%2f) which getBookFileName turns
+    // into a real trailing "/", so without this the last segment would be empty.
+    const urlWithoutFinalSlash = baseUrl.replace(/\/$/, "");
+    return urlWithoutFinalSlash.substring(
+      urlWithoutFinalSlash.lastIndexOf("/") + 1
+    );
   }
 
   public async getBookByDatabaseId(
@@ -403,6 +528,115 @@ export default class BloomParseServer {
       return lang.objectId;
     }
     return await this.createLanguage(langJson);
+  }
+
+  // Get all the books in circulation that fit the current parameters.
+  // Further filtering may be needed, but those two filters should reduce the transfer considerably.
+  public async getBooksForCatalog(
+    desiredLang: string | undefined,
+    tag: string | undefined,
+    embargoDays: number
+  ): Promise<any[]> {
+    let newestDate, newestDateString;
+    try {
+      newestDate = new Date(Date.now() - embargoDays * 24 * 60 * 60 * 1000);
+      // add one day to make sure we get all books from the last day (since we're using less than or equal to the truncated date)
+      newestDate.setDate(newestDate.getDate() + 1);
+      newestDateString = newestDate.toISOString().split("T")[0];
+    } catch (err) {
+      throw "Problem with embargo date handling: " + String(err);
+    }
+
+    const where: Record<string, unknown> = {
+      inCirculation: true,
+      draft: false,
+      createdAt: { $lte: { __type: "Date", iso: newestDateString } },
+    };
+
+    if (desiredLang)
+      where.langPointers = {
+        $inQuery: { where: { isoCode: desiredLang }, className: "language" },
+      };
+
+    if (tag) {
+      // Note on querying tags, which is an array type. https://docs.parseplatform.org/rest/guide/#queries-on-array-values
+      // says that its implicit that you're only requiring the value to exist in the array, and if you really mean to match
+      // all of them, then you have to use $all.
+      where.tags = tag;
+    }
+
+    const url = new URL(this.getParseTableUrl("books"));
+    // ENHANCE: if we want partial pages like GDL, use limit and skip (with function params to achieve this)
+    url.searchParams.append("limit", "100000");
+    url.searchParams.append("order", "title");
+    url.searchParams.append("include", "uploader,langPointers");
+    url.searchParams.append("where", JSON.stringify(where));
+
+    const response = await fetch(url.toString(), {
+      headers: {
+        "X-Parse-Application-Id": this.getParseAppId(),
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to get books for catalog: ${response.statusText}`
+      );
+    }
+
+    const data = await response.json();
+    return data.results;
+  }
+
+  // Get an object containing the data from the apiAccount table row with the
+  // specified ID (not yet authenticated).
+  public async getApiAccount(objectId: string): Promise<ApiAccount | null> {
+    let sessionToken;
+    try {
+      sessionToken = await this.loginAsCatalogService();
+      if (!sessionToken) {
+        throw new Error(
+          "The Catalog Service could not log in to Parse Server."
+        );
+      }
+    } catch (err) {
+      throw new Error(
+        `Could not log in as catalog service: ${
+          err instanceof Error ? err.message : JSON.stringify(err)
+        }`
+      );
+    }
+    try {
+      const url = new URL(this.getParseTableUrl("apiAccount"));
+      url.searchParams.append("include", "user");
+      url.searchParams.append(
+        "where",
+        JSON.stringify({ objectId: { $eq: objectId } })
+      );
+
+      const response = await fetch(url.toString(), {
+        headers: {
+          "X-Parse-Application-Id": this.getParseAppId(),
+          "X-Parse-Session-Token": sessionToken,
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`status ${response.status}: ${await response.text()}`);
+      }
+
+      const data = await response.json();
+      if (data?.results?.length === 1) {
+        return data.results[0] as ApiAccount;
+      }
+    } catch (err) {
+      throw new Error(
+        `Could not get apiAccount: ${
+          err instanceof Error ? err.message : JSON.stringify(err)
+        }`
+      );
+    }
+    return null;
   }
 
   // Get the count of books with the given language tag where 'rebrand' is false and 'inCirculation' is true and 'draft' is false.
