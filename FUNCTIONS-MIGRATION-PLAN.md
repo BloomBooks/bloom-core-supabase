@@ -33,7 +33,7 @@ All clients call `https://api.bloomlibrary.org/v1/<function>`. Known consumers:
 | `opds` | HTTP GET | No | ParseServer (incl. `catalog-service` login) | API-account `key` param |
 | `stats` | HTTP GET/POST | No (temp table only) | Postgres analytics DB (read-only user), ParseServer | none |
 | `contentfulToCrowdin` | Timer (22:30 daily) | Yes (writes to Crowdin) | Contentful (read), Crowdin (write) | tokens |
-| `dailyTimer` | Timer (10:40 daily) | Yes (refreshes PG materialized views) | Postgres (admin user) | n/a |
+| `dailyTimer` ✅ migrated | Timer (10:40 daily) | Yes (refreshes PG materialized views) | Postgres (admin user) | n/a |
 | `bookCleanup` | Timer (12:40 daily) | **Yes — deletes** S3 files and Parse records | ParseServer (`book-cleanup` login), S3 | password |
 | `status` | HTTP GET | No | Azure Durable Functions state | none |
 | `books` | HTTP GET/POST/DELETE | **Yes** (Parse + S3 writes) | ParseServer, S3/STS, Contentful, Durable Functions | Parse session token |
@@ -319,7 +319,7 @@ same daily 22:30 UTC schedule — but the port changed several things:
   guard — fix that (parameterized queries) during the port rather than copying it.
 - Consumed by blorg's book-stats UI; low write risk, moderate visibility.
 
-### Phase 6 — `dailyTimer` (small, but first *writing* function)
+### Phase 6 — `dailyTimer` (small, but first *writing* function) ✅ done
 - One job: call `common.refresh_materialized_views()` in the analytics Postgres as the admin
   user. **Chosen approach: schedule it inside the analytics Postgres itself with pg_cron** and
   skip porting the function entirely — it's a DB-to-itself operation; the Azure function is just
@@ -348,15 +348,18 @@ same daily 22:30 UTC schedule — but the port changed several things:
   to App Insights, which nobody is alerted on either.
 - Risk: needs the server-parameter change (restart) on the analytics DB. Failure mode is stale
   stats (detectable, recoverable), not data loss.
-- Status: **watchdog implemented** (`.github/workflows/cron-analytics-freshness-watchdog.yml`) —
-  a pure-`psql` GitHub Actions cron (daily, ~2h after the refresh) that asserts the latest
-  `refresh-materialized-views` pg_cron run succeeded within 25h, reading pg_cron's own
-  `cron.job_run_details` (no custom `refresh_log` table needed), and fails (→ GitHub failure
-  email) on staleness/failure/never-fired. The DB side (pg_cron enable + schedule + read-only
-  grants, with the non-superuser visibility caveat and `common.mv_refresh_status` fallback) is
-  documented as an ops/DBA runbook in [`analytics/README.md`](analytics/README.md). Remaining:
-  ops runs that runbook, then add the `BLOOM_ANALYTICS_READONLY_URL` repo secret and disable the
-  Azure `dailyTimer`.
+- Status: **LIVE (2026-07-22).** The DB side is done — pg_cron is enabled and the
+  `refresh-materialized-views` job (a `CALL` to the `refresh_materialized_views()` **procedure**)
+  is scheduled and has fired successfully. Because pg_cron enforces RLS (`username = current_user`),
+  the read-only user can't see the admin-owned job's rows directly and a plain view doesn't help;
+  run history is exposed through an admin-owned **SECURITY DEFINER function**
+  `common.mv_refresh_status()`. The watchdog
+  (`.github/workflows/cron-analytics-freshness-watchdog.yml`) — a pure-`psql` GitHub Actions cron
+  (daily, ~2h after the refresh) that asserts the latest run succeeded within 25h and fails
+  (→ GitHub failure email) on staleness/failure/never-fired — reads that function and is **passing**
+  (green on commit `dcabbd5`; the `BLOOM_ANALYTICS_READONLY_URL` secret is set). Full ops/DBA
+  runbook: [`analytics/README.md`](analytics/README.md). The old Azure `dailyTimer` has been
+  **disabled** (Azure portal, 2026-07-22), so cutover is complete — **Phase 6 done.**
 
 ### Phase 7 — `bookCleanup` (destructive timer)
 - Deletes abandoned-upload S3 files and Parse book records older than 24h. First function that
@@ -459,8 +462,10 @@ operational, in this order:
 5. **Timers**: uncomment the bookCleanup workflow schedule only after step 3's safe-mode
    comparison and after disabling the Azure timer (never both live). Disable the Azure
    contentfulToCrowdin timer once the GitHub cron has succeeded a few days in a row.
-6. **Phase 6** (materialized views): set up pg_cron + the `refresh_log` change + the freshness
-   watchdog in the analytics DB (see Phase 6 above) and disable the Azure `dailyTimer`.
+6. **Phase 6** (materialized views): ✅ done (2026-07-22) — pg_cron job + the
+   `common.mv_refresh_status()` SECURITY DEFINER function + the freshness watchdog are live and the
+   Azure `dailyTimer` is disabled (see Phase 6 above). No `refresh_log` table was needed — the
+   watchdog reads pg_cron's own run history through that function.
 7. **Provision production secrets** and repeat the per-function worker extension on
    `api.bloomlibrary.org` (step 4's list and ordering — `social` last).
 8. **Decommission** Azure per the checklist above.

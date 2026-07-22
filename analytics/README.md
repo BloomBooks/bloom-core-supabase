@@ -4,6 +4,14 @@
 (`bloom-analytics.postgres.database.azure.com`, Azure Database for PostgreSQL). Contact:
 andrew_polk@sil.org.
 
+> **Status (2026-07-22): LIVE — cutover complete.** pg_cron is enabled, the
+> `refresh-materialized-views` job is scheduled and has fired successfully, the read-only user reads
+> run history through `common.mv_refresh_status()` (SECURITY DEFINER — see step 3), the GHA watchdog
+> passes against it (run on commit `dcabbd5`), and the old Azure `dailyTimer` has been **disabled**
+> (via the Azure portal, 2026-07-22). The steps below are the version-controlled record of that
+> setup and the reference for rebuilding it. Rollback path if the refresh ever regresses: see
+> Cutover.
+
 ## What this is and why
 
 Phase 6 of the Azure→Supabase migration ([`../FUNCTIONS-MIGRATION-PLAN.md`](../FUNCTIONS-MIGRATION-PLAN.md),
@@ -123,5 +131,7 @@ GRANT SELECT ON cron.job, cron.job_run_details TO <readonly_user>;
 2. Add the `BLOOM_ANALYTICS_READONLY_URL` GitHub repo secret and let the watchdog run (it can be
    triggered manually via **Run workflow**). It should go green.
 3. **Disable the Azure `dailyTimer`** once pg_cron has refreshed cleanly for a day or two.
+   ✅ Done 2026-07-22 (disabled via the Azure portal UI).
 
-**Rollback:** re-enable the Azure `dailyTimer` and `SELECT cron.unschedule('refresh-materialized-views');`.
+**Rollback** (if the pg_cron refresh ever regresses): re-enable the Azure `dailyTimer` and
+`SELECT cron.unschedule('refresh-materialized-views');`.
