@@ -44,6 +44,39 @@ Functions, phases F0–F8). This doc covers the *database* side.
   `appSpecification`/`appDetailsInLanguage`/`booksInApp` (verify they're used at all before
   porting), `downloadHistory`, `version`, `bookDeletion` tombstones.
 
+## Design goal: perform at 200k books
+
+Production is ~25k books today; **every read-path design decision should assume 200k**
+(decided 2026-07-22). "Small table, seq scan is fine" reasoning is not acceptable for
+`books` — features must be designed against the 200k target, not current row counts.
+
+What this implies for the query patterns blorg actually issues (see
+`SupabaseBookQueryBuilder.ts` in blorg):
+
+- **Exact tag filters** use `tags @> ARRAY[...]` against the existing GIN index on
+  `tags` — already fine at 200k.
+- **Fuzzy/wildcard matching on vocabularies (tags, topics, bookshelves, branding, …)**:
+  the guiding pattern is **resolve against the small vocabulary table first, then apply
+  exact matches to books**. These matches are rare, and the vocabularies are tiny (the
+  `tags` table is a few thousand rows — a seq scan there is microseconds), so pattern
+  matching belongs on the vocabulary, never on 200k book rows. `match_topic_tags` already
+  works this way (LIKE over `tags`, then array containment on books via the GIN index).
+  The wildcard-tag path in blorg (`LIKE` on the generated `tags_text` column) should
+  eventually migrate to the same resolve-then-contain shape, at which point `tags_text`
+  can be retired; until then it's an accepted (rare) seq scan, not something to index.
+- **Free-text search** is the exception — it's per-word `ILIKE '%word%'` against the
+  per-book `search` column, which is book content, not a vocabulary, and it's the *common*
+  query (the search box). This is the one place a books-side index earns its keep:
+  a **`pg_trgm` GIN index on `books.search`**. Trigram GIN serves `ILIKE` directly, so no
+  query changes are needed. (Caveats: words shorter than 3 chars fall back to seq scan;
+  write amplification lands only on the batch importer.)
+- **Rare facets** (`title:`, `branding:`, `phash:` ILIKE on books) stay accepted seq
+  scans — infrequent enough that ~200k-row scans are tolerable, revisit only if slow-query
+  logs disagree.
+- **Operational**: on a populated hosted database new indexes must be added with
+  `CREATE INDEX CONCURRENTLY` (outside a transaction); and bulk imports should end with
+  `ANALYZE` so the planner has fresh statistics before the first real queries arrive.
+
 ## Corrections to the earlier draft plans
 
 The `supabase/*.md` docs in bloom-parse-server were a useful starting point; things fixed
