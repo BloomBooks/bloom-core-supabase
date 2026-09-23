@@ -9,7 +9,8 @@ Guidance for coding agents working in this repo. `CLAUDE.md` imports this file.
 - Use **pnpm** (the version pinned in `package.json`), never npm or yarn. Edge functions run on Deno.
 - CI type-checks every `.ts` under `supabase/functions` (`deno check --frozen`) and runs
   `pnpm test:ci`, which only picks up `supabase/functions/tests/*-test.ts`. A test anywhere else
-  never runs in CI.
+  never runs in CI. A separate `db-tests` job starts only the local Postgres container and runs
+  the pgTAP suite (`supabase/tests/`) with `supabase db reset` + `supabase test db`.
 - Dependencies are pinned to exact versions, with a 7-day cooldown on both resolvers; see
   "Dependency policy" in `README.md`.
 - The Cloud Team Collections backend (the `tc` schema, its edge functions and its local dev stack)

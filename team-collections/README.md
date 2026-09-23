@@ -45,8 +45,9 @@ forward-only delta migrations. See `docs/CONTRACTS.md` ("Database: declarative s
 - **Edge-function unit tests** (no stack needed; they fake PostgREST and S3):
   `pnpm test:ci` runs them with the rest of the repo's Deno tests, and
   `deno test --allow-all supabase/functions/tests/tc-*-test.ts` runs just these.
-- **Database tests** (pgTAP; needs a running local Supabase): `supabase start`, then
-  `supabase db reset` and `pnpm test:db`.
+- **Database tests** (pgTAP; needs a running local Supabase): `supabase start` (or just
+  `supabase db start`, which is all they need), then `supabase db reset` and `pnpm test:db`.
+  CI's `db-tests` job runs exactly that on every pull request.
 - **Whole local stack** (Supabase + MinIO + served functions): follow `dev/README.md`, then
   run `dev/smoke.ps1`.
 

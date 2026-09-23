@@ -39,3 +39,28 @@ jobs:
           BLOOM_GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.BLOOM_GOOGLE_SERVICE_ACCOUNT_EMAIL }}
           BLOOM_GOOGLE_SERVICE_PRIVATE_KEY: ${{ secrets.BLOOM_GOOGLE_SERVICE_PRIVATE_KEY }}
           BLOOM_SUBSCRIPTION_SPREADSHEET_ID: ${{ secrets.BLOOM_SUBSCRIPTION_SPREADSHEET_ID }}
+
+  # pgTAP tests for the Team Collections `tc` schema (supabase/tests/). Needs only the
+  # local Postgres container: `supabase db start` starts that alone (no auth, REST,
+  # storage, edge runtime, studio...), `db reset` applies supabase/migrations/ and the
+  # seeds, and `test db` runs pgTAP against it. Uses no repository secrets.
+  db-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Keep in sync with the supabase version pinned in package.json.
+      - uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520 # v3.0.0
+        with:
+          version: 2.109.1
+
+      - name: Start the local database
+        run: supabase db start
+
+      - name: Apply migrations and seeds
+        run: supabase db reset
+
+      - name: Run pgTAP tests
+        run: supabase test db
