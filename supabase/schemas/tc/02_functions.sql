@@ -167,6 +167,11 @@ BEGIN
         RAISE EXCEPTION '%', '{"error":"unauthenticated"}' USING ERRCODE = 'PT401';
     END IF;
 
+    -- Reap first, before locking our own transaction row: the reaper updates every expired
+    -- open transaction, so running it while holding our row lock let two concurrent aborts
+    -- each wait on the other's row (a deadlock).
+    PERFORM tc.reap_expired_checkin_transactions();
+
     -- FOR UPDATE, like checkin_finish_tx (which also locks this row first): abort and a
     -- concurrent finish then take turns, and whichever runs second sees the other's final
     -- status instead of overwriting a just-finished transaction with 'aborted'.
@@ -198,8 +203,6 @@ BEGIN
     ) THEN
         DELETE FROM tc.books WHERE id = v_tx.book_id AND current_version_id IS NULL;
     END IF;
-
-    PERFORM tc.reap_expired_checkin_transactions();
 END;
 $$;
 
@@ -897,7 +900,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) IS 'Internal to the collection-files-finish edge function; service-role only (trusts p_captured), with the caller passed as p_user_id/p_user_email/p_user_name as for checkin_finish_tx. Locks the transaction and group rows, so concurrent retries are idempotent. Re-checks the optimistic version at finish time too (repo-wins rule); PT409 VersionConflict aborts the transaction so a stale retry cannot succeed later.';
+COMMENT ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) IS 'Internal to the collection-files-finish edge function; service-role only (trusts p_captured), with the caller passed as p_user_id/p_user_email/p_user_name as for checkin_finish_tx. Locks the transaction and group rows, so concurrent retries are idempotent. Re-checks the optimistic version at finish time too (repo-wins rule); PT409 VersionConflict leaves the transaction open: a stale retry still fails the same check, and the caller''s next collection-files-start resumes it with the new version.';
 
 CREATE OR REPLACE FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
