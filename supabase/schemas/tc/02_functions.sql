@@ -167,10 +167,11 @@ BEGIN
         RAISE EXCEPTION '%', '{"error":"unauthenticated"}' USING ERRCODE = 'PT401';
     END IF;
 
-    -- Reap first, before locking our own transaction row: the reaper updates every expired
-    -- open transaction, so running it while holding our row lock let two concurrent aborts
-    -- each wait on the other's row (a deadlock).
-    PERFORM tc.reap_expired_checkin_transactions();
+    -- No global reap here (checkin_start_tx and collection_files_start_tx do it): run first,
+    -- it could delete this very transaction along with its never-finished book and turn a
+    -- successful abort into a 404; run while holding this row's lock, two concurrent aborts
+    -- could deadlock on each other's rows.
+
 
     -- FOR UPDATE, like checkin_finish_tx (which also locks this row first): abort and a
     -- concurrent finish then take turns, and whichever runs second sees the other's final
@@ -1910,7 +1911,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.reap_expired_checkin_transactions() IS 'Global expiry sweep for both checkin_transactions (via _checkin_reap_book) and collection_file_transactions. Returns the total number of items reaped across both sweeps. Called opportunistically at the top of checkin_start_tx/checkin_abort_tx/collection_files_start_tx; also safe to run from a scheduled job if one is ever wired up (no pg_cron dependency here).';
+COMMENT ON FUNCTION tc.reap_expired_checkin_transactions() IS 'Global expiry sweep for both checkin_transactions (via _checkin_reap_book) and collection_file_transactions. Returns the total number of items reaped across both sweeps. Called opportunistically at the top of checkin_start_tx and collection_files_start_tx; also safe to run from a scheduled job if one is ever wired up (no pg_cron dependency here).';
 
 CREATE OR REPLACE FUNCTION tc.rename_check(p_book_id uuid, p_new_name text) RETURNS jsonb
     LANGUAGE plpgsql STABLE SECURITY DEFINER

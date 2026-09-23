@@ -18,7 +18,7 @@
 
 BEGIN;
 
-SELECT plan(48);
+SELECT plan(50);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -435,5 +435,25 @@ SELECT is(
     '10c: an unknown key is not stale'
 );
 
+-- =============================================================================
+-- 11. Aborting an expired check-in of a never-finished new book still succeeds
+--     (abort must not reap its own target away first and then report 404)
+-- =============================================================================
+
+SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
+SELECT set_config('tests.tx11', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c411',
+    'Book Eleven', NULL, 'cs-11', '6.5.0', '[]') ->> 'transactionId', true);
+UPDATE tc.checkin_transactions SET expires_at = now() - INTERVAL '1 hour'
+WHERE id = current_setting('tests.tx11')::uuid;
+
+SELECT lives_ok(
+    format($$SELECT tc.checkin_abort_tx(%L)$$, current_setting('tests.tx11')),
+    '11a: aborting an expired new-book check-in succeeds'
+);
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c411'),
+    '11b: and removes the never-finished book'
+);
 SELECT * FROM finish();
 ROLLBACK;
