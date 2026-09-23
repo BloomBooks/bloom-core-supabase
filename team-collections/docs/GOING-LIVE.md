@@ -62,7 +62,10 @@ It idempotently creates, per environment:
 - IAM user `bloom-teams-broker-caller` — assume-only (its sole permission is sts:AssumeRole on
   that role). Its access key becomes the edge functions' `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`.
 - IAM user `bloom-teams-admin` — direct S3 permissions, used ONLY server-side (checksum/
-  version-id verification, manifest backup). Key becomes `BLOOM_S3_ADMIN_ACCESS_KEY`/`_SECRET_KEY`.
+  version-id verification, manifest backup, and the orphaned-upload sweep's
+  `s3:ListBucketVersions` + `s3:DeleteObjectVersion`). Key becomes
+  `BLOOM_S3_ADMIN_ACCESS_KEY`/`_SECRET_KEY`. (If the script was already run with an older
+  version, re-run it: it refreshes the inline policy idempotently.)
 
 Before running: review the embedded IAM policy JSON against current least-privilege guidance,
 and note the script's own NOTES section (developed against AWS CLI v2, never executed).
@@ -113,23 +116,25 @@ supabase secrets set BLOOM_S3_REGION=us-east-1
 # do NOT set BLOOM_S3_ENDPOINT in production — its absence selects real AWS endpoints
 ```
 
+`SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` need no `secrets set`: the
+platform (and `supabase functions serve` locally) injects them into every edge function. The
+finish functions use the service-role key to call the service-role-only finish RPCs (see 2.4).
+
 `BLOOM_CLOUD_LOCAL_MODE=false` flips `_shared/tc/env.ts`/`s3.ts` from MinIO-AssumeRole local
 credentials to real AWS STS (false is also the default when unset — hosted deployments,
 including any future "dev"-named project, never set it). The names mirror the local
 `team-collections/dev/functions.env` (which is the committed, local-only-constants version of this
 same set).
 
-### 2.4 [AGENT] Security hardening: lock down the `tc.*_tx` RPCs  ← REQUIRED before production
-Currently the internal transaction RPCs are EXECUTE-granted to `authenticated` because edge
-functions forward the caller's JWT. A member could call e.g. `checkin_finish_tx` directly and
-bypass the edge function's S3 checksum verification (blast radius limited to their own
-collection, but still). Task: (a) switch the edge functions to use the service-role key with an
-explicit verified-user-id parameter, and (b) change the `*_tx` grants in
-`supabase/schemas/tc/04_security.sql` to REVOKE `authenticated`. Apply the change per the stage
-(pre-launch: edit the schema file, then `team-collections/regen-init-migration.sh`; once a project database
-exists: a forward-only delta migration that never edits the already-applied initial migration) —
-see CONTRACTS.md → "Database: declarative schema". Verify with a pgTAP test that `authenticated`
-can no longer execute them. Human review before deploy.
+### 2.4 [DONE Sep 2026, BL-16531] Security hardening: lock down the finish RPCs
+The two RPCs that trust S3 version-ids the edge function verified, `checkin_finish_tx` and
+`collection_files_finish_tx`, are EXECUTE-able by `service_role` only (`04_security.sql`); the
+finish edge functions call them with the service-role key, passing the caller's user id, which
+they first establish from the caller's own JWT through `tc.current_caller()` (PostgREST
+validates the token, so this works with Firebase third-party auth). The other `*_tx` RPCs
+(start, abort, download check) stay on the caller's JWT: calling them directly bypasses no
+verification. pgTAP (`04_tc_checkin_flow_test.sql` §1) proves `authenticated` cannot execute the
+finish RPCs. Nothing to configure: the service-role key is injected into edge functions (2.3).
 
 ---
 
@@ -265,7 +270,11 @@ but giving the feature to real testers does:
     **excluding** any path a still-live transaction is uploading.
   - `sweep-stale-uploads` edge function — for each worklist key, deletes every S3 version newer
     than the referenced one (all of them if nothing references the key), restoring the committed
-    version to *current*. Idempotent; service-role-only.
+    version to *current*. Idempotent; service-role-only. Because check-ins continue while it
+    runs, it only deletes versions older than the 48 h transaction lifetime, and right before
+    deleting a key's candidates it re-reads that key (`tc.stale_upload_key_state`, service-role
+    only), skipping it if a check-in has since committed a new version or a live transaction now
+    touches it (counted as `keysChanged` in the response; harmless, the next run retries).
 
   **[OPS] Schedule it ~daily.** Any of: (a) `pg_cron` + `pg_net` job that `net.http_post`s the
   function URL with `Authorization: Bearer <service-role key>`; (b) an external cron (e.g. GitHub

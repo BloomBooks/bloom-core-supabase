@@ -14,8 +14,11 @@ import {
 import {
     callHandler,
     mockRequest,
+    type RecordedCall,
     routedFetchStub,
     setTestEnv,
+    TEST_CALLER,
+    TEST_SERVICE_ROLE_KEY,
     withMockFetch,
 } from "../_shared/tc/test_support.ts";
 
@@ -44,8 +47,10 @@ const routesFor = (
     bookRow: unknown,
     finishStatus: number,
     finishBody: unknown,
+    calls?: RecordedCall[],
 ) =>
     routedFetchStub([
+        { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
         {
             when: "checkin_transactions",
             status: txRow ? 200 : 200,
@@ -61,7 +66,7 @@ const routesFor = (
             status: finishStatus,
             body: finishBody,
         },
-    ]);
+    ], calls);
 
 Deno.test(
     "checkin-finish: happy path verifies checksum, captures version-id, returns versionId+seq",
@@ -114,6 +119,11 @@ Deno.test(
                     : input instanceof URL
                       ? input.href
                       : input.url;
+            if (url.includes("rpc/current_caller")) {
+                return Promise.resolve(
+                    new Response(JSON.stringify(TEST_CALLER), { status: 200 }),
+                );
+            }
             if (url.includes("checkin_transactions")) {
                 return Promise.resolve(
                     new Response(JSON.stringify([TX_ROW]), { status: 200 }),
@@ -168,6 +178,7 @@ Deno.test(
     async () => {
         const s3Mock = mockClient(S3Client);
         const fetchStub = routedFetchStub([
+            { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             { when: "checkin_transactions", status: 200, body: [] }, // selectTcRow finds nothing
         ]);
 
@@ -182,6 +193,94 @@ Deno.test(
         assertEquals(json.error, "transaction_not_found");
         assertEquals(s3Mock.commandCalls(HeadObjectCommand).length, 0);
 
+        s3Mock.restore();
+    },
+);
+
+Deno.test(
+    "checkin-finish: identity comes from the caller's own JWT; the finish RPC is called with the service-role key and that user id",
+    async () => {
+        const s3Mock = mockClient(S3Client);
+        s3Mock.on(HeadObjectCommand).resolves({
+            ChecksumSHA256: hexToBase64(TX_ROW.proposed_files[0].sha256),
+            VersionId: "v-42",
+        });
+        const calls: RecordedCall[] = [];
+        const fetchStub = routesFor(
+            TX_ROW,
+            BOOK_ROW,
+            200,
+            { versionId: "ver-1", seq: 3 },
+            calls,
+        );
+
+        const res = await withMockFetch(fetchStub, () =>
+            callHandler(
+                handler,
+                mockRequest({ transactionId: "tx-1" }, "callers-own-jwt"),
+                { transactionId: "tx-1", userId: "someone-else" },
+            ),
+        );
+        assertEquals(res.status, 200);
+
+        const identityCall = calls.find((c) =>
+            c.url.includes("rpc/current_caller"),
+        );
+        const finishCall = calls.find((c) =>
+            c.url.includes("rpc/checkin_finish_tx"),
+        );
+        if (!identityCall || !finishCall) {
+            throw new Error(
+                `expected both current_caller and checkin_finish_tx calls, got ${calls.map((c) => c.url)}`,
+            );
+        }
+        assertEquals(identityCall.authorization, "Bearer callers-own-jwt");
+        assertEquals(identityCall.apikey, "test-anon-key");
+        assertEquals(
+            calls.indexOf(identityCall) < calls.indexOf(finishCall),
+            true,
+            "identity must be established before the finish RPC",
+        );
+        // The finish RPC never sees the caller's token: it runs as the service role...
+        assertEquals(finishCall.apikey, TEST_SERVICE_ROLE_KEY);
+        assertEquals(finishCall.authorization, `Bearer ${TEST_SERVICE_ROLE_KEY}`);
+        // ...and is told who the caller is by the identity call, not by the request body.
+        assertEquals(finishCall.body?.p_user_id, TEST_CALLER.userId);
+        assertEquals(finishCall.body?.p_user_email, TEST_CALLER.email);
+        assertEquals(finishCall.body?.p_user_name, TEST_CALLER.name);
+        assertEquals(finishCall.body?.p_captured, [
+            { path: "book.htm", s3VersionId: "v-42" },
+        ]);
+
+        s3Mock.restore();
+    },
+);
+
+Deno.test(
+    "checkin-finish: a token PostgREST rejects -> 401, with no S3 work and no service-role call",
+    async () => {
+        const s3Mock = mockClient(S3Client);
+        const calls: RecordedCall[] = [];
+        const fetchStub = routedFetchStub(
+            [
+                {
+                    when: "rpc/current_caller",
+                    status: 401,
+                    body: { message: "JWT expired", code: "PGRST303" },
+                },
+            ],
+            calls,
+        );
+
+        const res = await withMockFetch(fetchStub, () =>
+            callHandler(handler, mockRequest({ transactionId: "tx-1" }), {
+                transactionId: "tx-1",
+            }),
+        );
+
+        assertEquals(res.status, 401);
+        assertEquals(calls.length, 1, "only the identity call may happen");
+        assertEquals(s3Mock.commandCalls(HeadObjectCommand).length, 0);
         s3Mock.restore();
     },
 );

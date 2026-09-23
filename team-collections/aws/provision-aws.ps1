@@ -422,6 +422,11 @@ function Ensure-AdminUser {
     # covers the ChecksumMode=ENABLED HeadObject readback verifyUploadedObject()
     # relies on; ListBucket is occasionally needed for diagnostics/tooling, not by
     # the edge functions themselves, but cheap to include for an admin identity.
+    # The sweep-stale-uploads function (see its index.ts) lists a key's versions
+    # (ListObjectVersions -> s3:ListBucketVersions, a bucket-level permission) and
+    # deletes specific orphaned versions (DeleteObject with a VersionId ->
+    # s3:DeleteObjectVersion). Plain s3:DeleteObject is deliberately NOT granted: the
+    # admin identity never needs to create delete markers.
     $bucketArns       = $BucketNames | ForEach-Object { "arn:aws:s3:::$_" }
     $bucketObjectArns = $BucketNames | ForEach-Object { "arn:aws:s3:::$_/*" }
     $adminPolicy = @{
@@ -434,9 +439,15 @@ function Ensure-AdminUser {
                 Resource = $bucketObjectArns
             },
             @{
+                Sid      = "SweepDeleteOrphanedVersions"
+                Effect   = "Allow"
+                Action   = @("s3:DeleteObjectVersion")
+                Resource = $bucketObjectArns
+            },
+            @{
                 Sid      = "AdminListBuckets"
                 Effect   = "Allow"
-                Action   = @("s3:ListBucket")
+                Action   = @("s3:ListBucket", "s3:ListBucketVersions")
                 Resource = $bucketArns
             }
         )

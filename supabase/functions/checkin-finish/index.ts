@@ -10,7 +10,11 @@ import {
     serveJsonPost,
 } from "../_shared/tc/handler.ts";
 import { HttpError, jsonResponse } from "../_shared/tc/errors.ts";
-import { callTcRpc, selectTcRow } from "../_shared/tc/rpc.ts";
+import {
+    callerIdentity,
+    callTcServiceRpc,
+    selectTcRow,
+} from "../_shared/tc/rpc.ts";
 import {
     adminS3Client,
     captureVerifiedUploads,
@@ -44,6 +48,10 @@ export const handler = async (
     const comment = optionalField<string>(body, "comment");
     const keepCheckedOut = Boolean(body["keepCheckedOut"]);
 
+    // Who is calling, established from their own JWT (see rpc.ts). Done first so a bad
+    // token is rejected before any S3 work.
+    const caller = await callerIdentity(req);
+
     // Read back our own open transaction (RLS restricts this to rows we started) so
     // we know which S3 objects to verify — checkin-finish's request body carries no
     // file list per CONTRACTS.md.
@@ -71,11 +79,16 @@ export const handler = async (
         tx.proposed_files,
     );
 
-    const result = await callTcRpc<CheckinFinishResult>(
-        req,
+    // Service-role call: checkin_finish_tx trusts p_captured, so only this function
+    // (which has just verified those uploads) may call it. The RPC itself re-checks
+    // that caller.userId started the transaction and still holds the book's lock.
+    const result = await callTcServiceRpc<CheckinFinishResult>(
         "checkin_finish_tx",
         {
             p_transaction_id: transactionId,
+            p_user_id: caller.userId,
+            p_user_email: caller.email,
+            p_user_name: caller.name,
             p_comment: comment,
             p_keep_checked_out: keepCheckedOut,
             p_captured: captured,

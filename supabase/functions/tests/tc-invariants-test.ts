@@ -62,6 +62,26 @@ Deno.test(
 );
 
 Deno.test(
+    "invariant: the stale-upload sweep's grace period is at least the transaction lifetime",
+    async () => {
+        const schema = await readText("supabase/schemas/tc/03_tables.sql");
+        const txHoursMatch = schema.match(
+            /expires_at\s+timestamp with time zone DEFAULT \(now\(\) \+ '(\d+):00:00'::interval\)/,
+        );
+        assert(txHoursMatch, "could not find the transaction expires_at default");
+        const { UPLOAD_GRACE_MS } = await import(
+            "../sweep-stale-uploads/index.ts"
+        );
+        assert(
+            UPLOAD_GRACE_MS >= Number(txHoursMatch[1]) * 60 * 60 * 1000,
+            `sweep-stale-uploads UPLOAD_GRACE_MS (${UPLOAD_GRACE_MS} ms) must cover the ` +
+                `${txHoursMatch[1]}h transaction lifetime, or it could delete an upload a live ` +
+                `transaction is about to commit.`,
+        );
+    },
+);
+
+Deno.test(
     "invariant: transaction lifetime (48h) is strictly less than the S3 noncurrent-version-expiry floor (7d, local MinIO)",
     async () => {
         const schema = await readText(

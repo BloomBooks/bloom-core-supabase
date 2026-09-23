@@ -7,7 +7,14 @@
 > design notes live.
 
 Changes to this file require an orchestrator commit and a version-note bump here.
-**Contract version: 1.7** (16 Jul 2026 — added the `get_collection_file_manifest` RPC,
+**Contract version: 1.8** (23 Sep 2026, BL-16531 review fixes — BREAKING for the client:
+`checkout_book` now returns a secret `checkout_token` on success, and `checkout_book_takeover`
+takes that token as a new second argument and grants takeover only for it (machine/seat no
+longer grant anything); `checkin-start`/`collection-files-start` NFC-normalize and validate
+every path (`changedPaths` come back NFC; new `400 InvalidManifest`) and `checkin-start` now
+also reports `NameConflict` for a rename of an existing book; `checkin-finish` re-checks the
+lock and base version (`409 LockHeldByOther` / `BaseVersionSuperseded`); the internal finish
+RPCs became service-role only. v1.7, 16 Jul 2026 — added the `get_collection_file_manifest` RPC,
 additive (E9): a per-file manifest for one collection-file group so the download path fetches
 only changed files pinned to their committed `s3_version_id`, mirroring `get_book_manifest`;
 the data already lived in `tc.collection_group_files`, this just exposes it for reads. No
@@ -161,8 +168,8 @@ with `p_`, and PostgREST matches JSON keys to parameter names — so clients sen
 | `get_changes(collection_id, since_event_id)` | events + touched book rows (polling/catch-up) |
 | `get_book_manifest(book_id)` | v1.2: per-file current manifest `{bookId, versionId, seq, checksum, files:[{path, sha256, size, s3VersionId}]}` for pinned-version Receive; never-committed books invisible except to their mid-Send lock holder |
 | `get_collection_file_manifest(collection_id, group_key)` | v1.7: per-file current manifest `{groupKey, version, files:[{path, sha256, size, s3VersionId}]}` for one collection-file group, so the download path fetches only changed files pinned to their committed `s3_version_id` (E9); a never-written group returns `version 0` / empty `files`. Mirrors `get_book_manifest`. |
-| `checkout_book(book_id, machine text, seat text?)` | conditional lock; returns resulting status (winner's identity on failure). v1.5: also records the caller's `seat` — a stable hash of the local collection folder path identifying WHICH local copy took the lock (never the raw path); returns `locked_seat`. |
-| `checkout_book_takeover(book_id, machine text, seat text?)` | v1.4/v1.5: atomically reassigns another account's lock to the caller ONLY when the existing lock is recorded for the same machine AND the same seat (account-switch, batch item 9 + bug #0: two local copies on one computer are two seats); a NULL stored seat never matches (fail-safe). Returns `{success, locked_by, locked_by_machine, locked_seat, locked_at}` (same shape as checkout_book); emits a CheckOut event only on a genuine handover; safe to call speculatively — no-ops (success:false) when unlocked, already the caller's, locked on a different machine, or locked in a different/unknown seat. Note: `machine` and `seat` are client-asserted, consistent with checkout_book's existing trust model. |
+| `checkout_book(book_id, machine text, seat text?)` | conditional lock; returns resulting status (winner's identity on failure). v1.5: also records the caller's `seat` — a stable hash of the local collection folder path identifying WHICH local copy took the lock (never the raw path); returns `locked_seat`. v1.8: on success also returns `checkout_token`, a fresh random secret (64 hex chars) issued to this caller only; every successful call issues a new one, replacing the previous. The client saves it with the book in that local copy (the book folder's checkout record, so it survives the collection folder being moved, renamed or copied) and presents it to `checkout_book_takeover`. The server stores only its SHA-256; no RPC, view or table readable by members ever returns the token or the hash, and a failed checkout returns no token. |
+| `checkout_book_takeover(book_id, checkout_token text, machine text, seat text?)` | v1.4/v1.8: atomically reassigns another account's lock to the caller ONLY when `checkout_token` is the token issued with that lock (account-switch, batch item 9: account B opening the local copy account A checked the book out in, whose checkout record holds A's token). `machine`/`seat` are recorded with the new lock for display but no longer grant anything (they are readable by every member). A lock with no token (e.g. one taken by checkin-start's take-if-free path) can never be taken over (fail-safe). On success returns a NEW `checkout_token` for the caller (the presented one stops working), which the client must save in place of the old one. Returns `{success, locked_by, locked_by_machine, locked_seat, locked_at, checkout_token (success only)}`; emits a CheckOut event only on a genuine handover; safe to call speculatively — no-ops (success:false) when unlocked, already the caller's, or the token is missing/wrong. Check-in does not need the token: it is gated on the lock holder's account, as before. |
 | `unlock_book(book_id)` | release own lock (undo checkout, no content change) |
 | `force_unlock(book_id)` | admin; audited; emits ForcedUnlock event |
 | `delete_book(book_id)` | requires caller holds the lock; sets `deleted_at`; emits Deleted |
@@ -182,12 +189,22 @@ Req: `{ collectionId, bookId?, bookInstanceId, proposedName, baseVersionId?, che
 clientVersion, files: [{path, sha256, size}] }`
 - `bookId` null ⇒ first Send of a new book: validates name/instance-id uniqueness; creates the
   row locked to caller with NO current version (invisible to teammates until first commit).
+- Existing book: `proposedName` must not equal (case-insensitively, after NFC) another live
+  book's name, else 409 `NameConflict` (v1.8; previously only caught at finish).
+- v1.8: every `files[].path` is NFC-normalized before anything else, and validated: it must be a
+  non-empty relative path (no leading `/`, no empty, `.` or `..` segment), with a `sha256`
+  string and a non-negative integer `size`; two entries whose paths are equal after
+  normalization are refused. Failure ⇒ 400 `InvalidManifest` (+`detail`, and `entries` or
+  `paths`). `changedPaths` are returned NFC: **the client must upload each changed file to
+  `prefix + changedPath` exactly as returned**, not under its local spelling.
+- The transaction records the book's current version as its base (whether or not
+  `baseVersionId` was sent); `checkin-finish` refuses to commit if the book has moved on.
 - Re-call with the same open transaction ⇒ refreshed credentials, same transactionId.
 200: `{ transactionId, changedPaths[], s3: { bucket, region, prefix,
 credentials: { accessKeyId, secretAccessKey, sessionToken, expiration } } }`
 (creds scoped `tc/{cid}/books/{bookInstanceId}/*`, 1 h)
-Errors: 401/403 · 409 `LockHeldByOther` (+holder) / `BaseVersionSuperseded` / `NameConflict`
-· 426 `ClientOutOfDate`.
+Errors: 400 `InvalidManifest` · 401/403 · 409 `LockHeldByOther` (+holder) /
+`BaseVersionSuperseded` / `NameConflict` · 426 `ClientOutOfDate`.
 
 #### `checkin-finish` POST
 Req: `{ transactionId, comment?, keepCheckedOut? }`
@@ -196,6 +213,19 @@ version (metadata) row, current-manifest rows (superseded rows pruned), book row
 lock release (unless keepCheckedOut), events (Created+CheckIn for a new book), writes
 `.manifest.json`. 200: `{ versionId, seq }` · 409 `MissingOrBadUploads { paths[] }`
 (re-upload + retry, idempotent) · 410 transaction expired.
+v1.8: before committing it re-checks, under a row lock, that the caller still holds the book's
+lock and that the book is still at the transaction's base version; otherwise nothing is written
+and it returns 409 `LockHeldByOther` (`holder` as in checkin-start, or `null` if the lock was
+released, e.g. force-unlocked) or 409 `BaseVersionSuperseded` (`currentVersionId`,
+`currentVersionSeq`) — the client must Receive and re-send rather than retry. A retry of a
+finish that already committed (even one racing it) returns the same `{ versionId, seq }`.
+
+*Internal (not called by the client):* the finish edge functions establish the caller from
+their own JWT via the `tc.current_caller()` RPC (validated by PostgREST, so this works for a
+Firebase ID token under Option A as well as a local GoTrue token), then call
+`tc.checkin_finish_tx` / `tc.collection_files_finish_tx` with the **service-role key**, passing
+that user id. Those two RPCs are EXECUTE-able by `service_role` only, because they trust the
+S3 version-ids they are given; a member calling them directly gets `permission denied`.
 
 #### `checkin-abort` POST — `{ transactionId }` → 200.
 
@@ -205,7 +235,9 @@ lock release (unless keepCheckedOut), events (Created+CheckIn for a new book), w
 #### `collection-files-start` / `collection-files-finish` POST
 `{ collectionId, groupKey: 'other'|'allowed-words'|'sample-texts', expectedVersion, files[] }`
 two-phase like check-in; finish bumps the group version atomically; 409 `VersionConflict`
-⇒ client pulls first (repo-wins rule).
+⇒ client pulls first (repo-wins rule). v1.8: paths are NFC-normalized/validated at start
+exactly as for checkin-start (400 `InvalidManifest`; upload to the returned `changedPaths`),
+and finish retries are idempotent (`{ version }` of the committed transaction).
 
 ## Realtime
 

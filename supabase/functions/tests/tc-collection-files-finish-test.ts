@@ -6,8 +6,11 @@ import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import {
     callHandler,
     mockRequest,
+    type RecordedCall,
     routedFetchStub,
     setTestEnv,
+    TEST_CALLER,
+    TEST_SERVICE_ROLE_KEY,
     withMockFetch,
 } from "../_shared/tc/test_support.ts";
 
@@ -38,7 +41,9 @@ Deno.test(
             VersionId: "v-1",
         });
 
+        const calls: RecordedCall[] = [];
         const fetchStub = routedFetchStub([
+            { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             {
                 when: "collection_file_transactions",
                 status: 200,
@@ -49,16 +54,34 @@ Deno.test(
                 status: 200,
                 body: { version: 4 },
             },
-        ]);
+        ], calls);
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest({ transactionId: "tx-1" }), {
-                transactionId: "tx-1",
-            }),
+            callHandler(
+                handler,
+                mockRequest({ transactionId: "tx-1" }, "callers-own-jwt"),
+                { transactionId: "tx-1" },
+            ),
         );
 
         assertEquals(res.status, 200);
         assertEquals((await res.json()).version, 4);
+
+        // Identity from the caller's own JWT; the finish RPC as the service role, told
+        // that user id (see rpc.ts).
+        const identityCall = calls.find((c) =>
+            c.url.includes("rpc/current_caller"),
+        );
+        const finishCall = calls.find((c) =>
+            c.url.includes("rpc/collection_files_finish_tx"),
+        );
+        if (!identityCall || !finishCall) {
+            throw new Error(`missing expected calls, got ${calls.map((c) => c.url)}`);
+        }
+        assertEquals(identityCall.authorization, "Bearer callers-own-jwt");
+        assertEquals(finishCall.apikey, TEST_SERVICE_ROLE_KEY);
+        assertEquals(finishCall.authorization, `Bearer ${TEST_SERVICE_ROLE_KEY}`);
+        assertEquals(finishCall.body?.p_user_id, TEST_CALLER.userId);
 
         const headCalls = s3Mock.commandCalls(HeadObjectCommand);
         assertEquals(headCalls.length, 1);
@@ -81,6 +104,7 @@ Deno.test(
         });
 
         const fetchStub = routedFetchStub([
+            { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             {
                 when: "collection_file_transactions",
                 status: 200,
@@ -118,6 +142,7 @@ Deno.test(
     async () => {
         const s3Mock = mockClient(S3Client);
         const fetchStub = routedFetchStub([
+            { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             { when: "collection_file_transactions", status: 200, body: [] },
         ]);
 

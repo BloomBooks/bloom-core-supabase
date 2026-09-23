@@ -3,7 +3,11 @@
 // 409 VersionConflict ⇒ client pulls first (repo-wins rule); 409 MissingOrBadUploads.
 import { requireField, serveJsonPost } from "../_shared/tc/handler.ts";
 import { HttpError, jsonResponse } from "../_shared/tc/errors.ts";
-import { callTcRpc, selectTcRow } from "../_shared/tc/rpc.ts";
+import {
+    callerIdentity,
+    callTcServiceRpc,
+    selectTcRow,
+} from "../_shared/tc/rpc.ts";
 import {
     adminS3Client,
     captureVerifiedUploads,
@@ -33,6 +37,9 @@ export const handler = async (
 ): Promise<Response> => {
     const transactionId = requireField<string>(body, "transactionId");
 
+    // See checkin-finish: identity from the caller's own JWT, before any S3 work.
+    const caller = await callerIdentity(req);
+
     const tx = await selectTcRow<CollectionFileTransactionRow>(
         req,
         "collection_file_transactions",
@@ -55,11 +62,14 @@ export const handler = async (
         tx.proposed_files,
     );
 
-    const result = await callTcRpc<CollectionFilesFinishResult>(
-        req,
+    // Service-role call, for the same reason as in checkin-finish.
+    const result = await callTcServiceRpc<CollectionFilesFinishResult>(
         "collection_files_finish_tx",
         {
             p_transaction_id: transactionId,
+            p_user_id: caller.userId,
+            p_user_email: caller.email,
+            p_user_name: caller.name,
             p_captured: captured,
         },
     );

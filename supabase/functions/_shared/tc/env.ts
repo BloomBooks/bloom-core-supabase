@@ -27,21 +27,34 @@ export const isLocalMode = (): boolean =>
 
 /** Supabase project URL + anon key, auto-injected by the Supabase CLI/platform into
  * every edge function's environment — used to call PostgREST RPCs with the caller's
- * OWN forwarded JWT (never the service-role key; see the migration's header comment
- * for why that is both sufficient and correct here). */
+ * OWN forwarded JWT (see rpc.ts for which calls do that and which use the service-role
+ * key instead). */
 export const supabaseUrl = (): string => requireEnv("SUPABASE_URL");
 export const supabaseAnonKey = (): string => requireEnv("SUPABASE_ANON_KEY");
 
+/** Service-role key, also auto-injected by the Supabase CLI/platform. Used ONLY for the
+ * internal finish RPCs that record S3 state the edge function has just verified (see
+ * rpc.ts callTcServiceRpc); never forwarded to, or derived from, a client. */
+export const supabaseServiceRoleKey = (): string =>
+    requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+
 /** S3 / MinIO connection details. */
 export interface S3Env {
-    endpoint: string;
+    /** Custom S3 endpoint. Always set in local mode (the MinIO URL); normally unset in
+     * a hosted deployment, where undefined makes the AWS SDK pick the default AWS
+     * endpoint for `region` (see GOING-LIVE.md 2.3). */
+    endpoint: string | undefined;
     bucket: string;
     region: string;
     forcePathStyle: boolean;
 }
 
 export const s3Env = (): S3Env => ({
-    endpoint: requireEnv("BLOOM_S3_ENDPOINT"),
+    // Local mode has no AWS to fall back to, so a missing MinIO endpoint is a
+    // configuration error there; elsewhere its absence means "real AWS".
+    endpoint: isLocalMode()
+        ? requireEnv("BLOOM_S3_ENDPOINT")
+        : Deno.env.get("BLOOM_S3_ENDPOINT") || undefined,
     bucket: requireEnv("BLOOM_S3_BUCKET"),
     region: optionalEnv("BLOOM_S3_REGION", "us-east-1"),
     // MinIO requires path-style; real AWS uses virtual-hosted style. Local mode always

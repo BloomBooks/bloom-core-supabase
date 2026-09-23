@@ -32,6 +32,16 @@ export const stubAssumeRole = () => {
     return stsMock;
 };
 
+/** The fake service-role key setTestEnv installs, so tests can assert which calls use it. */
+export const TEST_SERVICE_ROLE_KEY = "test-service-role-key";
+
+/** What a fake tc.current_caller RPC returns in tests (see rpc.ts callerIdentity). */
+export const TEST_CALLER = {
+    userId: "user-1",
+    email: "user1@example.com",
+    name: "User One",
+};
+
 /** Sets every env var `_shared/tc/env.ts` reads, with dev-mode-friendly defaults. Call
  * this at the top of every test file (module scope) — handlers call `s3Env()` /
  * `supabaseUrl()` etc. eagerly inside the request path, not at import time, but it's
@@ -39,6 +49,7 @@ export const stubAssumeRole = () => {
 export const setTestEnv = (): void => {
     Deno.env.set("SUPABASE_URL", "http://127.0.0.1:54321");
     Deno.env.set("SUPABASE_ANON_KEY", "test-anon-key");
+    Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", TEST_SERVICE_ROLE_KEY);
     Deno.env.set("BLOOM_CLOUD_LOCAL_MODE", "true");
     Deno.env.set("BLOOM_S3_ENDPOINT", "http://minio.invalid:9000");
     Deno.env.set("BLOOM_S3_BUCKET", "bloom-teams-test");
@@ -105,14 +116,24 @@ export const withMockFetch = async <T>(
     }
 };
 
+/** One request seen by routedFetchStub, when asked to record them. */
+export interface RecordedCall {
+    url: string;
+    apikey: string | null;
+    authorization: string | null;
+    body: Record<string, unknown> | undefined;
+}
+
 /** A `fetch` stub that dispatches by matching a substring against the request URL, in
  * order — the first match wins. Each route returns `{ status, body }`; `body` is
  * JSON-stringified (or `""` for `null`, matching how PostgREST responds to e.g. a
- * successful RPC with no return value). */
+ * successful RPC with no return value). If `calls` is given, every matched request's
+ * URL, apikey/Authorization headers and parsed JSON body are appended to it. */
 export const routedFetchStub = (
     routes: { when: string; status: number; body: unknown }[],
+    calls?: RecordedCall[],
 ): FetchStub => {
-    return (input) => {
+    return (input, init) => {
         const url =
             typeof input === "string"
                 ? input
@@ -122,6 +143,15 @@ export const routedFetchStub = (
         const route = routes.find((r) => url.includes(r.when));
         if (!route) {
             throw new Error(`routedFetchStub: no route matched for ${url}`);
+        }
+        if (calls) {
+            const headers = new Headers(init?.headers);
+            calls.push({
+                url,
+                apikey: headers.get("apikey"),
+                authorization: headers.get("Authorization"),
+                body: init?.body ? JSON.parse(String(init.body)) : undefined,
+            });
         }
         const text = route.body === null ? "" : JSON.stringify(route.body);
         return Promise.resolve(

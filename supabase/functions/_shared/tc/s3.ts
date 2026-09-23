@@ -308,7 +308,9 @@ export const listObjectVersions = async (
     client: S3Client,
     bucket: string,
     key: string,
-): Promise<{ versionId: string; isLatest: boolean }[]> => {
+): Promise<
+    { versionId: string; isLatest: boolean; lastModified: Date | undefined }[]
+> => {
     const out = await client.send(
         new ListObjectVersionsCommand({ Bucket: bucket, Prefix: key }),
     );
@@ -317,6 +319,7 @@ export const listObjectVersions = async (
         .map((v) => ({
             versionId: v.VersionId as string,
             isLatest: !!v.IsLatest,
+            lastModified: v.LastModified,
         }));
 };
 

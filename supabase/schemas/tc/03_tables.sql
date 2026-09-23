@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS tc.books (
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by text NOT NULL,
-    locked_seat text
+    locked_seat text,
+    checkout_token_hash bytea
 );
 
 COMMENT ON TABLE tc.books IS 'Authoritative book state per collection. Lock columns, soft tombstone, current-version denormalization. All state transitions go through RPCs/edge functions; no direct writes via PostgREST.';
@@ -24,7 +25,9 @@ COMMENT ON COLUMN tc.books.name IS 'NFC-normalized on write by the nfc_normalize
 
 COMMENT ON COLUMN tc.books.deleted_at IS 'Soft tombstone: non-NULL = deleted. Tombstoned names are reusable (excluded from the live-name uniqueness index).';
 
-COMMENT ON COLUMN tc.books.locked_seat IS 'Which local copy of the collection ("seat") holds the lock: a client-computed stable hash of the local collection folder path (never the raw path). NULL = unknown (legacy lock, or one acquired by checkin_start_tx''s take-if-free path); a NULL seat can never be taken over (fail-safe).';
+COMMENT ON COLUMN tc.books.locked_seat IS 'Which local copy of the collection ("seat") holds the lock: a client-computed stable hash of the local collection folder path (never the raw path). NULL = unknown (legacy lock, or one acquired by checkin_start_tx''s take-if-free path). Recorded for display only; it does not grant takeover (see checkout_token_hash).';
+
+COMMENT ON COLUMN tc.books.checkout_token_hash IS 'SHA-256 of the secret checkout token issued to the current lock holder by checkout_book/checkout_book_takeover (the token itself is never stored). Presenting the token is what lets another account take the lock over. NULL = no token (unlocked, or a lock taken by checkin_start_tx), which can never be taken over. Cleared by the books_clear_seat_on_unlock trigger whenever the lock is released or changes hands without a new token. Not SELECT-granted to authenticated (column-level grants in 04_security.sql).';
 
 CREATE TABLE IF NOT EXISTS tc.checkin_transactions (
     id uuid DEFAULT gen_random_uuid() NOT NULL,

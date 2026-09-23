@@ -363,7 +363,8 @@ BLOOM_CRON_SECRET = "env(BLOOM_CRON_SECRET)"
 #   supabase functions serve --env-file team-collections/dev/functions.env   (pnpm dev:functions:tc)
 # and on hosted projects from `supabase secrets set`. An env(...) entry for a variable that is
 # unset would hand the functions a placeholder instead of letting them fail fast.
-#   Both:        BLOOM_CLOUD_LOCAL_MODE, BLOOM_S3_ENDPOINT, BLOOM_S3_BUCKET, BLOOM_S3_REGION,
+#   Both:        BLOOM_CLOUD_LOCAL_MODE, BLOOM_S3_ENDPOINT (required locally; optional hosted,
+#                where unset means the AWS default endpoint), BLOOM_S3_BUCKET, BLOOM_S3_REGION,
 #                BLOOM_S3_FORCE_PATH_STYLE
 #   Local only:  BLOOM_S3_ROOT_ACCESS_KEY, BLOOM_S3_ROOT_SECRET_KEY (MinIO root user)
 #   Hosted only: BLOOM_TEAMS_BROKER_ROLE_ARN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,

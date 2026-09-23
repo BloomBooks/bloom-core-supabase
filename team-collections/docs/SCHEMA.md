@@ -56,7 +56,8 @@ erDiagram
         text current_checksum
         text locked_by "NULL = not checked out"
         text locked_by_machine
-        text locked_seat "v1.5; which local copy"
+        text locked_seat "v1.5; which local copy (display only)"
+        bytea checkout_token_hash "v1.8; SHA-256 of takeover secret; not member-readable"
         timestamptz locked_at
         timestamptz deleted_at "tombstone; NULL = live"
         text created_by
@@ -124,9 +125,9 @@ erDiagram
         uuid book_id FK
         text started_by
         text proposed_name
-        uuid base_version_id "soft FK to versions"
-        text changed_paths "text[]"
-        jsonb proposed_files "full manifest, captured at start"
+        uuid base_version_id "book's version at start; finish re-checks it"
+        text changed_paths "text[], NFC"
+        jsonb proposed_files "full manifest at start, paths NFC"
         text checksum
         uuid result_version_id "soft FK; set on finish"
         bigint result_seq
@@ -176,7 +177,14 @@ erDiagram
   analogue of `versions`/`version_files`.
 - **The two `*_transactions` tables are ephemeral.** They hold in-flight state for the two-phase
   check-in / collection-files protocols (start → upload to S3 → finish); rows are reaped when
-  `expires_at` passes. They are not part of the durable data model.
+  `expires_at` passes. They are not part of the durable data model. Start stores the proposed
+  manifest with every path NFC-normalized, so the keys the client uploads to and the paths
+  committed at finish are spelled the same way.
+- **Checkout token.** `books.checkout_token_hash` holds only the SHA-256 of a random secret that
+  `checkout_book` returns to the account taking the lock; presenting that secret is what
+  `checkout_book_takeover` requires. The column is excluded from `authenticated`'s column-level
+  SELECT grant and is cleared (by the `books_clear_seat_on_unlock` trigger) whenever the lock is
+  released or changes hands without a new token.
 - **`events`** is the append-only history log behind the History panel and realtime broadcasts;
   `type` is the numeric `BookHistoryEventType`. `book_id` is nullable (`ON DELETE SET NULL`) so a
   book's history survives its deletion.
