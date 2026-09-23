@@ -97,6 +97,8 @@ BEGIN
        OR CASE WHEN jsonb_typeof(e->'size') = 'number'
                THEN (e->>'size')::numeric < 0
                     OR (e->>'size')::numeric <> trunc((e->>'size')::numeric)
+                    -- the size columns are bigint
+                    OR (e->>'size')::numeric > 9223372036854775807
                ELSE true END;
     IF v_bad IS NOT NULL THEN
         RAISE EXCEPTION '%', json_build_object('error', 'InvalidManifest',
@@ -165,7 +167,10 @@ BEGIN
         RAISE EXCEPTION '%', '{"error":"unauthenticated"}' USING ERRCODE = 'PT401';
     END IF;
 
-    SELECT * INTO v_tx FROM tc.checkin_transactions WHERE id = p_transaction_id;
+    -- FOR UPDATE, like checkin_finish_tx (which also locks this row first): abort and a
+    -- concurrent finish then take turns, and whichever runs second sees the other's final
+    -- status instead of overwriting a just-finished transaction with 'aborted'.
+    SELECT * INTO v_tx FROM tc.checkin_transactions WHERE id = p_transaction_id FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION '%', '{"error":"transaction_not_found"}' USING ERRCODE = 'PT404';
     END IF;
@@ -247,9 +252,9 @@ BEGIN
         RAISE EXCEPTION '%', '{"error":"transaction_aborted"}' USING ERRCODE = 'PT409';
     END IF;
 
+    -- (No status update here: raising would roll it back. The expiry time alone refuses
+    -- the call, and reap_expired_checkin_transactions marks the row later.)
     IF v_tx.status = 'expired' OR v_tx.expires_at < now() THEN
-        UPDATE tc.checkin_transactions SET status = 'expired'
-        WHERE id = p_transaction_id AND status = 'open';
         RAISE EXCEPTION '%', '{"error":"TransactionExpired"}' USING ERRCODE = 'PT410';
     END IF;
 
@@ -814,9 +819,9 @@ BEGIN
     IF v_tx.status = 'aborted' THEN
         RAISE EXCEPTION '%', '{"error":"transaction_aborted"}' USING ERRCODE = 'PT409';
     END IF;
+    -- (No status update here: raising would roll it back. The expiry time alone refuses
+    -- the call, and the reaper marks the row later.)
     IF v_tx.status = 'expired' OR v_tx.expires_at < now() THEN
-        UPDATE tc.collection_file_transactions SET status = 'expired'
-        WHERE id = p_transaction_id AND status = 'open';
         RAISE EXCEPTION '%', '{"error":"TransactionExpired"}' USING ERRCODE = 'PT410';
     END IF;
 
@@ -825,8 +830,8 @@ BEGIN
     FOR UPDATE;
 
     IF v_group.version <> v_tx.expected_version THEN
-        UPDATE tc.collection_file_transactions SET status = 'aborted', aborted_at = now()
-        WHERE id = p_transaction_id;
+        -- The transaction stays open (an update here would be rolled back by the raise);
+        -- the caller's next collection-files-start resumes it with the new version.
         RAISE EXCEPTION '%', json_build_object(
             'error', 'VersionConflict', 'currentVersion', v_group.version
         )::text USING ERRCODE = 'PT409';
@@ -866,8 +871,8 @@ BEGIN
     WHERE id = v_group.id AND version = v_tx.expected_version;
 
     IF NOT FOUND THEN
-        UPDATE tc.collection_file_transactions SET status = 'aborted', aborted_at = now()
-        WHERE id = p_transaction_id;
+        -- The transaction stays open (an update here would be rolled back by the raise);
+        -- the caller's next collection-files-start resumes it with the new version.
         RAISE EXCEPTION '%', json_build_object(
             'error', 'VersionConflict', 'currentVersion', v_group.version
         )::text USING ERRCODE = 'PT409';

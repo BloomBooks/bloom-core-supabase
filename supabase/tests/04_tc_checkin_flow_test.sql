@@ -18,7 +18,7 @@
 
 BEGIN;
 
-SELECT plan(47);
+SELECT plan(48);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -323,6 +323,12 @@ SELECT throws_like(
         'Book Nine', NULL, 'cs-9', '6.5.0', '[{"path":"a.htm","size":1}]')$$,
     '%InvalidManifest%',
     '7c: an entry with no sha256 is refused'
+);
+SELECT throws_like(
+    $$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c409',
+        'Book Nine', NULL, 'cs-9', '6.5.0', '[{"path":"a.htm","sha256":"s","size":100000000000000000000}]')$$,
+    '%InvalidManifest%',
+    '7d: a size too big for the bigint size columns is refused (not a 500)'
 );
 SELECT ok(
     NOT EXISTS (SELECT 1 FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c409'),
