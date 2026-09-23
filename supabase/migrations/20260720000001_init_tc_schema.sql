@@ -478,6 +478,14 @@ BEGIN
         END IF;
     ELSE
         -- ---- Existing-book path ---------------------------------------------
+        -- Lock order is transaction row, then book row, the same as checkin_finish_tx and
+        -- checkin_abort_tx, so a re-sent start racing this user's own finish waits instead
+        -- of deadlocking. So first lock any open transaction of ours on this book (the
+        -- resume below updates it).
+        PERFORM 1 FROM tc.checkin_transactions
+        WHERE book_id = p_book_id AND started_by = v_user_id AND status = 'open'
+        FOR UPDATE;
+
         -- FOR UPDATE: hold the row while checking and taking the lock, so a concurrent
         -- checkout either finishes first (and we report LockHeldByOther below) or waits.
         SELECT * INTO v_book FROM tc.books
