@@ -86,11 +86,11 @@ GRANT ALL ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) TO authenticate
 REVOKE ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) FROM PUBLIC, anon, authenticated;
 GRANT ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) TO service_role;
 
-GRANT ALL ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb) TO authenticated;
+GRANT ALL ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text) TO authenticated;
 
-GRANT ALL ON FUNCTION tc.checkout_book(p_book_id uuid, p_machine text, p_seat text) TO authenticated;
+GRANT ALL ON FUNCTION tc.checkout_book(p_book_id uuid, p_machine text) TO authenticated;
 
-GRANT ALL ON FUNCTION tc.checkout_book_takeover(p_book_id uuid, p_checkout_token text, p_machine text, p_seat text) TO authenticated;
+GRANT ALL ON FUNCTION tc.checkout_book_takeover(p_book_id uuid, p_checkout_guid text, p_machine text) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.claim_memberships() TO authenticated;
 
@@ -104,7 +104,7 @@ GRANT ALL ON FUNCTION tc.create_collection(p_id uuid, p_name text) TO authentica
 
 GRANT ALL ON FUNCTION tc.current_caller() TO authenticated;
 
-GRANT ALL ON FUNCTION tc.delete_book(p_book_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION tc.delete_book(p_book_id uuid, p_checkout_guid text) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.download_start_check(p_collection_id uuid) TO authenticated;
 
@@ -149,13 +149,14 @@ GRANT ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) T
 
 GRANT ALL ON FUNCTION tc.undelete_book(p_book_id uuid) TO authenticated;
 
-GRANT ALL ON FUNCTION tc.unlock_book(p_book_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION tc.unlock_book(p_book_id uuid, p_checkout_guid text) TO authenticated;
 
--- Every column except checkout_token_hash: the takeover secret's hash is never
--- member-readable (only checkout_book/checkout_book_takeover, as SECURITY DEFINER, touch it).
+-- Listed column by column so that a column added later is not member-readable until it is
+-- added here. checkout_guid_hash is readable on purpose: it is a hash of 122 random bits,
+-- and clients compare it with their local .checkout file (CONTRACTS.md v1.9).
 GRANT SELECT (id, collection_id, instance_id, name, current_version_id, current_version_seq,
               current_checksum, locked_by, locked_by_machine, locked_at, deleted_at,
-              created_at, created_by, locked_seat) ON TABLE tc.books TO authenticated;
+              created_at, created_by, checkout_guid_hash) ON TABLE tc.books TO authenticated;
 
 GRANT SELECT ON TABLE tc.checkin_transactions TO authenticated;
 

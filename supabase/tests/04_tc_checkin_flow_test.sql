@@ -8,6 +8,12 @@
 --   8.   collection files: NFC at start, service-role finish, idempotent retry
 --   9.   the row locks that make start/finish race-safe are present
 --   10.  the sweep's per-key re-check
+--   11.  aborting an expired new-book check-in
+--   12-13. the checkout GUID (CONTRACTS.md v1.9) at start: required for one's own lock,
+--        issued when start takes a free lock or creates / resumes a new book
+--   14.  an admin force-unlocks without the GUID; the old holder's check-in is refused
+--   (5 also covers the GUID at finish: it must not have changed since start, and
+--   keepCheckedOut keeps it.)
 -- (The edge functions call the finish RPCs with the service-role key; here the suite's
 -- postgres role stands in for it and passes the caller's identity explicitly.)
 -- =============================================================================
@@ -18,7 +24,7 @@
 
 BEGIN;
 
-SELECT plan(50);
+SELECT plan(65);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -44,6 +50,15 @@ BEGIN
         true
     );
 END;
+$$;
+
+-- The stored form of a checkout GUID as the contract defines it (lowercase hex SHA-256 of
+-- the lowercase GUID), computed independently of tc._checkout_guid_hash.
+CREATE OR REPLACE FUNCTION tests.guid_hash(p_guid text)
+RETURNS text
+LANGUAGE sql
+AS $$
+    SELECT encode(sha256(convert_to(lower(p_guid), 'UTF8')), 'hex')
 $$;
 
 -- Composed vs decomposed spellings of "café.htm" (é = U+00E9, or e + U+0301).
@@ -159,6 +174,14 @@ SELECT ok(
     (SELECT base_version_id IS NULL FROM tc.checkin_transactions WHERE id = current_setting('tests.tx1')::uuid),
     '3e: a new book''s transaction has no base version'
 );
+SELECT ok(
+    (current_setting('tests.start1')::jsonb ->> 'checkoutGuid') IS NOT NULL
+    AND (SELECT checkout_guid_hash FROM tc.books WHERE id = current_setting('tests.book1')::uuid)
+        = tests.guid_hash(current_setting('tests.start1')::jsonb ->> 'checkoutGuid')
+    AND (SELECT checkout_guid_hash FROM tc.checkin_transactions WHERE id = current_setting('tests.tx1')::uuid)
+        = tests.guid_hash(current_setting('tests.start1')::jsonb ->> 'checkoutGuid'),
+    '3f: a new book''s start issues a checkout GUID; the book and the transaction store its hash'
+);
 
 -- =============================================================================
 -- 4. Finish (as the edge function would, with the caller passed explicitly)
@@ -178,8 +201,9 @@ SELECT is(
     '4a: the file is committed under the same NFC key it was uploaded to'
 );
 SELECT ok(
-    (SELECT current_version_seq = 1 AND locked_by IS NULL FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
-    '4b: the first commit is seq 1 and releases the lock'
+    (SELECT current_version_seq = 1 AND locked_by IS NULL AND checkout_guid_hash IS NULL
+       FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
+    '4b: the first commit is seq 1 and releases the lock (and its checkout GUID)'
 );
 SELECT ok(
     (SELECT count(*) = 2 FROM tc.events
@@ -204,14 +228,15 @@ SELECT throws_ok(
 --    commits v2 -- Alice's finish must not overwrite v2 or disturb Bob's lock.
 -- =============================================================================
 
-SELECT tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine');
+SELECT set_config('tests.a5',
+    tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine') ->> 'checkoutGuid', true);
 SELECT set_config('tests.tx2', tc.checkin_start_tx(
     'c0000000-0000-0000-0000-00000000c401', current_setting('tests.book1')::uuid, 'd0000000-0000-0000-0000-00000000c401',
     'Book One', NULL, 'cs-2a', '6.5.0',
     jsonb_build_array(
         jsonb_build_object('path', current_setting('tests.nfc'), 'sha256', 'sha-cafe-alice', 'size', 11),
         jsonb_build_object('path', 'images/a.png', 'sha256', 'sha-a', 'size', 20)
-    )) ->> 'transactionId', true);
+    ), current_setting('tests.a5')) ->> 'transactionId', true);
 
 SELECT is(
     (SELECT base_version_id::text FROM tc.checkin_transactions WHERE id = current_setting('tests.tx2')::uuid),
@@ -222,20 +247,26 @@ SELECT is(
 SELECT tc.force_unlock(current_setting('tests.book1')::uuid);
 
 SELECT tests.set_jwt('user-bob-cif', 'bob-cif@example.com', 'Bob');
-SELECT tc.checkout_book(current_setting('tests.book1')::uuid, 'BobMachine');
+SELECT set_config('tests.b5',
+    tc.checkout_book(current_setting('tests.book1')::uuid, 'BobMachine') ->> 'checkoutGuid', true);
 SELECT set_config('tests.tx3', tc.checkin_start_tx(
     'c0000000-0000-0000-0000-00000000c401', current_setting('tests.book1')::uuid, 'd0000000-0000-0000-0000-00000000c401',
     'Book One', (current_setting('tests.fin1')::jsonb ->> 'versionId')::uuid, 'cs-2b', '6.5.0',
     jsonb_build_array(
         jsonb_build_object('path', current_setting('tests.nfc'), 'sha256', 'sha-cafe-bob', 'size', 12),
         jsonb_build_object('path', 'images/a.png', 'sha256', 'sha-a', 'size', 20)
-    )) ->> 'transactionId', true);
+    ), current_setting('tests.b5')) ->> 'transactionId', true);
 SELECT tc.checkin_finish_tx(current_setting('tests.tx3')::uuid, 'user-bob-cif', 'bob-cif@example.com', 'Bob', 'bob', true,
     jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-bob')));
 
 SELECT ok(
     (SELECT current_version_seq = 2 AND locked_by = 'user-bob-cif' FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
     '5b: sanity: Bob committed v2 and kept the book checked out'
+);
+SELECT is(
+    (SELECT checkout_guid_hash FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
+    tests.guid_hash(current_setting('tests.b5')),
+    '5b2: keepCheckedOut keeps the checkout GUID (not rotated, not cleared)'
 );
 
 SELECT throws_like(
@@ -250,17 +281,33 @@ SELECT ok(
     '5d: v2 and Bob''s lock are untouched'
 );
 
--- Even once Alice holds the lock again, her transaction is based on v1, which is gone.
-SELECT tc.unlock_book(current_setting('tests.book1')::uuid);
+-- Even once Alice holds the lock again, it is a new checkout (a new GUID), not the one her
+-- transaction started under.
+SELECT tc.unlock_book(current_setting('tests.book1')::uuid, current_setting('tests.b5'));
 SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
-SELECT tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine');
+SELECT set_config('tests.a5b',
+    tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine') ->> 'checkoutGuid', true);
+
+SELECT throws_like(
+    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, %L)$$,
+        current_setting('tests.tx2'),
+        jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-alice'))::text),
+    '%CheckoutElsewhere%',
+    '5e: Alice''s finish is refused because the checkout GUID changed since her start'
+);
+
+-- Pretend the transaction had started under this checkout: her transaction is still based
+-- on v1, which is gone.
+UPDATE tc.checkin_transactions
+SET checkout_guid_hash = tests.guid_hash(current_setting('tests.a5b'))
+WHERE id = current_setting('tests.tx2')::uuid;
 
 SELECT throws_like(
     format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, %L)$$,
         current_setting('tests.tx2'),
         jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-alice'))::text),
     '%BaseVersionSuperseded%',
-    '5e: Alice''s finish is refused because the book moved on from her base version'
+    '5e2: with the same checkout, Alice''s finish is refused because the book moved on from her base version'
 );
 SELECT is(
     (SELECT s3_version_id FROM tc.version_files
@@ -269,7 +316,7 @@ SELECT is(
     '5f: Bob''s committed file is still the current one'
 );
 
-SELECT tc.unlock_book(current_setting('tests.book1')::uuid);
+SELECT tc.unlock_book(current_setting('tests.book1')::uuid, current_setting('tests.a5b'));
 SELECT throws_like(
     format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, '[]')$$,
         current_setting('tests.tx2')),
@@ -285,16 +332,17 @@ INSERT INTO tc.books (id, collection_id, instance_id, name, created_by)
 VALUES ('b0000000-0000-0000-0000-00000000c402', 'c0000000-0000-0000-0000-00000000c401',
         'd0000000-0000-0000-0000-00000000c402', 'Book Two', 'user-alice-cif');
 
-SELECT tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine');
+SELECT set_config('tests.a6',
+    tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine') ->> 'checkoutGuid', true);
 SELECT throws_like(
     format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', %L, 'd0000000-0000-0000-0000-00000000c401',
-        'book two', NULL, 'cs-x', '6.5.0', '[]')$$, current_setting('tests.book1')),
+        'book two', NULL, 'cs-x', '6.5.0', '[]', %L)$$, current_setting('tests.book1'), current_setting('tests.a6')),
     '%NameConflict%',
     '6a: an existing book cannot be renamed (case-insensitively) to another live book''s name'
 );
 SELECT lives_ok(
     format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', %L, 'd0000000-0000-0000-0000-00000000c401',
-        'Book One Renamed', NULL, 'cs-x', '6.5.0', '[]')$$, current_setting('tests.book1')),
+        'Book One Renamed', NULL, 'cs-x', '6.5.0', '[]', %L)$$, current_setting('tests.book1'), current_setting('tests.a6')),
     '6b: sanity: a rename to a free name is accepted'
 );
 
@@ -381,7 +429,7 @@ SELECT throws_ok(
 -- =============================================================================
 
 SELECT ok(
-    pg_get_functiondef('tc.checkin_start_tx(uuid, uuid, uuid, text, uuid, text, text, jsonb)'::regprocedure)
+    pg_get_functiondef('tc.checkin_start_tx(uuid, uuid, uuid, text, uuid, text, text, jsonb, text)'::regprocedure)
         ~ 'WHERE id = p_book_id AND collection_id = p_collection_id\s+FOR UPDATE',
     '9a: checkin_start_tx locks an existing book''s row before checking/taking the lock'
 );
@@ -454,6 +502,140 @@ SELECT lives_ok(
 SELECT ok(
     NOT EXISTS (SELECT 1 FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c411'),
     '11b: and removes the never-finished book'
+);
+
+-- =============================================================================
+-- 12. Existing book: starting a check-in of one's own lock needs its checkout GUID (the
+--     copy that has it); taking a free lock issues a new one.
+-- =============================================================================
+
+SELECT ok(
+    (SELECT locked_by = 'user-alice-cif' AND checkout_guid_hash = tests.guid_hash(current_setting('tests.a6'))
+       FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
+    '12-sanity: Alice still holds book one under the GUID from section 6'
+);
+
+SELECT throws_like(
+    format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', %L, 'd0000000-0000-0000-0000-00000000c401',
+        'Book One Renamed', NULL, 'cs-12', '6.5.0', '[]')$$, current_setting('tests.book1')),
+    '%CheckoutElsewhere%',
+    '12a: without the GUID, start refuses the holder (CheckoutElsewhere)'
+);
+SELECT throws_like(
+    format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', %L, 'd0000000-0000-0000-0000-00000000c401',
+        'Book One Renamed', NULL, 'cs-12', '6.5.0', '[]', %L)$$,
+        current_setting('tests.book1'), gen_random_uuid()::text),
+    '%CheckoutElsewhere%',
+    '12b: with a wrong GUID, start refuses the holder (CheckoutElsewhere)'
+);
+
+SELECT set_config('tests.s12', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', current_setting('tests.book1')::uuid, 'd0000000-0000-0000-0000-00000000c401',
+    'Book One Renamed', NULL, 'cs-12', '6.5.0', '[]', current_setting('tests.a6'))::text, true);
+SELECT ok(
+    (current_setting('tests.s12')::jsonb ? 'transactionId')
+    AND NOT (current_setting('tests.s12')::jsonb ? 'checkoutGuid')
+    AND (SELECT checkout_guid_hash FROM tc.books WHERE id = current_setting('tests.book1')::uuid)
+        = tests.guid_hash(current_setting('tests.a6')),
+    '12c: with the right GUID, start succeeds, issues no new GUID and keeps the hash'
+);
+
+-- Take-if-free: release the lock, then start with no GUID.
+SELECT tc.unlock_book(current_setting('tests.book1')::uuid, current_setting('tests.a6'));
+SELECT set_config('tests.s12e', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', current_setting('tests.book1')::uuid, 'd0000000-0000-0000-0000-00000000c401',
+    'Book One Renamed', NULL, 'cs-12', '6.5.0', '[]')::text, true);
+SELECT ok(
+    (current_setting('tests.s12e')::jsonb ->> 'checkoutGuid') IS NOT NULL
+    AND (SELECT locked_by = 'user-alice-cif'
+                AND checkout_guid_hash = tests.guid_hash(current_setting('tests.s12e')::jsonb ->> 'checkoutGuid')
+           FROM tc.books WHERE id = current_setting('tests.book1')::uuid)
+    AND (SELECT checkout_guid_hash FROM tc.checkin_transactions
+          WHERE id = (current_setting('tests.s12e')::jsonb ->> 'transactionId')::uuid)
+        = tests.guid_hash(current_setting('tests.s12e')::jsonb ->> 'checkoutGuid'),
+    '12d: start on a free book takes the lock and issues a GUID (stored on the book and the transaction)'
+);
+
+-- =============================================================================
+-- 13. New book: start issues a GUID, and resuming the never-committed book needs it (or
+--     re-issues one when the row has none).
+-- =============================================================================
+
+SELECT set_config('tests.s13', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c413',
+    'Book Thirteen', NULL, 'cs-13', '6.5.0', '[]')::text, true);
+SELECT ok(
+    (current_setting('tests.s13')::jsonb ->> 'checkoutGuid') IS NOT NULL
+    AND (SELECT checkout_guid_hash FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c413')
+        = tests.guid_hash(current_setting('tests.s13')::jsonb ->> 'checkoutGuid'),
+    '13a: a new book''s start issues a GUID'
+);
+
+SELECT throws_like(
+    $$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c413',
+        'Book Thirteen', NULL, 'cs-13', '6.5.0', '[]')$$,
+    '%CheckoutElsewhere%',
+    '13b: resuming one''s own new book without its GUID is refused (CheckoutElsewhere)'
+);
+
+SELECT ok(
+    (SELECT r ->> 'transactionId' = current_setting('tests.s13')::jsonb ->> 'transactionId'
+            AND NOT (r ? 'checkoutGuid')
+       FROM (SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c413',
+                 'Book Thirteen', NULL, 'cs-13', '6.5.0', '[]',
+                 current_setting('tests.s13')::jsonb ->> 'checkoutGuid') AS r) s),
+    '13c: resuming with the GUID continues the same transaction and issues no new GUID'
+);
+
+-- A never-committed row with no hash at all: resuming re-issues one.
+UPDATE tc.books SET checkout_guid_hash = NULL WHERE instance_id = 'd0000000-0000-0000-0000-00000000c413';
+SELECT set_config('tests.s13d', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c413',
+    'Book Thirteen', NULL, 'cs-13', '6.5.0', '[]')::text, true);
+SELECT ok(
+    (current_setting('tests.s13d')::jsonb ->> 'checkoutGuid') IS NOT NULL
+    AND (current_setting('tests.s13d')::jsonb ->> 'checkoutGuid') <> (current_setting('tests.s13')::jsonb ->> 'checkoutGuid')
+    AND (current_setting('tests.s13d')::jsonb ->> 'transactionId') = (current_setting('tests.s13')::jsonb ->> 'transactionId')
+    AND (SELECT checkout_guid_hash FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c413')
+        = tests.guid_hash(current_setting('tests.s13d')::jsonb ->> 'checkoutGuid')
+    AND (SELECT checkout_guid_hash FROM tc.checkin_transactions
+          WHERE id = (current_setting('tests.s13d')::jsonb ->> 'transactionId')::uuid)
+        = tests.guid_hash(current_setting('tests.s13d')::jsonb ->> 'checkoutGuid'),
+    '13d: resuming a new book whose row has no hash issues a new GUID for the same transaction'
+);
+
+-- =============================================================================
+-- 14. An admin can always cancel someone else's checkout without its GUID; the old
+--     holder's in-flight check-in is then refused.
+-- =============================================================================
+
+SELECT tests.set_jwt('user-bob-cif', 'bob-cif@example.com', 'Bob');
+SELECT set_config('tests.b14',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000c402', 'BobMachine') ->> 'checkoutGuid', true);
+SELECT set_config('tests.tx14', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', 'b0000000-0000-0000-0000-00000000c402', 'd0000000-0000-0000-0000-00000000c402',
+    'Book Two', NULL, 'cs-14', '6.5.0',
+    jsonb_build_array(jsonb_build_object('path', 'two.htm', 'sha256', 'sha-two', 'size', 3)),
+    current_setting('tests.b14')) ->> 'transactionId', true);
+
+-- Alice (admin) has never seen Bob's GUID.
+SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
+SELECT lives_ok(
+    $$SELECT tc.force_unlock('b0000000-0000-0000-0000-00000000c402')$$,
+    '14a: an admin with no GUID can force-unlock a book another member has checked out'
+);
+SELECT ok(
+    current_setting('tests.tx14', true) IS NOT NULL
+    AND (SELECT locked_by IS NULL AND checkout_guid_hash IS NULL
+           FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000c402'),
+    '14b: force_unlock clears the lock and the checkout GUID hash'
+);
+SELECT throws_like(
+    format($$SELECT tc.checkin_finish_tx(%L, 'user-bob-cif', NULL, NULL, 'stale', false, %L)$$,
+        current_setting('tests.tx14'),
+        jsonb_build_array(jsonb_build_object('path', 'two.htm', 's3VersionId', 'sv-two'))::text),
+    '%LockHeldByOther%',
+    '14c: the old holder''s check-in under the now-stale GUID is refused'
 );
 SELECT * FROM finish();
 ROLLBACK;

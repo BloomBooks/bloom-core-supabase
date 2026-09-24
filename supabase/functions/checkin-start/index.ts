@@ -1,9 +1,11 @@
 // POST /functions/v1/checkin-start — CONTRACTS.md §checkin-start
 //
 // Req: { collectionId, bookId?, bookInstanceId, proposedName, baseVersionId?,
-//        checksum, clientVersion, files: [{path, sha256, size}] }
-// 200: { transactionId, changedPaths[], s3: { bucket, region, prefix, credentials } }
-// Errors: 401/403 · 409 LockHeldByOther/BaseVersionSuperseded/NameConflict · 426 ClientOutOfDate.
+//        checksum, clientVersion, files: [{path, sha256, size}], checkoutGuid? }
+// 200: { transactionId, changedPaths[], checkoutGuid?, s3: { bucket, region, prefix, credentials } }
+//      (checkoutGuid only when this call issued a new checkout: new book, or a free lock taken)
+// Errors: 400 InvalidManifest · 401/403 · 409 LockHeldByOther/CheckoutElsewhere/BaseVersionSuperseded/
+//         NameConflict · 426 ClientOutOfDate.
 import {
     optionalField,
     requireField,
@@ -18,6 +20,7 @@ interface CheckinStartResult {
     transactionId: string;
     bookId: string;
     changedPaths: string[];
+    checkoutGuid?: string;
 }
 
 // Exported (rather than only passed inline to serveJsonPost) so Deno tests can import
@@ -35,6 +38,8 @@ export const handler = async (
     const files = requireField<unknown[]>(body, "files");
     const bookId = optionalField<string>(body, "bookId");
     const baseVersionId = optionalField<string>(body, "baseVersionId");
+    // The book folder's .checkout GUID, if the client has one (CONTRACTS.md v1.9).
+    const checkoutGuid = optionalField<string>(body, "checkoutGuid");
 
     const result = await callTcRpc<CheckinStartResult>(
         req,
@@ -48,6 +53,7 @@ export const handler = async (
             p_checksum: checksum,
             p_client_version: clientVersion,
             p_files: files,
+            p_checkout_guid: checkoutGuid,
         },
     );
 
@@ -64,6 +70,9 @@ export const handler = async (
     return jsonResponse(200, {
         transactionId: result.transactionId,
         changedPaths: result.changedPaths,
+        // Present only when this call issued a new checkout; the client saves it in the
+        // book folder's .checkout file.
+        ...(result.checkoutGuid ? { checkoutGuid: result.checkoutGuid } : {}),
         s3,
     });
 };

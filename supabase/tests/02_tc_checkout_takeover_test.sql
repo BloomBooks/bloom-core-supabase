@@ -1,8 +1,10 @@
 -- =============================================================================
--- pgTAP tests: tc.checkout_book_takeover (dogfood batch 1, item 9 -- account-switch
--- checkout takeover). Takeover is granted by presenting the secret checkout token that
--- checkout_book returned to the lock holder (kept in the local copy's checkout record);
--- the machine name and seat, which every member can read, grant nothing.
+-- pgTAP tests: the checkout GUID (CONTRACTS.md v1.9). checkout_book issues a random GUID to
+-- the account that checks a book out (its client keeps it in the book folder's .checkout
+-- file); the server stores only its hash, which members can read. Unlock, delete and (in
+-- 04_tc_checkin_flow_test.sql) check-in by the holder require the GUID, and
+-- checkout_book_takeover lets a DIFFERENT account take the lock over only by presenting it
+-- (dogfood batch 1, item 9: account switch in the same local copy).
 -- =============================================================================
 -- Run against a local Supabase stack:
 --   supabase start
@@ -11,7 +13,7 @@
 
 BEGIN;
 
-SELECT plan(32);
+SELECT plan(46);
 
 SELECT has_function('tc', 'checkout_book_takeover', 'tc.checkout_book_takeover() exists');
 
@@ -42,11 +44,27 @@ BEGIN
 END;
 $$;
 
+-- The hash as the contract defines it, computed here independently of tc._checkout_guid_hash:
+-- lowercase hex SHA-256 of the UTF-8 bytes of the GUID's lowercase string form.
+CREATE OR REPLACE FUNCTION tests.guid_hash(p_guid text)
+RETURNS text
+LANGUAGE sql
+AS $$
+    SELECT encode(sha256(convert_to(lower(p_guid), 'UTF8')), 'hex')
+$$;
+
+-- The book's current stored hash.
+CREATE OR REPLACE FUNCTION tests.stored_hash()
+RETURNS text
+LANGUAGE sql
+AS $$
+    SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'
+$$;
+
 -- =============================================================================
--- Fixture: a collection with Alice (admin) and Bob (member, claimed), a book Alice has
--- checked out on "SharedMachine" in her own local copy ("seat-alice-copy"). Uses the
--- public RPCs (create_collection/members_add/claim_memberships), matching
--- 01_tc_schema_test.sql's own fixture convention.
+-- Fixture: a collection with Alice (admin) and Bob (member, claimed), and a book Alice
+-- checks out on "SharedMachine". Uses the public RPCs (create_collection/members_add/
+-- claim_memberships), matching 01_tc_schema_test.sql's own fixture convention.
 -- =============================================================================
 
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
@@ -81,225 +99,363 @@ VALUES (
     'user-alice-tko'
 );
 
--- Alice checks the book out on SharedMachine, seat "seat-alice-copy"; keep the token her
--- client would save in the book folder's checkout record.
-SELECT set_config('tests.alice_token',
-    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine', 'seat-alice-copy') ->> 'checkout_token',
+-- Alice checks the book out; keep the GUID her client would save in the .checkout file.
+SELECT set_config('tests.alice_guid',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine') ->> 'checkoutGuid',
     true);
 
 SELECT ok(
-    (SELECT locked_seat FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'seat-alice-copy',
-    '0d: checkout_book records the caller''s seat with the lock'
+    current_setting('tests.alice_guid') ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    '0d: a successful checkout returns a checkout GUID (lowercase random UUID)'
+);
+
+SELECT is(
+    tests.stored_hash(),
+    tests.guid_hash(current_setting('tests.alice_guid')),
+    '0e: the book row stores sha256 (lowercase hex) of the lowercase GUID'
 );
 
 SELECT ok(
-    current_setting('tests.alice_token') ~ '^[0-9a-f]{64}$',
-    '0e: a successful checkout returns a 64-hex-char checkout token'
+    has_column_privilege('authenticated', 'tc.books', 'checkout_guid_hash', 'SELECT'),
+    '0f: members can SELECT tc.books.checkout_guid_hash'
+);
+
+SELECT is(
+    (SELECT b ->> 'checkoutGuidHash'
+       FROM jsonb_array_elements(tc.get_collection_state('c0000000-0000-0000-0000-00000000a001') -> 'books') b
+      WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000a001'),
+    tests.guid_hash(current_setting('tests.alice_guid')),
+    '0g: get_collection_state returns the hash as checkoutGuidHash'
+);
+
+SELECT is(
+    (SELECT b ->> 'checkoutGuidHash'
+       FROM jsonb_array_elements(tc.get_changes('c0000000-0000-0000-0000-00000000a001', 0) -> 'books') b
+      WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000a001'),
+    tests.guid_hash(current_setting('tests.alice_guid')),
+    '0h: get_changes returns the hash as checkoutGuidHash'
 );
 
 SELECT ok(
-    (SELECT checkout_token_hash = sha256(convert_to(current_setting('tests.alice_token'), 'UTF8'))
-       FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '0f: only the token''s SHA-256 is stored on the book row'
+    position(current_setting('tests.alice_guid') IN tc.get_collection_state('c0000000-0000-0000-0000-00000000a001')::text) = 0
+    AND position(current_setting('tests.alice_guid') IN tc.get_changes('c0000000-0000-0000-0000-00000000a001', 0)::text) = 0,
+    '0i: neither get_collection_state nor get_changes contains the GUID itself'
 );
 
--- The hash column is not readable by members (column-level grants), nor is the token
--- reachable through the member-facing state RPCs.
+-- Checked as the superuser running the tests, so every column of every row counts.
 SELECT ok(
-    NOT has_column_privilege('authenticated', 'tc.books', 'checkout_token_hash', 'SELECT'),
-    '0g: authenticated cannot SELECT tc.books.checkout_token_hash'
-);
-
-SELECT ok(
-    has_column_privilege('authenticated', 'tc.books', 'locked_by', 'SELECT'),
-    '0h: sanity: authenticated can still SELECT the ordinary lock columns'
-);
-
-SELECT ok(
-    position(current_setting('tests.alice_token') IN tc.get_collection_state('c0000000-0000-0000-0000-00000000a001')::text) = 0
-    AND position('checkout_token' IN tc.get_collection_state('c0000000-0000-0000-0000-00000000a001')::text) = 0,
-    '0i: get_collection_state exposes neither the token nor its hash'
-);
-
-SELECT ok(
-    position(current_setting('tests.alice_token') IN tc.get_changes('c0000000-0000-0000-0000-00000000a001', 0)::text) = 0
-    AND position('checkout_token' IN tc.get_changes('c0000000-0000-0000-0000-00000000a001', 0)::text) = 0,
-    '0j: get_changes exposes neither the token nor its hash'
+    NOT EXISTS (SELECT 1 FROM tc.books b WHERE b::text LIKE '%' || current_setting('tests.alice_guid') || '%')
+    AND NOT EXISTS (SELECT 1 FROM tc.events e WHERE e::text LIKE '%' || current_setting('tests.alice_guid') || '%')
+    AND NOT EXISTS (SELECT 1 FROM tc.checkin_transactions t WHERE t::text LIKE '%' || current_setting('tests.alice_guid') || '%'),
+    '0j: the GUID itself is stored nowhere (books, events, checkin_transactions)'
 );
 
 -- =============================================================================
--- 1. Bob (different account) CANNOT take over without Alice's token -- even replaying
---    the machine and seat every member can read.
+-- 1. Checking out again as the holder is refused and re-issues nothing (the caller may be
+--    in another copy; re-issuing would silently orphan the copy that has the GUID).
+-- =============================================================================
+
+SELECT set_config('tests.recheckout',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'OtherMachine')::text,
+    true);
+
+SELECT ok(
+    (current_setting('tests.recheckout')::jsonb ->> 'success') = 'false'
+    AND (current_setting('tests.recheckout')::jsonb ->> 'locked_by_me') = 'true'
+    AND NOT (current_setting('tests.recheckout')::jsonb ? 'checkoutGuid'),
+    '1a: re-checkout by the holder returns success false, locked_by_me true, and no GUID'
+);
+
+SELECT ok(
+    tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid'))
+    AND (SELECT locked_by_machine FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'SharedMachine',
+    '1b: the refused re-checkout leaves the hash (and the recorded machine) unchanged'
+);
+
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.events
+     WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0),
+    '1c: the refused re-checkout emits no CheckOut event'
+);
+
+-- =============================================================================
+-- 2. Bob (a different account) cannot take over without the GUID
 -- =============================================================================
 
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT ok(
-    NOT (tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'BobsMachine') ? 'checkout_token'),
-    '1a: a failed checkout_book does not hand Bob a token'
+    (SELECT r ->> 'success' = 'false' AND NOT (r ? 'checkoutGuid') AND NOT (r ? 'locked_by_me')
+       FROM (SELECT tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'BobsMachine') AS r) s),
+    '2a: Bob''s checkout_book fails, with no GUID and no locked_by_me'
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', NULL, 'SharedMachine', 'seat-alice-copy')) ->> 'success' = 'false'),
-    '1b: Bob cannot take over by replaying Alice''s machine and seat with no token'
+    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', NULL, 'SharedMachine')) ->> 'success' = 'false'),
+    '2b: Bob cannot take over with no GUID'
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', repeat('0', 64), 'SharedMachine', 'seat-alice-copy')) ->> 'success' = 'false'),
-    '1c: Bob cannot take over with a wrong token'
+    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text, 'SharedMachine')) ->> 'success' = 'false'),
+    '2c: Bob cannot take over with a wrong GUID'
 );
 
 SELECT ok(
     (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
-        (SELECT encode(checkout_token_hash, 'hex') FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-        'SharedMachine', 'seat-alice-copy')) ->> 'success' = 'false'),
-    '1d: presenting the stored hash instead of the token does not work'
+        (SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+        'SharedMachine')) ->> 'success' = 'false'),
+    '2d: presenting the member-readable hash instead of the GUID does not work'
 );
 
 SELECT ok(
-    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-alice-tko',
-    '1e: the lock still belongs to Alice after the failed attempts'
-);
-
--- =============================================================================
--- 2. Bob CAN take over when he presents Alice's token (the true shared-computer
---    scenario: account B opens the exact local folder account A checked the book out in;
---    the folder may have been moved or renamed, so machine/seat need not match)
--- =============================================================================
-
-SELECT set_config('tests.bob_token',
-    tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
-        current_setting('tests.alice_token'), 'SharedMachine', 'seat-renamed-copy') ->> 'checkout_token',
-    true);
-
-SELECT ok(
-    current_setting('tests.bob_token') ~ '^[0-9a-f]{64}$',
-    '2a: Bob takes over with Alice''s token and gets a token of his own'
-);
-
-SELECT ok(
-    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-bob-tko',
-    '2b: the lock now belongs to Bob'
-);
-
-SELECT ok(
-    (SELECT locked_seat FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'seat-renamed-copy',
-    '2c: the seat Bob reported is recorded with his lock'
-);
-
-SELECT ok(
-    current_setting('tests.bob_token') <> current_setting('tests.alice_token')
-    AND (SELECT checkout_token_hash = sha256(convert_to(current_setting('tests.bob_token'), 'UTF8'))
-           FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '2d: the token was rotated: the row now holds the hash of Bob''s new token'
-);
-
-SELECT ok(
-    (SELECT count(*) = 1 FROM tc.events
-     WHERE book_id = 'b0000000-0000-0000-0000-00000000a001'
-       AND type = 0
-       AND by_user_id = 'user-bob-tko'),
-    '2e: exactly one CheckOut event (type=0) recorded for Bob''s takeover'
-);
-
--- Alice's old token is dead: she cannot use it to take the lock back.
-SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
-
-SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', current_setting('tests.alice_token'), 'SharedMachine', 'seat-alice-copy')) ->> 'success' = 'false'),
-    '2f: the token Bob presented no longer grants takeover'
+    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-alice-tko'
+    AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
+    '2e: the lock and its hash are unchanged after the failed attempts'
 );
 
 -- =============================================================================
--- 3. Calling it again for the CURRENT holder is a harmless no-op (not a new "takeover")
+-- 3. Bob CAN take over by presenting the GUID (the shared-computer scenario: account B
+--    opens the local copy account A checked the book out in), and the GUID is kept.
 -- =============================================================================
 
-SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
-
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', current_setting('tests.bob_token'), 'SharedMachine', 'seat-renamed-copy')) ->> 'success' = 'false'),
-    '3a: re-calling takeover when the caller already holds the lock reports no change'
+    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+        current_setting('tests.alice_guid'), 'SharedMachine')) ->> 'success' = 'true'),
+    '3a: Bob takes over with the GUID'
 );
 
 SELECT ok(
-    (SELECT count(*) = 1 FROM tc.events
-     WHERE book_id = 'b0000000-0000-0000-0000-00000000a001'
-       AND type = 0
-       AND by_user_id = 'user-bob-tko'),
-    '3b: no duplicate CheckOut event was emitted for the no-op re-call'
-);
-
-SELECT ok(
-    (SELECT checkout_token_hash = sha256(convert_to(current_setting('tests.bob_token'), 'UTF8'))
+    (SELECT locked_by = 'user-bob-tko' AND locked_by_machine = 'SharedMachine'
        FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '3c: the no-op re-call leaves Bob''s token valid'
+    '3b: the lock now belongs to Bob'
 );
 
--- =============================================================================
--- 4. A non-member cannot take over any lock, even with the token
--- =============================================================================
+SELECT is(
+    tests.stored_hash(),
+    tests.guid_hash(current_setting('tests.alice_guid')),
+    '3c: takeover keeps the GUID (not rotated), so the same copy goes on working'
+);
+
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.events
+     WHERE book_id = 'b0000000-0000-0000-0000-00000000a001'
+       AND type = 0
+       AND by_user_id = 'user-bob-tko'),
+    '3d: exactly one CheckOut event (type=0) recorded for Bob''s takeover'
+);
+
+SELECT is(
+    current_setting('tc.checkout_takeover', true),
+    'off',
+    '3e: the takeover switches its keep-the-GUID flag off again afterwards'
+);
+
+SELECT ok(
+    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+        current_setting('tests.alice_guid'), 'SharedMachine')) ->> 'success' = 'false')
+    AND (SELECT count(*) = 1 FROM tc.events
+         WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0 AND by_user_id = 'user-bob-tko')
+    AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
+    '3f: re-calling takeover as the current holder is a no-op (no event, hash kept)'
+);
 
 SELECT tests.set_jwt('user-carol-tko', 'carol-tko@example.com', true);
 
 -- PT403 (not 42501): checkout_book_takeover raises the schema-wide PT### passthrough codes.
 SELECT throws_ok(
-    format($$SELECT tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', %L, 'SharedMachine', 'seat-alice-copy')$$,
-        current_setting('tests.bob_token')),
+    format($$SELECT tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', %L, 'SharedMachine')$$,
+        current_setting('tests.alice_guid')),
     'PT403',
     NULL,
-    '4a: a non-member cannot take over a lock (not_a_member)'
+    '3g: a non-member cannot take over a lock, even with the GUID (not_a_member)'
 );
 
 -- =============================================================================
--- 5. Unlock clears the seat and the token (books_clear_seat_on_unlock trigger)
+-- 4. Unlock and delete by the holder require the GUID
 -- =============================================================================
+
+SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
+
+SELECT throws_like(
+    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', NULL)$$,
+    'CheckoutElsewhere%',
+    '4a: the holder cannot unlock without the GUID'
+);
+
+SELECT throws_like(
+    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text)$$,
+    'CheckoutElsewhere%',
+    '4b: the holder cannot unlock with a wrong GUID'
+);
+
+SELECT throws_like(
+    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001',
+        (SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'))$$,
+    'CheckoutElsewhere%',
+    '4c: the holder cannot unlock with the hash in place of the GUID'
+);
+
+SELECT throws_like(
+    $$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', NULL)$$,
+    'CheckoutElsewhere%',
+    '4d: the holder cannot delete without the GUID'
+);
+
+SELECT throws_like(
+    $$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text)$$,
+    'CheckoutElsewhere%',
+    '4e: the holder cannot delete with a wrong GUID'
+);
+
+SELECT ok(
+    (SELECT locked_by = 'user-bob-tko' AND deleted_at IS NULL
+       FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001')
+    AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
+    '4f: the refused unlocks and deletes changed nothing'
+);
+
+SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
+
+SELECT throws_like(
+    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+        current_setting('tests.alice_guid')),
+    'lock_not_held%',
+    '4g: the GUID alone does not let a non-holder unlock'
+);
 
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT lives_ok(
-    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001')$$,
-    '5a: the current holder can unlock'
+    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+        upper(current_setting('tests.alice_guid'))),
+    '4h: the holder can unlock with the GUID (compared case-insensitively)'
 );
 
 SELECT ok(
-    (SELECT locked_seat IS NULL FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '5b: locked_seat is cleared with the lock (trigger)'
-);
-
-SELECT ok(
-    (SELECT checkout_token_hash IS NULL FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '5c: checkout_token_hash is cleared with the lock (trigger)'
+    (SELECT locked_by IS NULL AND checkout_guid_hash IS NULL
+       FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '4i: unlocking clears the lock and the hash'
 );
 
 -- =============================================================================
--- 6. A lock that changed hands without a token being issued (as checkin_start_tx's
---    take-if-free path does) can never be taken over, and no earlier token survives it.
+-- 5. A new checkout gets a new GUID, and delete works with it
 -- =============================================================================
 
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 
-SELECT set_config('tests.alice_token2',
-    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine', 'seat-alice-copy') ->> 'checkout_token',
+SELECT set_config('tests.alice_guid2',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine') ->> 'checkoutGuid',
     true);
 
--- Simulate a token-less lock change (a different holder written without a new hash).
-UPDATE tc.books SET locked_by = 'user-dave-tko' WHERE id = 'b0000000-0000-0000-0000-00000000a001';
+SELECT ok(
+    current_setting('tests.alice_guid2') <> current_setting('tests.alice_guid')
+    AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid2')),
+    '5a: a new checkout issues a new GUID and stores its hash'
+);
+
+SELECT lives_ok(
+    format($$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+        current_setting('tests.alice_guid2')),
+    '5b: the holder can delete with the GUID'
+);
 
 SELECT ok(
-    (SELECT checkout_token_hash IS NULL FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
-    '6a: a change of holder that sets no new token clears the old token hash (trigger)'
+    (SELECT deleted_at IS NOT NULL AND locked_by IS NULL AND checkout_guid_hash IS NULL
+       FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '5c: delete releases the lock and clears the hash'
+);
+
+SELECT tc.undelete_book('b0000000-0000-0000-0000-00000000a001');
+
+-- =============================================================================
+-- 6. An admin can always cancel someone else's checkout without its GUID; force_unlock
+--    clears the hash (books_clear_checkout_on_unlock trigger)
+-- =============================================================================
+
+SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
+
+SELECT set_config('tests.bob_guid',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'BobsMachine') ->> 'checkoutGuid',
+    true);
+
+-- Alice (admin) never saw Bob's GUID.
+SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
+
+SELECT lives_ok(
+    $$SELECT tc.force_unlock('b0000000-0000-0000-0000-00000000a001')$$,
+    '6a: an admin with no GUID can force-unlock a book another member has checked out'
+);
+
+SELECT ok(
+    current_setting('tests.bob_guid') IS NOT NULL
+    AND (SELECT locked_by IS NULL AND checkout_guid_hash IS NULL
+           FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '6b: force_unlock clears the lock and the hash'
 );
 
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
+SELECT throws_like(
+    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+        current_setting('tests.bob_guid')),
+    'lock_not_held%',
+    '6c: the force-unlocked GUID grants its old holder nothing afterwards'
+);
+
+-- =============================================================================
+-- 7. members_remove clears the removed member's locks and hashes
+-- =============================================================================
+
+SELECT set_config('tests.bob_guid2',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'BobsMachine') ->> 'checkoutGuid',
+    true);
+
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', current_setting('tests.alice_token2'), 'SharedMachine', 'seat-alice-copy')) ->> 'success' = 'false'),
-    '6b: a lock with no token cannot be taken over, even with the previous holder''s token'
+    current_setting('tests.bob_guid2') <> ''
+    AND (SELECT locked_by = 'user-bob-tko'
+                AND checkout_guid_hash = tests.guid_hash(current_setting('tests.bob_guid2'))
+           FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '7a: Bob checks the free book out and gets a GUID'
+);
+
+SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
+
+SELECT lives_ok(
+    $$SELECT tc.members_remove('c0000000-0000-0000-0000-00000000a001',
+        (SELECT id FROM tc.members
+          WHERE collection_id = 'c0000000-0000-0000-0000-00000000a001' AND user_id = 'user-bob-tko'))$$,
+    '7b: the admin removes Bob'
 );
 
 SELECT ok(
-    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-dave-tko',
-    '6c: the token-less lock is unchanged'
+    (SELECT locked_by IS NULL AND checkout_guid_hash IS NULL
+       FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '7c: removing the member clears his lock and its hash'
+);
+
+-- =============================================================================
+-- 8. A lock that changes hands without a new GUID (outside checkout_book_takeover) loses
+--    the old hash, so the previous holder's GUID cannot take it over.
+-- =============================================================================
+
+SELECT set_config('tests.alice_guid4',
+    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine') ->> 'checkoutGuid',
+    true);
+
+-- Simulate a GUID-less lock change (a different holder written without a new hash).
+UPDATE tc.books SET locked_by = 'user-dave-tko' WHERE id = 'b0000000-0000-0000-0000-00000000a001';
+
+SELECT ok(
+    current_setting('tests.alice_guid4') IS NOT NULL
+    AND (SELECT checkout_guid_hash IS NULL FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
+    '8a: a change of holder that sets no new GUID clears the old hash (trigger)'
+);
+
+SELECT ok(
+    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+        current_setting('tests.alice_guid4'), 'SharedMachine')) ->> 'success' = 'false')
+    AND (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-dave-tko',
+    '8b: a lock with no hash cannot be taken over, even with the previous holder''s GUID'
 );
 
 SELECT * FROM finish();

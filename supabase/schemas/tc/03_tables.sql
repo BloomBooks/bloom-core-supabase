@@ -13,8 +13,7 @@ CREATE TABLE IF NOT EXISTS tc.books (
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by text NOT NULL,
-    locked_seat text,
-    checkout_token_hash bytea
+    checkout_guid_hash text
 );
 
 COMMENT ON TABLE tc.books IS 'Authoritative book state per collection. Lock columns, soft tombstone, current-version denormalization. All state transitions go through RPCs/edge functions; no direct writes via PostgREST.';
@@ -25,9 +24,9 @@ COMMENT ON COLUMN tc.books.name IS 'NFC-normalized on write by the nfc_normalize
 
 COMMENT ON COLUMN tc.books.deleted_at IS 'Soft tombstone: non-NULL = deleted. Tombstoned names are reusable (excluded from the live-name uniqueness index).';
 
-COMMENT ON COLUMN tc.books.locked_seat IS 'Which local copy of the collection ("seat") holds the lock: a client-computed stable hash of the local collection folder path (never the raw path). NULL = unknown (legacy lock, or one acquired by checkin_start_tx''s take-if-free path). Recorded for display only; it does not grant takeover (see checkout_token_hash).';
+COMMENT ON COLUMN tc.books.locked_by_machine IS 'Name of the machine the lock was taken from. Display only: it grants nothing (the checkout GUID decides which local copy may check in).';
 
-COMMENT ON COLUMN tc.books.checkout_token_hash IS 'SHA-256 of the secret checkout token issued to the current lock holder by checkout_book/checkout_book_takeover (the token itself is never stored). Presenting the token is what lets another account take the lock over. NULL = no token (unlocked, or a lock taken by checkin_start_tx), which can never be taken over. Cleared by the books_clear_seat_on_unlock trigger whenever the lock is released or changes hands without a new token. Not SELECT-granted to authenticated (column-level grants in 04_security.sql).';
+COMMENT ON COLUMN tc.books.checkout_guid_hash IS 'Lowercase hex SHA-256 of the UTF-8 bytes of the current checkout GUID (canonical lowercase form), i.e. tc._checkout_guid_hash(guid). The GUID itself is never stored: the server returns it only to the client that took the lock, which keeps it in the book folder''s .checkout file. Check-in, unlock and delete by the holder, and takeover by another account, all require the GUID. Readable by members (a hash of 122 random bits cannot be reversed) and returned as checkoutGuidHash by get_collection_state/get_changes so a client can tell whether its local .checkout is still current. NULL = unlocked. Cleared by the books_clear_checkout_on_unlock trigger whenever the lock is released or changes hands without a new GUID.';
 
 CREATE TABLE IF NOT EXISTS tc.checkin_transactions (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -47,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tc.checkin_transactions (
     checksum text,
     result_version_id uuid,
     result_seq bigint,
+    checkout_guid_hash text,
     CONSTRAINT checkin_transactions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'finished'::text, 'aborted'::text, 'expired'::text])))
 );
 
@@ -57,6 +57,8 @@ COMMENT ON COLUMN tc.checkin_transactions.proposed_files IS 'Full proposed manif
 COMMENT ON COLUMN tc.checkin_transactions.checksum IS 'SHA-256 checksum of the full proposed manifest, supplied at checkin-start and persisted as tc.versions.checksum / tc.books.current_checksum on finish.';
 
 COMMENT ON COLUMN tc.checkin_transactions.result_version_id IS 'Set on successful checkin-finish; makes a repeated checkin-finish call for an already-finished transaction idempotent (returns the same result).';
+
+COMMENT ON COLUMN tc.checkin_transactions.checkout_guid_hash IS 'The book''s checkout_guid_hash as checkin-start saw (or issued) it. checkin-finish refuses (CheckoutElsewhere) unless the book still has this hash, so a checkout that moved to another copy (takeover, force-unlock and re-checkout) in between cannot be committed over.';
 
 CREATE TABLE IF NOT EXISTS tc.collection_file_groups (
     id bigint NOT NULL,
@@ -346,7 +348,7 @@ CREATE INDEX versions_book_id_idx ON tc.versions USING btree (book_id);
 
 CREATE INDEX versions_collection_id_idx ON tc.versions USING btree (collection_id);
 
-CREATE OR REPLACE TRIGGER books_clear_seat_on_unlock BEFORE UPDATE ON tc.books FOR EACH ROW EXECUTE FUNCTION tc._clear_seat_on_unlock();
+CREATE OR REPLACE TRIGGER books_clear_checkout_on_unlock BEFORE UPDATE ON tc.books FOR EACH ROW EXECUTE FUNCTION tc._clear_checkout_on_unlock();
 
 CREATE OR REPLACE TRIGGER books_nfc_normalize_name_tg BEFORE INSERT OR UPDATE OF name ON tc.books FOR EACH ROW EXECUTE FUNCTION tc.nfc_normalize_book_name();
 

@@ -55,9 +55,8 @@ erDiagram
         bigint current_version_seq "denormalized"
         text current_checksum
         text locked_by "NULL = not checked out"
-        text locked_by_machine
-        text locked_seat "v1.5; which local copy (display only)"
-        bytea checkout_token_hash "v1.8; SHA-256 of takeover secret; not member-readable"
+        text locked_by_machine "display only"
+        text checkout_guid_hash "v1.9; hex SHA-256 of the checkout GUID; member-readable"
         timestamptz locked_at
         timestamptz deleted_at "tombstone; NULL = live"
         text created_by
@@ -131,6 +130,7 @@ erDiagram
         text checksum
         uuid result_version_id "soft FK; set on finish"
         bigint result_seq
+        text checkout_guid_hash "v1.9; book's checkout at start; finish re-checks it"
         text status "open | finished | aborted | expired"
         timestamptz expires_at
     }
@@ -180,11 +180,15 @@ erDiagram
   `expires_at` passes. They are not part of the durable data model. Start stores the proposed
   manifest with every path NFC-normalized, so the keys the client uploads to and the paths
   committed at finish are spelled the same way.
-- **Checkout token.** `books.checkout_token_hash` holds only the SHA-256 of a random secret that
-  `checkout_book` returns to the account taking the lock; presenting that secret is what
-  `checkout_book_takeover` requires. The column is excluded from `authenticated`'s column-level
-  SELECT grant and is cleared (by the `books_clear_seat_on_unlock` trigger) whenever the lock is
-  released or changes hands without a new token.
+- **Checkout GUID.** Every new checkout (`checkout_book`, or `checkin-start` creating a book or
+  taking a free lock) issues a random GUID, returned only to the client taking the lock, which keeps
+  it in the book folder's `.checkout` file. `books.checkout_guid_hash` holds only its hash (lowercase
+  hex SHA-256 of the lowercase GUID). The hash is member-readable and returned by
+  `get_collection_state`/`get_changes` as `checkoutGuidHash`, so a client can tell whether its local
+  `.checkout` is still current; the GUID itself is stored nowhere. Check-in, unlock and delete by the
+  holder, and `checkout_book_takeover` by another account, all require the GUID; `force_unlock`
+  (admin) does not. The `books_clear_checkout_on_unlock` trigger clears the hash whenever the lock is
+  released or changes hands without a new GUID (`checkout_book_takeover` alone keeps it on purpose).
 - **`events`** is the append-only history log behind the History panel and realtime broadcasts;
   `type` is the numeric `BookHistoryEventType`. `book_id` is nullable (`ON DELETE SET NULL`) so a
   book's history survives its deletion.
