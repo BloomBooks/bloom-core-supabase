@@ -26,7 +26,7 @@
 
 BEGIN;
 
-SELECT plan(77);
+SELECT plan(78);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -771,5 +771,18 @@ SELECT tc.checkin_start_tx(
 SELECT ok(
     (SELECT count(*) = 1 FROM tc.events WHERE id > current_setting('tests.ev17')::bigint),
     '17c: starting again under one''s own lock records no further CheckOut event'
+);
+-- =============================================================================
+-- 18. A deleted book (tombstone) can't be checked in to
+-- =============================================================================
+
+UPDATE tc.books SET deleted_at = now(), locked_by = NULL, locked_at = NULL
+WHERE id = current_setting('tests.book1')::uuid;
+SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
+SELECT throws_like(
+    format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', %L, 'd0000000-0000-0000-0000-00000000c401',
+        'Book One', NULL, 'cs-x', '6.5.0', '[]')$$, current_setting('tests.book1')),
+    '%book_not_found%',
+    '18a: check-in start refuses a deleted book instead of taking its lock'
 );
 SELECT * FROM finish();ROLLBACK;

@@ -318,6 +318,10 @@ BEGIN
     --      (NULL for a new book's first commit, which then requires the book still to
     --      have no version). ------------------------------------------------------
     SELECT * INTO v_book FROM tc.books WHERE id = v_tx.book_id FOR UPDATE;
+    -- Deleted since start: committing would add a version nobody can see.
+    IF v_book.deleted_at IS NOT NULL THEN
+        RAISE EXCEPTION '%', '{"error":"book_not_found"}' USING ERRCODE = 'PT404';
+    END IF;
     IF v_book.locked_by IS DISTINCT FROM v_user_id THEN
         RAISE EXCEPTION '%', json_build_object(
             'error', 'LockHeldByOther',
@@ -543,7 +547,9 @@ BEGIN
         WHERE id = p_book_id AND collection_id = p_collection_id
         FOR UPDATE;
 
-        IF NOT FOUND THEN
+        -- A deleted book (tombstone) is not there to check in to: finishing would add a
+        -- version nobody can see.
+        IF NOT FOUND OR v_book.deleted_at IS NOT NULL THEN
             RAISE EXCEPTION '%', '{"error":"book_not_found"}' USING ERRCODE = 'PT404';
         END IF;
 
