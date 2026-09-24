@@ -39,6 +39,8 @@ const TX_ROW = {
         },
     ],
     status: "open",
+    // Resumed a few times by checkin-start; finish must pass this exact value on.
+    revision: 3,
 };
 const BOOK_ROW = { instance_id: "instance-1" };
 
@@ -251,6 +253,18 @@ Deno.test(
         assertEquals(finishCall.body?.p_captured, [
             { path: "book.htm", s3VersionId: "v-42" },
         ]);
+        // The revision read with the proposal just verified goes to the RPC, which refuses
+        // (TransactionChanged) if a concurrent checkin-start resume has changed it since.
+        const txRead = calls.find((c) => c.url.includes("checkin_transactions"));
+        if (!txRead) {
+            throw new Error("the transaction row was never read");
+        }
+        assertEquals(
+            new URL(txRead.url).searchParams.get("select")?.split(",").includes("revision"),
+            true,
+            "the transaction read must fetch the revision with the proposal",
+        );
+        assertEquals(finishCall.body?.p_expected_revision, 3);
 
         s3Mock.restore();
     },
@@ -319,6 +333,33 @@ Deno.test(
             false,
             "the internal `manifest` field must never leak to the client",
         );
+
+        s3Mock.restore();
+    },
+);
+
+Deno.test(
+    "checkin-finish: RPC 409 TransactionChanged (a concurrent resume) passes through, with no manifest backup",
+    async () => {
+        const s3Mock = mockClient(S3Client);
+        s3Mock.on(HeadObjectCommand).resolves({
+            ChecksumSHA256: hexToBase64(TX_ROW.proposed_files[0].sha256),
+            VersionId: "v-42",
+        });
+
+        const fetchStub = routesFor(TX_ROW, BOOK_ROW, 409, {
+            message: JSON.stringify({ error: "TransactionChanged" }),
+        });
+
+        const res = await withMockFetch(fetchStub, () =>
+            callHandler(handler, mockRequest({ transactionId: "tx-1" }), {
+                transactionId: "tx-1",
+            }),
+        );
+
+        assertEquals(res.status, 409);
+        assertEquals(await res.json(), { error: "TransactionChanged" });
+        assertEquals(s3Mock.commandCalls(PutObjectCommand).length, 0);
 
         s3Mock.restore();
     },

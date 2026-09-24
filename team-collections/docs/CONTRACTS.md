@@ -20,7 +20,13 @@ argument (`CheckoutElsewhere` when it does not match); `checkin-start` takes an 
 when the caller holds the book under a different GUID; `checkin-finish` answers `409
 CheckoutElsewhere` if the checkout changed since start; book rows from `get_collection_state` /
 `get_changes` carry `checkoutGuidHash` instead of `locked_seat`. `force_unlock` is unchanged: an
-admin never needs the GUID. v1.8, 23 Sep 2026, BL-16531 review fixes — BREAKING for the client:
+admin never needs the GUID. v1.9 follow-up, same day (BL-16531 review; no version bump, since no
+request or response field changes): `checkin-finish` and `collection-files-finish` can answer
+`409 TransactionChanged` when a concurrent start resumed (rewrote) the transaction while finish
+was verifying it — nothing is committed and it is retryable like any other failed finish;
+`checkin-start` taking a free lock now emits a CheckOut event, as `checkout_book` does; and
+`checkin-start` obtains its S3 credentials before it takes the lock, so a credential failure can
+no longer leave a checkout GUID issued that the client never received. v1.8, 23 Sep 2026, BL-16531 review fixes — BREAKING for the client:
 `checkout_book` now returns a secret `checkout_token` on success, and `checkout_book_takeover`
 takes that token as a new second argument and grants takeover only for it (machine/seat no
 longer grant anything); `checkin-start`/`collection-files-start` NFC-normalize and validate
@@ -225,8 +231,11 @@ clientVersion, files: [{path, sha256, size}], checkoutGuid? }`
   case a new one is issued.
 - v1.9, existing book: if the caller already holds the lock, `checkoutGuid` must be its current
   checkout GUID, else 409 `CheckoutElsewhere` (the caller holds it in another copy); if the book is
-  free, start takes the lock and issues a new GUID; if someone else holds it, 409
-  `LockHeldByOther` as before.
+  free, start takes the lock, issues a new GUID and emits a CheckOut event (type 0, exactly as
+  `checkout_book` does, so other clients see the lock via realtime/`get_changes`); if someone
+  else holds it, 409 `LockHeldByOther` as before.
+- The S3 credentials are obtained before the lock is taken (so a failure there leaves no GUID
+  issued that the response never carried); a refused start returns none.
 - Existing book: `proposedName` must not equal (case-insensitively, after NFC) another live
   book's name, else 409 `NameConflict` (v1.8; previously only caught at finish).
 - v1.8: every `files[].path` is NFC-normalized before anything else, and validated: it must be a
@@ -262,13 +271,21 @@ v1.9: it also refuses with 409 `CheckoutElsewhere` unless the book still has the
 the transaction started under (checked after `LockHeldByOther`, before
 `BaseVersionSuperseded`). `keepCheckedOut: true` keeps the lock AND the GUID; otherwise both are
 released.
+v1.9 follow-up: 409 `TransactionChanged` means a `checkin-start` for the same transaction (a
+resume, which rewrites its file list) ran while this finish was verifying the uploads, so what
+was verified is no longer what would be committed. Nothing is written and the transaction stays
+open; treat it like any other failed finish (start again, upload the returned `changedPaths`,
+finish).
 
 *Internal (not called by the client):* the finish edge functions establish the caller from
 their own JWT via the `tc.current_caller()` RPC (validated by PostgREST, so this works for a
 Firebase ID token under Option A as well as a local GoTrue token), then call
 `tc.checkin_finish_tx` / `tc.collection_files_finish_tx` with the **service-role key**, passing
 that user id. Those two RPCs are EXECUTE-able by `service_role` only, because they trust the
-S3 version-ids they are given; a member calling them directly gets `permission denied`.
+S3 version-ids they are given; a member calling them directly gets `permission denied`. Each
+also takes `p_expected_revision`: the transaction row's `revision` as the edge function read it
+along with the file list it verified; every start resume bumps `revision`, and a mismatch is the
+409 `TransactionChanged` above.
 
 #### `checkin-abort` POST — `{ transactionId }` → 200.
 
@@ -280,7 +297,9 @@ S3 version-ids they are given; a member calling them directly gets `permission d
 two-phase like check-in; finish bumps the group version atomically; 409 `VersionConflict`
 ⇒ client pulls first (repo-wins rule). v1.8: paths are NFC-normalized/validated at start
 exactly as for checkin-start (400 `InvalidManifest`; upload to the returned `changedPaths`),
-and finish retries are idempotent (`{ version }` of the committed transaction).
+and finish retries are idempotent (`{ version }` of the committed transaction). v1.9 follow-up:
+finish can also answer 409 `TransactionChanged` (a concurrent start resumed the transaction
+while finish was verifying it; nothing committed, retry as for any failed finish).
 
 ## Realtime
 

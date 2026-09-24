@@ -3,7 +3,8 @@
 // Req: { transactionId, comment?, keepCheckedOut? }
 // Verifies each changed object's sha256 attribute server-side, captures S3
 // version-ids, then commits the single atomic DB transaction (tc.checkin_finish_tx).
-// 200: { versionId, seq } · 409 MissingOrBadUploads { paths[] } · 410 expired.
+// 200: { versionId, seq } · 409 MissingOrBadUploads { paths[] } · 409 TransactionChanged (a
+// concurrent checkin-start resume rewrote the transaction while we verified it) · 410 expired.
 import {
     optionalField,
     requireField,
@@ -30,6 +31,7 @@ interface CheckinTransactionRow {
     changed_paths: string[];
     proposed_files: { path: string; sha256: string; size: number }[];
     status: string;
+    revision: number;
 }
 
 interface CheckinFinishResult {
@@ -58,7 +60,7 @@ export const handler = async (
     const tx = await selectTcRow<CheckinTransactionRow>(
         req,
         "checkin_transactions",
-        `id=eq.${transactionId}&select=id,collection_id,book_id,changed_paths,proposed_files,status`,
+        `id=eq.${transactionId}&select=id,collection_id,book_id,changed_paths,proposed_files,status,revision`,
     );
     if (!tx) {
         throw new HttpError(404, { error: "transaction_not_found" });
@@ -92,6 +94,9 @@ export const handler = async (
             p_comment: comment,
             p_keep_checked_out: keepCheckedOut,
             p_captured: captured,
+            // The proposal we verified; a checkin-start resume since then changes it, and
+            // the RPC refuses (409 TransactionChanged) rather than commit a mismatch.
+            p_expected_revision: tx.revision,
         },
     );
 

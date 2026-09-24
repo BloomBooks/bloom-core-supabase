@@ -249,7 +249,7 @@ $$;
 
 COMMENT ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) IS 'Internal to the checkin-abort edge function. Idempotent. Rolls back a never-finished new book entirely; leaves an existing book''s lock untouched.';
 
-CREATE OR REPLACE FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) RETURNS jsonb
+CREATE OR REPLACE FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 -- Service-role only (see 04_security.sql and the checkin-finish edge function). The
@@ -300,6 +300,14 @@ BEGIN
     -- the call, and reap_expired_checkin_transactions marks the row later.)
     IF v_tx.status = 'expired' OR v_tx.expires_at < now() THEN
         RAISE EXCEPTION '%', '{"error":"TransactionExpired"}' USING ERRCODE = 'PT410';
+    END IF;
+
+    -- p_captured was verified against the proposal the edge function read at
+    -- p_expected_revision. A checkin-start resume since then rewrote proposed_files and
+    -- changed_paths (and bumped the revision), so those version-ids must not be committed
+    -- with the new proposal's checksums. The transaction stays open for a fresh finish.
+    IF v_tx.revision IS DISTINCT FROM p_expected_revision THEN
+        RAISE EXCEPTION '%', '{"error":"TransactionChanged"}' USING ERRCODE = 'PT409';
     END IF;
 
     -- ---- Re-check, under a row lock, what start checked: the caller still holds the
@@ -429,7 +437,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) IS 'Internal to the checkin-finish edge function; service-role only, because it trusts p_captured (S3 version-ids the edge function verified). p_user_id/p_user_email/p_user_name identify the caller, established by the edge function from the caller''s own JWT (tc.current_caller). Locks the transaction and book rows, re-checks that the caller started the transaction, is still a member, still holds the book''s lock under the same checkout GUID (v1.9: the book''s checkout_guid_hash must equal the transaction''s), and that the book is still at the transaction''s base version. Single atomic DB transaction: version row, current-manifest replacement, book update, lock release (which clears the checkout GUID; keepCheckedOut keeps both), events, transaction close. Idempotent when re-called (even concurrently) on an already-finished transaction. Raises PT401/PT403/PT404/PT409(LockHeldByOther, CheckoutElsewhere, BaseVersionSuperseded, MissingOrBadUploads)/PT410(expired).';
+COMMENT ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) IS 'Internal to the checkin-finish edge function; service-role only, because it trusts p_captured (S3 version-ids the edge function verified). p_user_id/p_user_email/p_user_name identify the caller, established by the edge function from the caller''s own JWT (tc.current_caller). p_expected_revision is the transaction''s revision as the edge function read it with the proposal it verified; a different current revision (a concurrent checkin-start resume) is refused with PT409 TransactionChanged. Locks the transaction and book rows, re-checks that the caller started the transaction, is still a member, still holds the book''s lock under the same checkout GUID (v1.9: the book''s checkout_guid_hash must equal the transaction''s), and that the book is still at the transaction''s base version. Single atomic DB transaction: version row, current-manifest replacement, book update, lock release (which clears the checkout GUID; keepCheckedOut keeps both), events, transaction close. Idempotent when re-called (even concurrently) on an already-finished transaction. Raises PT401/PT403/PT404/PT409(TransactionChanged, LockHeldByOther, CheckoutElsewhere, BaseVersionSuperseded, MissingOrBadUploads)/PT410(expired).';
 
 CREATE OR REPLACE FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text DEFAULT NULL::text) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
@@ -607,6 +615,20 @@ BEGIN
                 )
             )::text USING ERRCODE = 'PT409';
         END IF;
+
+        IF v_new_guid IS NOT NULL THEN
+            -- We just took a free lock: record the CheckOut event (type = 0) exactly as
+            -- checkout_book does, so other clients' get_changes/realtime pick up the new
+            -- lock state. (A new book gets no such event: it stays invisible until commit.)
+            INSERT INTO tc.events (
+                collection_id, book_id, type,
+                by_user_id, by_user_name, by_email, book_name
+            )
+            SELECT
+                v_book.collection_id, v_book.id, 0,
+                v_user_id, (auth.jwt() ->> 'name'), tc.current_user_email(),
+                v_book.name;
+        END IF;
     END IF;
 
     -- ---- Diff proposed manifest vs current --------------------------------
@@ -629,6 +651,10 @@ BEGIN
     -- p_base_version_id whenever the client sent one, having passed the check above):
     -- checkin_finish_tx refuses to commit if the book has moved on from it.
     IF FOUND THEN
+        -- Bumping revision tells a checkin-finish that read the old proposal (and verified
+        -- S3 against it) that it changed underneath it (TransactionChanged). status = 'open'
+        -- is re-checked here because a concurrent finish may have closed the row since the
+        -- SELECT above; then a fresh transaction is opened instead.
         UPDATE tc.checkin_transactions
         SET proposed_name = p_proposed_name,
             base_version_id = v_book.current_version_id,
@@ -637,10 +663,12 @@ BEGIN
             proposed_files = v_files,
             changed_paths = v_changed,
             checkout_guid_hash = v_book.checkout_guid_hash,
-            expires_at = now() + INTERVAL '48 hours'
-        WHERE id = v_existing_tx.id
+            expires_at = now() + INTERVAL '48 hours',
+            revision = revision + 1
+        WHERE id = v_existing_tx.id AND status = 'open'
         RETURNING id INTO v_tx_id;
-    ELSE
+    END IF;
+    IF v_tx_id IS NULL THEN
         INSERT INTO tc.checkin_transactions (
             collection_id, book_id, started_by, proposed_name, base_version_id,
             changed_paths, client_version, proposed_files, checksum, checkout_guid_hash
@@ -664,7 +692,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text) IS 'Internal to the checkin-start edge function. NFC-normalizes and validates the proposed manifest (PT400 InvalidManifest), then handles membership/lock/base-version/name checks (the existing-book path holds the book row FOR UPDATE), the new-book path, manifest diffing, and open-transaction resume. v1.9: a book already locked by the caller needs p_checkout_guid to match its checkout_guid_hash (else PT409 CheckoutElsewhere); taking a free lock or creating a new book issues a new checkout GUID, returned as checkoutGuid; resuming one''s own never-committed new book needs the GUID too (or gets a new one if the row has none). Records the book''s current version and checkout_guid_hash in the transaction for checkin_finish_tx to re-check. Raises PT400/PT401/PT403/PT404/PT409/PT426 per CONTRACTS.md checkin-start error list.';
+COMMENT ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text) IS 'Internal to the checkin-start edge function. NFC-normalizes and validates the proposed manifest (PT400 InvalidManifest), then handles membership/lock/base-version/name checks (the existing-book path holds the book row FOR UPDATE), the new-book path, manifest diffing, and open-transaction resume. v1.9: a book already locked by the caller needs p_checkout_guid to match its checkout_guid_hash (else PT409 CheckoutElsewhere); taking a free lock or creating a new book issues a new checkout GUID, returned as checkoutGuid; resuming one''s own never-committed new book needs the GUID too (or gets a new one if the row has none). Taking a free lock of an existing book emits a CheckOut event (type=0), as checkout_book does. Records the book''s current version and checkout_guid_hash in the transaction for checkin_finish_tx to re-check; resuming an open transaction bumps its revision (checkin_finish_tx then refuses a finish that verified the older proposal). Raises PT400/PT401/PT403/PT404/PT409/PT426 per CONTRACTS.md checkin-start error list.';
 
 CREATE OR REPLACE FUNCTION tc.checkout_book(p_book_id uuid, p_machine text) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
@@ -873,7 +901,7 @@ $$;
 
 COMMENT ON FUNCTION tc.claim_memberships() IS 'CONTRACTS.md: claim_memberships — fills user_id on rows matching the caller''s verified email. Requires tc.jwt_email_verified().';
 
-CREATE OR REPLACE FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) RETURNS jsonb
+CREATE OR REPLACE FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 -- Service-role only; p_user_id is the caller, as in checkin_finish_tx.
@@ -914,6 +942,11 @@ BEGIN
     -- the call, and the reaper marks the row later.)
     IF v_tx.status = 'expired' OR v_tx.expires_at < now() THEN
         RAISE EXCEPTION '%', '{"error":"TransactionExpired"}' USING ERRCODE = 'PT410';
+    END IF;
+    -- Same guard as checkin_finish_tx: p_captured was verified against the proposal read
+    -- at p_expected_revision, not one a concurrent collection-files-start resume wrote since.
+    IF v_tx.revision IS DISTINCT FROM p_expected_revision THEN
+        RAISE EXCEPTION '%', '{"error":"TransactionChanged"}' USING ERRCODE = 'PT409';
     END IF;
 
     SELECT * INTO v_group FROM tc.collection_file_groups
@@ -988,7 +1021,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) IS 'Internal to the collection-files-finish edge function; service-role only (trusts p_captured), with the caller passed as p_user_id/p_user_email/p_user_name as for checkin_finish_tx. Locks the transaction and group rows, so concurrent retries are idempotent. Re-checks the optimistic version at finish time too (repo-wins rule); PT409 VersionConflict leaves the transaction open: a stale retry still fails the same check, and the caller''s next collection-files-start resumes it with the new version.';
+COMMENT ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) IS 'Internal to the collection-files-finish edge function; service-role only (trusts p_captured), with the caller passed as p_user_id/p_user_email/p_user_name as for checkin_finish_tx. Locks the transaction and group rows, so concurrent retries are idempotent. Refuses with PT409 TransactionChanged when the transaction''s revision is no longer p_expected_revision (a concurrent collection-files-start resume rewrote the proposal the edge function verified). Re-checks the optimistic version at finish time too (repo-wins rule); PT409 VersionConflict leaves the transaction open: a stale retry still fails the same check, and the caller''s next collection-files-start resumes it with the new version.';
 
 CREATE OR REPLACE FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
@@ -1041,14 +1074,19 @@ BEGIN
       AND started_by = v_user_id AND status = 'open';
 
     IF FOUND THEN
+        -- As in checkin_start_tx: the revision bump makes a finish that verified the old
+        -- proposal refuse (TransactionChanged), and a row a concurrent finish closed since
+        -- the SELECT above is left alone in favor of a fresh transaction.
         UPDATE tc.collection_file_transactions
         SET expected_version = p_expected_version,
             proposed_files = v_files,
             changed_paths = v_changed,
-            expires_at = now() + INTERVAL '48 hours'
-        WHERE id = v_existing.id
+            expires_at = now() + INTERVAL '48 hours',
+            revision = revision + 1
+        WHERE id = v_existing.id AND status = 'open'
         RETURNING id INTO v_tx_id;
-    ELSE
+    END IF;
+    IF v_tx_id IS NULL THEN
         INSERT INTO tc.collection_file_transactions (
             collection_id, group_key, started_by, expected_version, proposed_files, changed_paths
         )
@@ -1062,7 +1100,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) IS 'Internal to the collection-files-start edge function. NFC-normalizes/validates the proposed manifest (PT400 InvalidManifest), then optimistic-version gate (PT409 VersionConflict) + manifest diff + transaction open/resume.';
+COMMENT ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) IS 'Internal to the collection-files-start edge function. NFC-normalizes/validates the proposed manifest (PT400 InvalidManifest), then optimistic-version gate (PT409 VersionConflict) + manifest diff + transaction open/resume (a resume bumps the transaction''s revision; see collection_files_finish_tx).';
 
 CREATE OR REPLACE FUNCTION tc.create_collection(p_id uuid, p_name text) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
@@ -2245,6 +2283,7 @@ CREATE TABLE IF NOT EXISTS tc.checkin_transactions (
     result_version_id uuid,
     result_seq bigint,
     checkout_guid_hash text,
+    revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT checkin_transactions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'finished'::text, 'aborted'::text, 'expired'::text])))
 );
 
@@ -2257,6 +2296,8 @@ COMMENT ON COLUMN tc.checkin_transactions.checksum IS 'SHA-256 checksum of the f
 COMMENT ON COLUMN tc.checkin_transactions.result_version_id IS 'Set on successful checkin-finish; makes a repeated checkin-finish call for an already-finished transaction idempotent (returns the same result).';
 
 COMMENT ON COLUMN tc.checkin_transactions.checkout_guid_hash IS 'The book''s checkout_guid_hash as checkin-start saw (or issued) it. checkin-finish refuses (CheckoutElsewhere) unless the book still has this hash, so a checkout that moved to another copy (takeover, force-unlock and re-checkout) in between cannot be committed over.';
+
+COMMENT ON COLUMN tc.checkin_transactions.revision IS 'Bumped every time checkin-start resumes (rewrites) this open transaction. checkin-finish reads it together with changed_paths/proposed_files, verifies those uploads against S3, and passes it to checkin_finish_tx, which refuses (PT409 TransactionChanged) if a concurrent resume changed the proposal in between, so version-ids verified against one proposal are never committed with another''s checksums.';
 
 CREATE TABLE IF NOT EXISTS tc.collection_file_groups (
     id bigint NOT NULL,
@@ -2293,11 +2334,14 @@ CREATE TABLE IF NOT EXISTS tc.collection_file_transactions (
     aborted_at timestamp with time zone,
     status text DEFAULT 'open'::text NOT NULL,
     result_version bigint,
+    revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT collection_file_transactions_group_key_check CHECK ((group_key = ANY (ARRAY['other'::text, 'allowed-words'::text, 'sample-texts'::text]))),
     CONSTRAINT collection_file_transactions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'finished'::text, 'aborted'::text, 'expired'::text])))
 );
 
 COMMENT ON TABLE tc.collection_file_transactions IS 'Open collection-files-start -> collection-files-finish two-phase commits. Mirrors tc.checkin_transactions but scoped to (collection_id, group_key) instead of a book.';
+
+COMMENT ON COLUMN tc.collection_file_transactions.revision IS 'Bumped every time collection-files-start resumes (rewrites) this open transaction; collection_files_finish_tx refuses (PT409 TransactionChanged) unless it still equals the revision collection-files-finish read with the proposal it verified against S3 (same role as tc.checkin_transactions.revision).';
 
 CREATE TABLE IF NOT EXISTS tc.collection_group_files (
     id bigint NOT NULL,
@@ -2691,8 +2735,8 @@ GRANT ALL ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) TO authenticate
 -- verify those uploads against S3 first and establish the caller from their own JWT, may
 -- call them (with the service-role key). Granted to authenticated they would let a member
 -- commit arbitrary, unverified version-ids straight to the shared manifest.
-REVOKE ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) TO service_role;
+REVOKE ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) TO service_role;
 
 GRANT ALL ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text) TO authenticated;
 
@@ -2703,8 +2747,8 @@ GRANT ALL ON FUNCTION tc.checkout_book_takeover(p_book_id uuid, p_checkout_guid 
 GRANT ALL ON FUNCTION tc.claim_memberships() TO authenticated;
 
 -- Service-role only, for the same reason as checkin_finish_tx above.
-REVOKE ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) TO service_role;
+REVOKE ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) TO service_role;
 
 GRANT ALL ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) TO authenticated;
 

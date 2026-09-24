@@ -14,7 +14,7 @@ import {
 import { jsonResponse } from "../_shared/tc/errors.ts";
 import { callTcRpc } from "../_shared/tc/rpc.ts";
 import { getScopedCredentials, S3_WRITE_ACTIONS } from "../_shared/tc/s3.ts";
-import { resolveBookPrefix } from "../_shared/tc/paths.ts";
+import { bookPrefix, resolveBookPrefix } from "../_shared/tc/paths.ts";
 
 interface CheckinStartResult {
     transactionId: string;
@@ -41,6 +41,28 @@ export const handler = async (
     // The book folder's .checkout GUID, if the client has one (CONTRACTS.md v1.9).
     const checkoutGuid = optionalField<string>(body, "checkoutGuid");
 
+    // Get the S3 credentials BEFORE calling checkin_start_tx. That RPC can commit a new
+    // checkout GUID (taking a free lock, or creating a new book) which only this response
+    // carries back to the client; if anything could still fail after it (the books read,
+    // STS), the GUID would be lost, and every retry from this copy would then be refused
+    // with CheckoutElsewhere. So everything that can fail happens first, and the response
+    // is built as soon as the RPC returns. If the RPC refuses, these credentials are
+    // simply discarded (never returned).
+    //
+    // Scope the credentials to the DB-canonical instance_id, never a caller-supplied one
+    // for an existing book: checkin_start_tx validates/locks an existing book by bookId and
+    // ignores the client's instance id, so using the client value would let a member
+    // request write credentials for an arbitrary book's prefix (Greptile P1, PR #8048).
+    // resolveBookPrefix reads the canonical value from the books row with the caller's own
+    // JWT (instance_id never changes, so reading it before the RPC is as good as after).
+    // For a new book (no bookId) the RPC creates, or resumes, only a row whose instance_id
+    // IS bookInstanceId (any other row with that instance id is a NameConflict), so the
+    // request's value is the canonical one.
+    const prefix = bookId
+        ? await resolveBookPrefix(req, collectionId, bookId)
+        : bookPrefix(collectionId, bookInstanceId);
+    const s3 = await getScopedCredentials(prefix, S3_WRITE_ACTIONS);
+
     const result = await callTcRpc<CheckinStartResult>(
         req,
         "checkin_start_tx",
@@ -56,16 +78,6 @@ export const handler = async (
             p_checkout_guid: checkoutGuid,
         },
     );
-
-    // Scope the S3 credentials to the DB-canonical instance_id, never the caller-supplied
-    // bookInstanceId: for an existing book checkin_start_tx validates/locks by bookId and
-    // ignores the client's instance id, so using the client value here would let a member
-    // request write credentials for an arbitrary book's prefix (Greptile P1, PR #8048).
-    // resolveBookPrefix reads the canonical value back from the books row (same pattern
-    // as checkin-finish); for the new-book path the row was just created from
-    // bookInstanceId, so the canonical value is identical.
-    const prefix = await resolveBookPrefix(req, collectionId, result.bookId);
-    const s3 = await getScopedCredentials(prefix, S3_WRITE_ACTIONS);
 
     return jsonResponse(200, {
         transactionId: result.transactionId,

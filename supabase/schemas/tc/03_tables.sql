@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS tc.checkin_transactions (
     result_version_id uuid,
     result_seq bigint,
     checkout_guid_hash text,
+    revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT checkin_transactions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'finished'::text, 'aborted'::text, 'expired'::text])))
 );
 
@@ -59,6 +60,8 @@ COMMENT ON COLUMN tc.checkin_transactions.checksum IS 'SHA-256 checksum of the f
 COMMENT ON COLUMN tc.checkin_transactions.result_version_id IS 'Set on successful checkin-finish; makes a repeated checkin-finish call for an already-finished transaction idempotent (returns the same result).';
 
 COMMENT ON COLUMN tc.checkin_transactions.checkout_guid_hash IS 'The book''s checkout_guid_hash as checkin-start saw (or issued) it. checkin-finish refuses (CheckoutElsewhere) unless the book still has this hash, so a checkout that moved to another copy (takeover, force-unlock and re-checkout) in between cannot be committed over.';
+
+COMMENT ON COLUMN tc.checkin_transactions.revision IS 'Bumped every time checkin-start resumes (rewrites) this open transaction. checkin-finish reads it together with changed_paths/proposed_files, verifies those uploads against S3, and passes it to checkin_finish_tx, which refuses (PT409 TransactionChanged) if a concurrent resume changed the proposal in between, so version-ids verified against one proposal are never committed with another''s checksums.';
 
 CREATE TABLE IF NOT EXISTS tc.collection_file_groups (
     id bigint NOT NULL,
@@ -95,11 +98,14 @@ CREATE TABLE IF NOT EXISTS tc.collection_file_transactions (
     aborted_at timestamp with time zone,
     status text DEFAULT 'open'::text NOT NULL,
     result_version bigint,
+    revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT collection_file_transactions_group_key_check CHECK ((group_key = ANY (ARRAY['other'::text, 'allowed-words'::text, 'sample-texts'::text]))),
     CONSTRAINT collection_file_transactions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'finished'::text, 'aborted'::text, 'expired'::text])))
 );
 
 COMMENT ON TABLE tc.collection_file_transactions IS 'Open collection-files-start -> collection-files-finish two-phase commits. Mirrors tc.checkin_transactions but scoped to (collection_id, group_key) instead of a book.';
+
+COMMENT ON COLUMN tc.collection_file_transactions.revision IS 'Bumped every time collection-files-start resumes (rewrites) this open transaction; collection_files_finish_tx refuses (PT409 TransactionChanged) unless it still equals the revision collection-files-finish read with the proposal it verified against S3 (same role as tc.checkin_transactions.revision).';
 
 CREATE TABLE IF NOT EXISTS tc.collection_group_files (
     id bigint NOT NULL,

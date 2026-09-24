@@ -12,6 +12,8 @@
 --   12-13. the checkout GUID (CONTRACTS.md v1.9) at start: required for one's own lock,
 --        issued when start takes a free lock or creates / resumes a new book
 --   14.  an admin force-unlocks without the GUID; the old holder's check-in is refused
+--   15-16. a start resume racing a finish is refused at finish (TransactionChanged)
+--   17.  start taking a free lock emits a CheckOut event
 --   (5 also covers the GUID at finish: it must not have changed since start, and
 --   keepCheckedOut keeps it.)
 -- (The edge functions call the finish RPCs with the service-role key; here the suite's
@@ -24,7 +26,7 @@
 
 BEGIN;
 
-SELECT plan(65);
+SELECT plan(77);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -61,6 +63,21 @@ AS $$
     SELECT encode(sha256(convert_to(lower(p_guid), 'UTF8')), 'hex')
 $$;
 
+-- A transaction's current revision, as the finish edge functions read it (with the proposal
+-- they verify) and pass it to the finish RPCs as p_expected_revision.
+CREATE OR REPLACE FUNCTION tests.rev(p_tx text)
+RETURNS bigint
+LANGUAGE sql
+AS $$
+    SELECT revision FROM tc.checkin_transactions WHERE id = p_tx::uuid
+$$;
+CREATE OR REPLACE FUNCTION tests.cfrev(p_tx text)
+RETURNS bigint
+LANGUAGE sql
+AS $$
+    SELECT revision FROM tc.collection_file_transactions WHERE id = p_tx::uuid
+$$;
+
 -- Composed vs decomposed spellings of "café.htm" (é = U+00E9, or e + U+0301).
 SELECT set_config('tests.nfc', U&'caf\00E9.htm', true);
 SELECT set_config('tests.nfd', U&'cafe\0301.htm', true);
@@ -71,23 +88,23 @@ SELECT set_config('tests.nfd', U&'cafe\0301.htm', true);
 -- =============================================================================
 
 SELECT ok(
-    NOT has_function_privilege('authenticated', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb)', 'EXECUTE'),
+    NOT has_function_privilege('authenticated', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb, bigint)', 'EXECUTE'),
     '1a: authenticated cannot execute checkin_finish_tx'
 );
 SELECT ok(
-    NOT has_function_privilege('anon', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb)', 'EXECUTE'),
+    NOT has_function_privilege('anon', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb, bigint)', 'EXECUTE'),
     '1b: anon cannot execute checkin_finish_tx'
 );
 SELECT ok(
-    has_function_privilege('service_role', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb)', 'EXECUTE'),
+    has_function_privilege('service_role', 'tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb, bigint)', 'EXECUTE'),
     '1c: service_role can execute checkin_finish_tx'
 );
 SELECT ok(
-    NOT has_function_privilege('authenticated', 'tc.collection_files_finish_tx(uuid, text, text, text, jsonb)', 'EXECUTE'),
+    NOT has_function_privilege('authenticated', 'tc.collection_files_finish_tx(uuid, text, text, text, jsonb, bigint)', 'EXECUTE'),
     '1d: authenticated cannot execute collection_files_finish_tx'
 );
 SELECT ok(
-    has_function_privilege('service_role', 'tc.collection_files_finish_tx(uuid, text, text, text, jsonb)', 'EXECUTE'),
+    has_function_privilege('service_role', 'tc.collection_files_finish_tx(uuid, text, text, text, jsonb, bigint)', 'EXECUTE'),
     '1e: service_role can execute collection_files_finish_tx'
 );
 SELECT ok(
@@ -99,13 +116,13 @@ SELECT ok(
 SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
 SET LOCAL ROLE authenticated;
 SELECT throws_ok(
-    $$SELECT tc.checkin_finish_tx('00000000-0000-0000-0000-000000000000', 'user-alice-cif', NULL, NULL, NULL, false, '[]')$$,
+    $$SELECT tc.checkin_finish_tx('00000000-0000-0000-0000-000000000000', 'user-alice-cif', NULL, NULL, NULL, false, '[]', 1)$$,
     '42501',
     NULL,
     '1g: a member calling checkin_finish_tx directly gets permission denied'
 );
 SELECT throws_ok(
-    $$SELECT tc.collection_files_finish_tx('00000000-0000-0000-0000-000000000000', 'user-alice-cif', NULL, NULL, '[]')$$,
+    $$SELECT tc.collection_files_finish_tx('00000000-0000-0000-0000-000000000000', 'user-alice-cif', NULL, NULL, '[]', 1)$$,
     '42501',
     NULL,
     '1h: a member calling collection_files_finish_tx directly gets permission denied'
@@ -192,7 +209,7 @@ SELECT set_config('tests.fin1', tc.checkin_finish_tx(
     jsonb_build_array(
         jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-1'),
         jsonb_build_object('path', 'images/a.png', 's3VersionId', 'sv-a-1')
-    ))::text, true);
+    ), tests.rev(current_setting('tests.tx1')))::text, true);
 
 SELECT is(
     (SELECT s3_version_id FROM tc.version_files
@@ -212,12 +229,12 @@ SELECT ok(
     '4c: Created + CheckIn events carry the identity passed in (not the service role''s)'
 );
 SELECT is(
-    tc.checkin_finish_tx(current_setting('tests.tx1')::uuid, 'user-alice-cif', 'alice-cif@example.com', 'Alice', 'first', false, '[]') ->> 'versionId',
+    tc.checkin_finish_tx(current_setting('tests.tx1')::uuid, 'user-alice-cif', 'alice-cif@example.com', 'Alice', 'first', false, '[]', tests.rev(current_setting('tests.tx1'))) ->> 'versionId',
     current_setting('tests.fin1')::jsonb ->> 'versionId',
     '4d: re-calling finish on a finished transaction returns the same version (idempotent)'
 );
 SELECT throws_ok(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-bob-cif', NULL, NULL, NULL, false, '[]')$$, current_setting('tests.tx1')),
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-bob-cif', NULL, NULL, NULL, false, '[]', tests.rev(%1$L))$$, current_setting('tests.tx1')),
     'PT403',
     NULL,
     '4e: finish refuses a user who did not start the transaction'
@@ -257,7 +274,8 @@ SELECT set_config('tests.tx3', tc.checkin_start_tx(
         jsonb_build_object('path', 'images/a.png', 'sha256', 'sha-a', 'size', 20)
     ), current_setting('tests.b5')) ->> 'transactionId', true);
 SELECT tc.checkin_finish_tx(current_setting('tests.tx3')::uuid, 'user-bob-cif', 'bob-cif@example.com', 'Bob', 'bob', true,
-    jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-bob')));
+    jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-bob')),
+    tests.rev(current_setting('tests.tx3')));
 
 SELECT ok(
     (SELECT current_version_seq = 2 AND locked_by = 'user-bob-cif' FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
@@ -270,7 +288,7 @@ SELECT is(
 );
 
 SELECT throws_like(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, %L)$$,
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-alice-cif', NULL, NULL, 'stale', false, %2$L, tests.rev(%1$L))$$,
         current_setting('tests.tx2'),
         jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-alice'))::text),
     '%LockHeldByOther%',
@@ -289,7 +307,7 @@ SELECT set_config('tests.a5b',
     tc.checkout_book(current_setting('tests.book1')::uuid, 'AliceMachine') ->> 'checkoutGuid', true);
 
 SELECT throws_like(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, %L)$$,
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-alice-cif', NULL, NULL, 'stale', false, %2$L, tests.rev(%1$L))$$,
         current_setting('tests.tx2'),
         jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-alice'))::text),
     '%CheckoutElsewhere%',
@@ -303,7 +321,7 @@ SET checkout_guid_hash = tests.guid_hash(current_setting('tests.a5b'))
 WHERE id = current_setting('tests.tx2')::uuid;
 
 SELECT throws_like(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, %L)$$,
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-alice-cif', NULL, NULL, 'stale', false, %2$L, tests.rev(%1$L))$$,
         current_setting('tests.tx2'),
         jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cafe-alice'))::text),
     '%BaseVersionSuperseded%',
@@ -318,7 +336,7 @@ SELECT is(
 
 SELECT tc.unlock_book(current_setting('tests.book1')::uuid, current_setting('tests.a5b'));
 SELECT throws_like(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'stale', false, '[]')$$,
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-alice-cif', NULL, NULL, 'stale', false, '[]', tests.rev(%1$L))$$,
         current_setting('tests.tx2')),
     '%LockHeldByOther%',
     '5g: a finish by someone who no longer holds the lock is refused even when the lock is free'
@@ -399,7 +417,8 @@ SELECT ok(
 );
 SELECT is(
     tc.collection_files_finish_tx(current_setting('tests.cftx')::uuid, 'user-alice-cif', 'alice-cif@example.com', 'Alice',
-        jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cf-1'))) ->> 'version',
+        jsonb_build_array(jsonb_build_object('path', current_setting('tests.nfc'), 's3VersionId', 'sv-cf-1')),
+        tests.cfrev(current_setting('tests.cftx'))) ->> 'version',
     '1',
     '8b: finish bumps the group to version 1'
 );
@@ -412,12 +431,12 @@ SELECT is(
     '8c: the collection file is committed under the NFC key'
 );
 SELECT is(
-    tc.collection_files_finish_tx(current_setting('tests.cftx')::uuid, 'user-alice-cif', 'alice-cif@example.com', 'Alice', '[]') ->> 'version',
+    tc.collection_files_finish_tx(current_setting('tests.cftx')::uuid, 'user-alice-cif', 'alice-cif@example.com', 'Alice', '[]', tests.cfrev(current_setting('tests.cftx'))) ->> 'version',
     '1',
     '8d: re-calling finish returns the same version (idempotent)'
 );
 SELECT throws_ok(
-    format($$SELECT tc.collection_files_finish_tx(%L, 'user-bob-cif', NULL, NULL, '[]')$$, current_setting('tests.cftx')),
+    format($$SELECT tc.collection_files_finish_tx(%1$L, 'user-bob-cif', NULL, NULL, '[]', tests.cfrev(%1$L))$$, current_setting('tests.cftx')),
     'PT403',
     NULL,
     '8e: collection-files finish refuses a user who did not start the transaction'
@@ -434,17 +453,17 @@ SELECT ok(
     '9a: checkin_start_tx locks an existing book''s row before checking/taking the lock'
 );
 SELECT ok(
-    pg_get_functiondef('tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb)'::regprocedure)
+    pg_get_functiondef('tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb, bigint)'::regprocedure)
         LIKE '%FROM tc.checkin_transactions WHERE id = p_transaction_id FOR UPDATE%',
     '9b: checkin_finish_tx locks its transaction row (concurrent retries are idempotent)'
 );
 SELECT ok(
-    pg_get_functiondef('tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb)'::regprocedure)
+    pg_get_functiondef('tc.checkin_finish_tx(uuid, text, text, text, text, boolean, jsonb, bigint)'::regprocedure)
         LIKE '%FROM tc.books WHERE id = v_tx.book_id FOR UPDATE%',
     '9c: checkin_finish_tx locks the book row while re-checking lock and base version'
 );
 SELECT ok(
-    pg_get_functiondef('tc.collection_files_finish_tx(uuid, text, text, text, jsonb)'::regprocedure)
+    pg_get_functiondef('tc.collection_files_finish_tx(uuid, text, text, text, jsonb, bigint)'::regprocedure)
         LIKE '%FROM tc.collection_file_transactions WHERE id = p_transaction_id FOR UPDATE%',
     '9d: collection_files_finish_tx locks its transaction row'
 );
@@ -631,11 +650,126 @@ SELECT ok(
     '14b: force_unlock clears the lock and the checkout GUID hash'
 );
 SELECT throws_like(
-    format($$SELECT tc.checkin_finish_tx(%L, 'user-bob-cif', NULL, NULL, 'stale', false, %L)$$,
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-bob-cif', NULL, NULL, 'stale', false, %2$L, tests.rev(%1$L))$$,
         current_setting('tests.tx14'),
         jsonb_build_array(jsonb_build_object('path', 'two.htm', 's3VersionId', 'sv-two'))::text),
     '%LockHeldByOther%',
     '14c: the old holder''s check-in under the now-stale GUID is refused'
 );
-SELECT * FROM finish();
-ROLLBACK;
+-- =============================================================================
+-- 15. A checkin-start resume between the finish edge function's read of the transaction
+--     and the finish RPC: the finish is refused (TransactionChanged), since the uploads
+--     it verified belong to the older proposal.
+-- =============================================================================
+
+SELECT set_config('tests.tx15', current_setting('tests.s12e')::jsonb ->> 'transactionId', true);
+-- What checkin-finish read (with the proposal it went on to verify against S3).
+SELECT set_config('tests.rev15', tests.rev(current_setting('tests.tx15'))::text, true);
+SELECT set_config('tests.s15', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', current_setting('tests.book1')::uuid, 'd0000000-0000-0000-0000-00000000c401',
+    'Book One Renamed', NULL, 'cs-15', '6.5.0',
+    jsonb_build_array(jsonb_build_object('path', 'fifteen.htm', 'sha256', 'sha-15-new', 'size', 15)),
+    current_setting('tests.s12e')::jsonb ->> 'checkoutGuid')::text, true);
+
+SELECT ok(
+    (current_setting('tests.s15')::jsonb ->> 'transactionId') = current_setting('tests.tx15')
+    AND tests.rev(current_setting('tests.tx15')) = current_setting('tests.rev15')::bigint + 1,
+    '15a: sanity: the concurrent start resumed the same transaction and bumped its revision'
+);
+SELECT throws_like(
+    format($$SELECT tc.checkin_finish_tx(%L, 'user-alice-cif', NULL, NULL, 'raced', false, %L, %s)$$,
+        current_setting('tests.tx15'),
+        jsonb_build_array(jsonb_build_object('path', 'fifteen.htm', 's3VersionId', 'sv-15-old'))::text,
+        current_setting('tests.rev15')),
+    '%TransactionChanged%',
+    '15b: a finish carrying the revision it verified before the resume is refused (TransactionChanged)'
+);
+SELECT ok(
+    (SELECT status = 'open' FROM tc.checkin_transactions WHERE id = current_setting('tests.tx15')::uuid)
+    AND (SELECT current_version_seq = 2 AND locked_by = 'user-alice-cif'
+           FROM tc.books WHERE id = current_setting('tests.book1')::uuid),
+    '15c: the refused finish commits nothing and leaves the transaction open'
+);
+SELECT is(
+    tc.checkin_finish_tx(current_setting('tests.tx15')::uuid, 'user-alice-cif', NULL, NULL, 'retried', false,
+        jsonb_build_array(jsonb_build_object('path', 'fifteen.htm', 's3VersionId', 'sv-15-new')),
+        tests.rev(current_setting('tests.tx15'))) ->> 'seq',
+    '3',
+    '15d: a finish that verified the current revision commits'
+);
+
+-- =============================================================================
+-- 16. The same race for collection files.
+-- =============================================================================
+
+SELECT set_config('tests.cf16', tc.collection_files_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', 'sample-texts', 0,
+    jsonb_build_array(jsonb_build_object('path', 's.txt', 'sha256', 'sha-s-old', 'size', 1))
+    ) ->> 'transactionId', true);
+SELECT is(tests.cfrev(current_setting('tests.cf16')), 1::bigint,
+    '16a: a new collection-files transaction starts at revision 1');
+SELECT is(
+    tc.collection_files_start_tx(
+        'c0000000-0000-0000-0000-00000000c401', 'sample-texts', 0,
+        jsonb_build_array(jsonb_build_object('path', 's.txt', 'sha256', 'sha-s-new', 'size', 2))
+    ) ->> 'transactionId',
+    current_setting('tests.cf16'),
+    '16b: sanity: a second start resumes the same transaction'
+);
+SELECT throws_like(
+    format($$SELECT tc.collection_files_finish_tx(%L, 'user-alice-cif', NULL, NULL, %L, 1)$$,
+        current_setting('tests.cf16'),
+        jsonb_build_array(jsonb_build_object('path', 's.txt', 's3VersionId', 'sv-s-old'))::text),
+    '%TransactionChanged%',
+    '16c: a collection-files finish carrying the pre-resume revision is refused (TransactionChanged)'
+);
+SELECT is(
+    tc.collection_files_finish_tx(current_setting('tests.cf16')::uuid, 'user-alice-cif', NULL, NULL,
+        jsonb_build_array(jsonb_build_object('path', 's.txt', 's3VersionId', 'sv-s-new')),
+        tests.cfrev(current_setting('tests.cf16'))) ->> 'version',
+    '1',
+    '16d: with the current revision (2) the collection-files finish commits'
+);
+
+-- =============================================================================
+-- 17. checkin-start taking a free lock records a CheckOut event, like checkout_book, so
+--     other clients polling get_changes see the new lock.
+-- =============================================================================
+
+SELECT ok(
+    (SELECT locked_by IS NULL FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000c402'),
+    '17-sanity: book two is free (force-unlocked in section 14)'
+);
+SELECT set_config('tests.ev17', (SELECT COALESCE(max(id), 0) FROM tc.events)::text, true);
+SELECT set_config('tests.s17', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', 'b0000000-0000-0000-0000-00000000c402', 'd0000000-0000-0000-0000-00000000c402',
+    'Book Two', NULL, 'cs-17', '6.5.0', '[]')::text, true);
+
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.events
+      WHERE id > current_setting('tests.ev17')::bigint
+        AND collection_id = 'c0000000-0000-0000-0000-00000000c401'
+        AND book_id = 'b0000000-0000-0000-0000-00000000c402'
+        AND type = 0 AND by_user_id = 'user-alice-cif' AND by_email = 'alice-cif@example.com'
+        AND by_user_name = 'Alice' AND book_name = 'Book Two')
+    AND (SELECT count(*) = 1 FROM tc.events WHERE id > current_setting('tests.ev17')::bigint),
+    '17a: taking the free lock emitted exactly one CheckOut event, with the caller''s identity'
+);
+SELECT ok(
+    (SELECT (c -> 'events') @> '[{"type": 0, "book_id": "b0000000-0000-0000-0000-00000000c402"}]'::jsonb
+            AND (c -> 'books') @> jsonb_build_array(jsonb_build_object(
+                'id', 'b0000000-0000-0000-0000-00000000c402',
+                'locked_by', 'user-alice-cif',
+                'checkoutGuidHash', tests.guid_hash(current_setting('tests.s17')::jsonb ->> 'checkoutGuid')))
+       FROM (SELECT tc.get_changes('c0000000-0000-0000-0000-00000000c401',
+                                   current_setting('tests.ev17')::bigint) AS c) s),
+    '17b: get_changes reports the event and the book''s new lock'
+);
+SELECT tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', 'b0000000-0000-0000-0000-00000000c402', 'd0000000-0000-0000-0000-00000000c402',
+    'Book Two', NULL, 'cs-17', '6.5.0', '[]', current_setting('tests.s17')::jsonb ->> 'checkoutGuid');
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.events WHERE id > current_setting('tests.ev17')::bigint),
+    '17c: starting again under one''s own lock records no further CheckOut event'
+);
+SELECT * FROM finish();ROLLBACK;

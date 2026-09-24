@@ -83,8 +83,8 @@ GRANT ALL ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) TO authenticate
 -- verify those uploads against S3 first and establish the caller from their own JWT, may
 -- call them (with the service-role key). Granted to authenticated they would let a member
 -- commit arbitrary, unverified version-ids straight to the shared manifest.
-REVOKE ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb) TO service_role;
+REVOKE ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) TO service_role;
 
 GRANT ALL ON FUNCTION tc.checkin_start_tx(p_collection_id uuid, p_book_id uuid, p_book_instance_id uuid, p_proposed_name text, p_base_version_id uuid, p_checksum text, p_client_version text, p_files jsonb, p_checkout_guid text) TO authenticated;
 
@@ -95,8 +95,8 @@ GRANT ALL ON FUNCTION tc.checkout_book_takeover(p_book_id uuid, p_checkout_guid 
 GRANT ALL ON FUNCTION tc.claim_memberships() TO authenticated;
 
 -- Service-role only, for the same reason as checkin_finish_tx above.
-REVOKE ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb) TO service_role;
+REVOKE ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_captured jsonb, p_expected_revision bigint) TO service_role;
 
 GRANT ALL ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) TO authenticated;
 

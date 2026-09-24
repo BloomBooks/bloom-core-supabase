@@ -131,6 +131,7 @@ erDiagram
         uuid result_version_id "soft FK; set on finish"
         bigint result_seq
         text checkout_guid_hash "v1.9; book's checkout at start; finish re-checks it"
+        bigint revision "bumped by each start resume; finish passes the one it verified"
         text status "open | finished | aborted | expired"
         timestamptz expires_at
     }
@@ -144,6 +145,7 @@ erDiagram
         text changed_paths "text[]"
         text status "open | finished | aborted | expired"
         bigint result_version
+        bigint revision "bumped by each start resume; finish passes the one it verified"
     }
 ```
 

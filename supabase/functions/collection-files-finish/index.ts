@@ -1,6 +1,7 @@
 // POST /functions/v1/collection-files-finish — CONTRACTS.md §collection-files-start/finish
 // Req: { transactionId } -> bumps the group version atomically.
 // 409 VersionConflict ⇒ client pulls first (repo-wins rule); 409 MissingOrBadUploads.
+// 409 TransactionChanged: a concurrent collection-files-start resume rewrote the transaction.
 import { requireField, serveJsonPost } from "../_shared/tc/handler.ts";
 import { HttpError, jsonResponse } from "../_shared/tc/errors.ts";
 import {
@@ -22,6 +23,7 @@ interface CollectionFileTransactionRow {
     group_key: string;
     changed_paths: string[];
     proposed_files: { path: string; sha256: string; size: number }[];
+    revision: number;
 }
 
 interface CollectionFilesFinishResult {
@@ -43,7 +45,7 @@ export const handler = async (
     const tx = await selectTcRow<CollectionFileTransactionRow>(
         req,
         "collection_file_transactions",
-        `id=eq.${transactionId}&select=id,collection_id,group_key,changed_paths,proposed_files`,
+        `id=eq.${transactionId}&select=id,collection_id,group_key,changed_paths,proposed_files,revision`,
     );
     if (!tx) {
         throw new HttpError(404, { error: "transaction_not_found" });
@@ -71,6 +73,9 @@ export const handler = async (
             p_user_email: caller.email,
             p_user_name: caller.name,
             p_captured: captured,
+            // See checkin-finish: refused (409 TransactionChanged) if a resume changed the
+            // proposal we just verified.
+            p_expected_revision: tx.revision,
         },
     );
 

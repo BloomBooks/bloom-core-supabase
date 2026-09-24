@@ -30,6 +30,7 @@ const TX_ROW = {
             size: 0,
         },
     ],
+    revision: 2,
 };
 
 Deno.test(
@@ -82,6 +83,17 @@ Deno.test(
         assertEquals(finishCall.apikey, TEST_SERVICE_ROLE_KEY);
         assertEquals(finishCall.authorization, `Bearer ${TEST_SERVICE_ROLE_KEY}`);
         assertEquals(finishCall.body?.p_user_id, TEST_CALLER.userId);
+        // The revision read with the verified proposal is passed on (see checkin-finish).
+        const txRead = calls.find((c) => c.url.includes("collection_file_transactions"));
+        if (!txRead) {
+            throw new Error("the transaction row was never read");
+        }
+        assertEquals(
+            new URL(txRead.url).searchParams.get("select")?.split(",").includes("revision"),
+            true,
+            "the transaction read must fetch the revision with the proposal",
+        );
+        assertEquals(finishCall.body?.p_expected_revision, 2);
 
         const headCalls = s3Mock.commandCalls(HeadObjectCommand);
         assertEquals(headCalls.length, 1);
