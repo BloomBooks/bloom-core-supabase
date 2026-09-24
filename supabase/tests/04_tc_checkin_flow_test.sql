@@ -26,7 +26,7 @@
 
 BEGIN;
 
-SELECT plan(78);
+SELECT plan(79);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -784,5 +784,17 @@ SELECT throws_like(
         'Book One', NULL, 'cs-x', '6.5.0', '[]')$$, current_setting('tests.book1')),
     '%book_not_found%',
     '18a: check-in start refuses a deleted book instead of taking its lock'
+);
+-- ...and a book deleted after its check-in started can't be finished either.
+SELECT set_config('tests.tx18', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c418',
+    'Book Eighteen', NULL, 'cs-18', '6.5.0', '[]') ->> 'transactionId', true);
+UPDATE tc.books SET deleted_at = now()
+WHERE instance_id = 'd0000000-0000-0000-0000-00000000c418';
+SELECT throws_like(
+    format($$SELECT tc.checkin_finish_tx(%1$L, 'user-alice-cif', 'alice-cif@example.com', 'Alice', 'eighteen', false, '[]', tests.rev(%1$L))$$,
+        current_setting('tests.tx18')),
+    '%book_not_found%',
+    '18b: finish refuses a book deleted after start (no invisible version)'
 );
 SELECT * FROM finish();ROLLBACK;
