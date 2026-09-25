@@ -198,7 +198,8 @@ CREATE TABLE IF NOT EXISTS tc.members (
     added_by text NOT NULL,
     added_at timestamp with time zone DEFAULT now() NOT NULL,
     claimed_at timestamp with time zone,
-    display_name text
+    display_name text,
+    last_seen_at timestamp with time zone
 );
 
 COMMENT ON TABLE tc.members IS 'Approved-accounts table. Unclaimed rows (user_id IS NULL) are pending until the account holder signs in and calls claim_memberships(). email is stored lowercase + NFC-normalised.';
@@ -206,6 +207,8 @@ COMMENT ON TABLE tc.members IS 'Approved-accounts table. Unclaimed rows (user_id
 COMMENT ON COLUMN tc.members.user_id IS 'NULL until the account holder claims the seat. TEXT covers both Firebase UIDs and local-GoTrue UUIDs.';
 
 COMMENT ON COLUMN tc.members.display_name IS 'Human-readable name shown in place of the email wherever the member is displayed (checkout status, history, sharing panel). NULL = none set; display falls back to email. Set via tc.members_set_display_name (admin, or the claimed member themselves).';
+
+COMMENT ON COLUMN tc.members.last_seen_at IS 'v1.11: the last time this member had THIS collection open in Bloom (per membership, so work in another collection does not count), to 10-minute granularity. Set by tc._touch_member, which get_collection_state (opening or re-syncing the collection) and get_changes (the 60-second poll and reconnect catch-up) call; written at most once per 10 minutes per member. NULL = never seen (invited only). Returned by members_list for the Share dialog''s "Last seen".';
 
 ALTER TABLE tc.members ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME tc.members_id_seq

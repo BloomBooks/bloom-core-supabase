@@ -7,7 +7,18 @@
 > design notes live.
 
 Changes to this file require an orchestrator commit and a version-note bump here.
-**Contract version: 1.10** (24 Sep 2026, BL-16531 — BREAKING for the client: the **client makes
+**Contract version: 1.11** (25 Sep 2026, BL-16673 — additive, non-breaking: per-collection **last
+seen**, for the Share dialog's "Last seen <when>" (else "Invited <when>"). `tc.members` gains
+`last_seen_at` (NULL = never seen, i.e. invited only), and `members_list` rows carry it. It is per
+membership, not per account: it records when that person last had THIS collection open. "Seen"
+means the member's Bloom called `get_collection_state` (opening or re-syncing the collection) or
+`get_changes` (the 60 s poll and reconnect catch-up); each such call sets the caller's own row to
+now() unless it is already less than 10 minutes old, so the value has 10-minute granularity and a
+polling client writes the row about once per 10 minutes. Consequently `get_collection_state` and
+`get_changes` now write (they are VOLATILE, no longer STABLE; clients already call every RPC by
+POST, and a GET of either would now fail). The touch emits no event and no realtime broadcast;
+checkout, check-in and unlock do not touch it, because a member doing those is polling anyway.
+Nothing the client sends changes. v1.10, 24 Sep 2026, BL-16531 — BREAKING for the client: the **client makes
 the checkout GUID**, and check-in never issues one. A database change can commit and its response
 still be lost; with a server-made GUID that stranded the book (checked out, but no copy had the
 GUID to check in or unlock with). Now the client writes a new GUID to `.checkout` first, then
@@ -212,8 +223,8 @@ with `p_`, and PostgREST matches JSON keys to parameter names — so clients sen
 | `create_collection(id uuid, name text)` | creates collection + caller as sole claimed admin |
 | `my_collections()` | collections where caller's email is approved (claimed or not) |
 | `claim_memberships()` | fills user_id on rows matching caller's verified email |
-| `get_collection_state(collection_id, since_event_id?)` | full/delta snapshot: book rows (locks, current version seq + checksum), collection-file group versions, `max_event_id`. v1.9: book rows carry `checkoutGuidHash` (see "Checkout GUID" below; NULL when unlocked) |
-| `get_changes(collection_id, since_event_id)` | events + touched book rows (polling/catch-up). v1.9: book rows carry `checkoutGuidHash` |
+| `get_collection_state(collection_id, since_event_id?)` | full/delta snapshot: book rows (locks, current version seq + checksum), collection-file group versions, `max_event_id`. v1.9: book rows carry `checkoutGuidHash` (see "Checkout GUID" below; NULL when unlocked). v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST |
+| `get_changes(collection_id, since_event_id)` | events + touched book rows (polling/catch-up). v1.9: book rows carry `checkoutGuidHash`. v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST |
 | `get_book_manifest(book_id)` | v1.2: per-file current manifest `{bookId, versionId, seq, checksum, files:[{path, sha256, size, s3VersionId}]}` for pinned-version Receive; never-committed books invisible except to their mid-Send lock holder |
 | `get_collection_file_manifest(collection_id, group_key)` | v1.7: per-file current manifest `{groupKey, version, files:[{path, sha256, size, s3VersionId}]}` for one collection-file group, so the download path fetches only changed files pinned to their committed `s3_version_id` (E9); a never-written group returns `version 0` / empty `files`. Mirrors `get_book_manifest`. |
 | `checkout_book(book_id, machine text, checkout_guid text)` | conditional lock of a FREE book; returns resulting status (winner's identity on failure). v1.10: `checkout_guid` is made by the client and saved in `.checkout` before the call (see "Checkout GUID" below); NULL or blank raises SQLSTATE 22023 `invalid_checkout_guid`. On success returns `{success: true, locked_by, locked_by_machine, locked_at}` (no GUID). A retry by the caller with the SAME GUID after it succeeded returns the same success, changing nothing and emitting no second event. A book the caller holds under a different GUID (another copy), or under a send-only check-in lock, returns `{success: false, locked_by_me: true, locked_by, locked_by_machine, locked_at}` and changes nothing, because replacing the GUID would orphan the copy holding the current one. Locked by someone else (or deleted): `{success: false, locked_by, locked_by_machine, locked_at}`. `machine` is for display only. |
@@ -223,7 +234,7 @@ with `p_`, and PostgREST matches JSON keys to parameter names — so clients sen
 | `delete_book(book_id, checkout_guid text)` | requires caller holds the lock and (v1.9) presents its checkout GUID (else `CheckoutElsewhere: ...`, SQLSTATE P0001); sets `deleted_at`; emits Deleted |
 | `undelete_book(book_id)` | admin; clears tombstone (name-uniqueness enforced) |
 | `rename_check(book_id, new_name)` | advisory uniqueness pre-check |
-| `members: list/add/remove/set_role` | admin-only approved-accounts management; remove force-unlocks that user's checkouts (evented); last-admin guard. v1.6: list rows carry `display_name` |
+| `members: list/add/remove/set_role` | admin-only approved-accounts management; remove force-unlocks that user's checkouts (evented); last-admin guard. v1.6: list rows carry `display_name`. v1.11: list rows carry `last_seen_at` (ISO timestamp, or NULL if the member has never had the collection open; 10-minute granularity) |
 | `members_set_display_name(collection_id, member_id bigint, display_name text)` | v1.6: sets the durable human-readable name shown in place of the email (member list, checkout status, history). Admin may set anyone's; a claimed member may set their own; blank/whitespace clears to NULL (display falls back to email); max 100 chars |
 | `add_palette_colors(collection_id, palette, colors[])` | union merge |
 | `log_event(...)` | client-originated history entries |

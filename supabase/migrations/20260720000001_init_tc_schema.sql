@@ -192,6 +192,24 @@ $$;
 
 COMMENT ON FUNCTION tc._normalize_proposed_files(p_files jsonb) IS 'Internal: validates a proposed manifest [{path, sha256, size}] and returns it with every path NFC-normalized (order kept). Raises PT400 InvalidManifest for a non-array, an entry lacking a relative path (empty, leading "/", or an empty/"."/".." segment), sha256 or non-negative size, or two entries whose paths are equal after normalization. Used by both start RPCs so the diff, the stored transaction, changedPaths and the committed manifest agree on each path''s spelling.';
 
+CREATE OR REPLACE FUNCTION tc._touch_member(p_collection_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- The caller's row is keyed the way tc.is_member keys it: (collection_id, user_id =
+    -- JWT sub), unique by members_claimed_user_uq. The 10-minute throttle keeps a
+    -- 60-second poller to about one row write per member per 10 minutes; any other call
+    -- is an index lookup that writes nothing.
+    UPDATE tc.members
+    SET    last_seen_at = now()
+    WHERE  collection_id = p_collection_id
+      AND  user_id       = tc.current_user_id()
+      AND  (last_seen_at IS NULL OR last_seen_at < now() - interval '10 minutes');
+END;
+$$;
+
+COMMENT ON FUNCTION tc._touch_member(p_collection_id uuid) IS 'Internal (v1.11): records that the caller had the collection open, setting their own tc.members.last_seen_at in that collection to now() unless it is already less than 10 minutes old. Called by get_collection_state and get_changes after their membership check. Touches only that one row: emits no tc.events and no realtime broadcast (the only trigger on tc.members, the last-admin guard, returns at once for an update that leaves role alone). Not callable by clients.';
+
 CREATE OR REPLACE FUNCTION tc.add_palette_colors(p_collection_id uuid, p_palette text, p_colors text[]) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
@@ -1446,7 +1464,7 @@ $$;
 COMMENT ON FUNCTION tc.get_book_manifest(p_book_id uuid) IS 'CONTRACTS.md v1.2: get_book_manifest — per-file current manifest for one book (path, sha256, size, s3VersionId), used by Receive to download pinned versions. Enforces the never-committed-book invisibility rule. v1.2 (20260707000006): also reports lockedBy/lockedByEmail/lockedByName so Receive can show "still checked out to X" without a second round trip.';
 
 CREATE OR REPLACE FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) RETURNS jsonb
-    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 DECLARE
     v_events jsonb;
@@ -1455,6 +1473,9 @@ BEGIN
     IF NOT tc.is_member(p_collection_id) THEN
         RAISE EXCEPTION 'not_a_member' USING ERRCODE = '42501';
     END IF;
+
+    -- The caller is polling this collection, so they have it open (v1.11).
+    PERFORM tc._touch_member(p_collection_id);
 
     -- Events since cursor
     SELECT jsonb_agg(row_to_json(e)::jsonb ORDER BY e.id)
@@ -1522,7 +1543,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash).';
+COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash). v1.11: VOLATILE, because it records that the caller has the collection open (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes).';
 
 CREATE OR REPLACE FUNCTION tc.get_collection_file_manifest(p_collection_id uuid, p_group_key text) RETURNS jsonb
     LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -1575,7 +1596,7 @@ $$;
 COMMENT ON FUNCTION tc.get_collection_file_manifest(p_collection_id uuid, p_group_key text) IS 'E9: per-file current manifest for one collection-file group (path, sha256, size, s3VersionId) from tc.collection_group_files, used by the download path to fetch only changed files pinned to their committed s3_version_id. Mirrors get_book_manifest; a never-written group returns version 0 / empty files.';
 
 CREATE OR REPLACE FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint DEFAULT NULL::bigint) RETURNS jsonb
-    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 DECLARE
     v_max_event_id bigint;
@@ -1586,6 +1607,9 @@ BEGIN
     IF NOT tc.is_member(p_collection_id) THEN
         RAISE EXCEPTION 'not_a_member' USING ERRCODE = '42501';
     END IF;
+
+    -- The caller is opening (or re-syncing) this collection (v1.11).
+    PERFORM tc._touch_member(p_collection_id);
 
     -- Max event id for the cursor
     SELECT max(id) INTO v_max_event_id
@@ -1671,7 +1695,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current).';
+COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current). v1.11: VOLATILE, because it records that the caller opened the collection (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes).';
 
 CREATE OR REPLACE FUNCTION tc.is_admin(p_collection_id uuid) RETURNS boolean
     LANGUAGE sql STABLE SECURITY DEFINER
@@ -1942,18 +1966,18 @@ $$;
 
 COMMENT ON FUNCTION tc.members_last_admin_guard() IS 'Trigger function: prevents deleting or demoting the last admin of a collection. Locks the parent collection row (FOR UPDATE) before counting so concurrent admin removals/demotions serialize instead of racing to zero admins (fixed 20260717000001).';
 
-CREATE OR REPLACE FUNCTION tc.members_list(p_collection_id uuid) RETURNS TABLE(id bigint, email text, display_name text, role tc.member_role, user_id text, added_by text, added_at timestamp with time zone, claimed_at timestamp with time zone)
+CREATE OR REPLACE FUNCTION tc.members_list(p_collection_id uuid) RETURNS TABLE(id bigint, email text, display_name text, role tc.member_role, user_id text, added_by text, added_at timestamp with time zone, claimed_at timestamp with time zone, last_seen_at timestamp with time zone)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
     SELECT m.id, m.email, m.display_name, m.role, m.user_id, m.added_by, m.added_at,
-           m.claimed_at
+           m.claimed_at, m.last_seen_at
     FROM tc.members m
     WHERE m.collection_id = p_collection_id
       AND tc.is_member(p_collection_id)   -- membership gate
     ORDER BY m.email
 $$;
 
-COMMENT ON FUNCTION tc.members_list(p_collection_id uuid) IS 'CONTRACTS.md: members list — returns approved-accounts for the collection. Any member may call this. v1.6 (20260713000001): rows also carry display_name.';
+COMMENT ON FUNCTION tc.members_list(p_collection_id uuid) IS 'CONTRACTS.md: members list — returns approved-accounts for the collection. Any member may call this. v1.6 (20260713000001): rows also carry display_name. v1.11: rows also carry last_seen_at (NULL = never seen).';
 
 CREATE OR REPLACE FUNCTION tc.members_remove(p_collection_id uuid, p_member_id bigint) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
@@ -2556,7 +2580,8 @@ CREATE TABLE IF NOT EXISTS tc.members (
     added_by text NOT NULL,
     added_at timestamp with time zone DEFAULT now() NOT NULL,
     claimed_at timestamp with time zone,
-    display_name text
+    display_name text,
+    last_seen_at timestamp with time zone
 );
 
 COMMENT ON TABLE tc.members IS 'Approved-accounts table. Unclaimed rows (user_id IS NULL) are pending until the account holder signs in and calls claim_memberships(). email is stored lowercase + NFC-normalised.';
@@ -2564,6 +2589,8 @@ COMMENT ON TABLE tc.members IS 'Approved-accounts table. Unclaimed rows (user_id
 COMMENT ON COLUMN tc.members.user_id IS 'NULL until the account holder claims the seat. TEXT covers both Firebase UIDs and local-GoTrue UUIDs.';
 
 COMMENT ON COLUMN tc.members.display_name IS 'Human-readable name shown in place of the email wherever the member is displayed (checkout status, history, sharing panel). NULL = none set; display falls back to email. Set via tc.members_set_display_name (admin, or the claimed member themselves).';
+
+COMMENT ON COLUMN tc.members.last_seen_at IS 'v1.11: the last time this member had THIS collection open in Bloom (per membership, so work in another collection does not count), to 10-minute granularity. Set by tc._touch_member, which get_collection_state (opening or re-syncing the collection) and get_changes (the 60-second poll and reconnect catch-up) call; written at most once per 10 minutes per member. NULL = never seen (invited only). Returned by members_list for the Share dialog''s "Last seen".';
 
 ALTER TABLE tc.members ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME tc.members_id_seq
@@ -2847,6 +2874,9 @@ GRANT USAGE ON SCHEMA tc TO authenticated;
 -- The service role calls only the service-role-only SECURITY DEFINER functions below
 -- (finish RPCs, sweep worklist/re-check, support_set_admin); it needs the schema.
 GRANT USAGE ON SCHEMA tc TO service_role;
+
+-- Internal: only get_collection_state and get_changes (SECURITY DEFINER) call it.
+REVOKE ALL ON FUNCTION tc._touch_member(p_collection_id uuid) FROM PUBLIC, anon, authenticated;
 
 GRANT ALL ON FUNCTION tc.add_palette_colors(p_collection_id uuid, p_palette text, p_colors text[]) TO authenticated;
 

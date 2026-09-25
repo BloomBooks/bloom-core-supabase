@@ -45,6 +45,7 @@ erDiagram
         text display_name "v1.6; NULL falls back to email"
         text added_by
         timestamptz claimed_at
+        timestamptz last_seen_at "v1.11; NULL = never seen"
     }
     books {
         uuid id PK
@@ -193,6 +194,10 @@ erDiagram
   holder, and `checkout_book_takeover` by another account, all require the GUID; `force_unlock`
   (admin) does not. The `books_clear_checkout_on_unlock` trigger clears the hash whenever the lock is
   released or changes hands without a new GUID (`checkout_book_takeover` alone keeps it on purpose).
+- **`members.last_seen_at`** (v1.11) is when that member last had that collection open in Bloom,
+  per membership: `get_collection_state` and `get_changes` set the caller's own row to now() unless
+  it is already less than 10 minutes old, so a polling client writes it about once per 10 minutes.
+  NULL means never seen (invited only). The Share dialog shows it as "Last seen"; it emits no event.
 - **`events`** is the append-only history log behind the History panel and realtime broadcasts;
   `type` is the numeric `BookHistoryEventType`. `book_id` is nullable (`ON DELETE SET NULL`) so a
   book's history survives its deletion.

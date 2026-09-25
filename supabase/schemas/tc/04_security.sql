@@ -74,6 +74,9 @@ GRANT USAGE ON SCHEMA tc TO authenticated;
 -- (finish RPCs, sweep worklist/re-check, support_set_admin); it needs the schema.
 GRANT USAGE ON SCHEMA tc TO service_role;
 
+-- Internal: only get_collection_state and get_changes (SECURITY DEFINER) call it.
+REVOKE ALL ON FUNCTION tc._touch_member(p_collection_id uuid) FROM PUBLIC, anon, authenticated;
+
 GRANT ALL ON FUNCTION tc.add_palette_colors(p_collection_id uuid, p_palette text, p_colors text[]) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) TO authenticated;
