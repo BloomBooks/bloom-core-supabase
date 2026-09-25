@@ -196,7 +196,10 @@ BEGIN
     -- status instead of overwriting a just-finished transaction with 'aborted'.
     SELECT * INTO v_tx FROM tc.checkin_transactions WHERE id = p_transaction_id FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION '%', '{"error":"transaction_not_found"}' USING ERRCODE = 'PT404';
+        -- Nothing (any longer) to abort. Aborting a never-committed new book deletes the book,
+        -- and with it this very row, so a retry after a lost response lands here and must
+        -- succeed like any other repeat abort. It reveals nothing about anyone's transactions.
+        RETURN;
     END IF;
     IF v_tx.started_by <> v_user_id THEN
         RAISE EXCEPTION '%', '{"error":"forbidden"}' USING ERRCODE = 'PT403';
@@ -239,7 +242,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) IS 'Internal to the checkin-abort edge function. Idempotent. Rolls back a never-finished new book entirely; releases an existing book''s send-only lock (v1.10: taken by checkin-start with no checkout GUID); leaves a real checkout untouched.';
+COMMENT ON FUNCTION tc.checkin_abort_tx(p_transaction_id uuid) IS 'Internal to the checkin-abort edge function. Idempotent, including for a transaction id that no longer exists (e.g. removed with the new book a first abort rolled back): that is a no-op success, not 404. Rolls back a never-finished new book entirely; releases an existing book''s send-only lock (v1.10: taken by checkin-start with no checkout GUID); leaves a real checkout untouched.';
 
 CREATE OR REPLACE FUNCTION tc.checkin_finish_tx(p_transaction_id uuid, p_user_id text, p_user_email text, p_user_name text, p_comment text, p_keep_checked_out boolean, p_captured jsonb, p_expected_revision bigint) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
@@ -1240,25 +1243,36 @@ CREATE OR REPLACE FUNCTION tc.events_realtime_broadcast() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-    PERFORM pg_notify(
-        'realtime:' || NEW.collection_id::text,
-        json_build_object(
-            'eventId',     NEW.id,
-            'type',        NEW.type,
-            'bookId',      NEW.book_id,
-            'versionSeq',  NEW.book_version_seq,
-            'byUserName',  NEW.by_user_name,
-            'byEmail',     NEW.by_email,
-            'lock',        NEW.lock_info,
-            'name',        NEW.book_name,
-            'groupKey',    NEW.group_key
-        )::text
-    );
+    -- Supabase Realtime's broadcast-from-database: realtime.send stores the message in
+    -- realtime.messages, and the Realtime server delivers it to subscribers of the private
+    -- channel collection:{collection_id} whom the realtime.messages RLS policy lets read it
+    -- (04_security.sql). realtime.send only warns if it cannot deliver, so a Realtime problem
+    -- never blocks the check-in that logged the event. Where the Realtime schema is absent
+    -- (a database started without the Realtime service, as the pgTAP job does) there is
+    -- nothing to send to; clients catch up with get_changes either way.
+    IF to_regprocedure('realtime.send(jsonb,text,text,boolean)') IS NOT NULL THEN
+        PERFORM realtime.send(
+            jsonb_build_object(
+                'eventId',     NEW.id,
+                'type',        NEW.type,
+                'bookId',      NEW.book_id,
+                'versionSeq',  NEW.book_version_seq,
+                'byUserName',  NEW.by_user_name,
+                'byEmail',     NEW.by_email,
+                'lock',        NEW.lock_info,
+                'name',        NEW.book_name,
+                'groupKey',    NEW.group_key
+            ),
+            'tc_event',
+            'collection:' || NEW.collection_id::text,
+            true
+        );
+    END IF;
     RETURN NEW;
 END;
 $$;
 
-COMMENT ON FUNCTION tc.events_realtime_broadcast() IS 'Broadcasts a realtime notification on channel realtime:{collection_id} for every new event row. The message shape matches CONTRACTS.md §Realtime.';
+COMMENT ON FUNCTION tc.events_realtime_broadcast() IS 'Broadcasts every new event row with realtime.send (Supabase Realtime broadcast from the database) as event "tc_event" on the PRIVATE channel collection:{collection_id}, in the message shape of CONTRACTS.md §Realtime (realtime.send adds its own "id" key). A no-op where the realtime schema is not installed; delivery failures are only warnings.';
 
 CREATE OR REPLACE FUNCTION tc.force_unlock(p_book_id uuid) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER

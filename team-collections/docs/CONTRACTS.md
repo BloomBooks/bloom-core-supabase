@@ -26,7 +26,12 @@ is also the answer to a GUID sent for a send-only lock). `checkout_book_takeover
 version bump, additive): `checkin-finish` and `collection-files-finish` never commit an upload
 older than a 24 h commit window — 409 `MissingOrBadUploads` then also carries `stalePaths[]`, and
 the client re-uploads as for any `MissingOrBadUploads` — so the orphaned-upload sweep (48 h grace,
-now paged through all its work each run) can never delete a version being committed. v1.9, 24 Sep 2026, BL-16531 — BREAKING for the client: the per-copy
+now paged through all its work each run) can never delete a version being committed. A second
+v1.10 follow-up (no version bump; nothing the client sends changes): realtime events now go out
+on the contracted private channel `collection:{uuid}` (they were on the wrong channel) as
+broadcast event `tc_event`, members only; `checkin-abort` of a transaction that no longer exists
+is a 200 no-op instead of 404 (a retried abort of a new book); `collection-files-start` gets its
+S3 credentials before opening the transaction. v1.9, 24 Sep 2026, BL-16531 — BREAKING for the client: the per-copy
 "seat" and the v1.8 takeover token are replaced by a **checkout GUID**, which says which local
 copy of a book holds its checkout, so check-in keeps working when a collection folder is moved,
 renamed or copied, and a second copy can no longer silently take the checkout from the first.
@@ -319,7 +324,10 @@ along with the file list it verified; every start resume bumps `revision`, and a
 409 `TransactionChanged` above.
 
 #### `checkin-abort` POST — `{ transactionId }` → 200.
-Removes a never-committed new book; v1.10: releases an existing book's send-only lock (no GUID)
+Idempotent: v1.10 follow-up, a transaction id that does not exist (any longer) is also 200 — a
+no-op, not 404 — because aborting a never-committed new book removes the transaction with the
+book, and a retry after a lost response must still succeed. Someone else's transaction is still
+403. Removes a never-committed new book; v1.10: releases an existing book's send-only lock (no GUID)
 that the aborted check-in took; a checkout (with a GUID) is kept. An expired check-in's send-only
 lock is released the same way when it is reaped.
 
@@ -353,12 +361,19 @@ and finish retries are idempotent (`{ version }` of the committed transaction). 
 finish can also answer 409 `TransactionChanged` (a concurrent start resumed the transaction
 while finish was verifying it; nothing committed, retry as for any failed finish). v1.10
 follow-up: as in `checkin-finish`, an upload older than the 24 h commit window is not committed
-(409 `MissingOrBadUploads` with `stalePaths[]`; upload again).
+(409 `MissingOrBadUploads` with `stalePaths[]`; upload again). `collection-files-start` gets
+its S3 credentials before it opens (or resumes) the transaction, as `checkin-start` does, so a
+credential failure leaves no transaction the client never heard of; a refused start returns none.
 
 ## Realtime
 
 Private broadcast channel `collection:{uuid}` (events-table trigger). Message:
 `{ eventId, type, bookId?, versionSeq?, byUserName, byEmail, lock?, name?, groupKey? }`.
+v1.10 follow-up: the trigger sends it with Supabase Realtime's `realtime.send` as broadcast event
+`tc_event` (the payload also carries an `id` that `realtime.send` adds); only members of the
+collection may join the channel (RLS policy `tc_members_receive_collection_broadcasts` on
+`realtime.messages`). Subscribe with `private: true` and the user's JWT. (The Bloom client polls
+`get_changes` for now; realtime is a later wave.)
 Clients persist `last_seen_event_id`; on (re)connect always run one `get_changes` delta first.
 Event `type` values = existing `BookHistoryEventType` numerics + incident extensions
 (e.g. WorkPreservedLocally).

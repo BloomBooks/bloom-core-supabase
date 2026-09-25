@@ -8,12 +8,14 @@
 --   8.   collection files: NFC at start, service-role finish, idempotent retry
 --   9.   the row locks that make start/finish race-safe are present
 --   10.  the sweep's paged worklist and per-key re-check
---   11.  aborting an expired new-book check-in
+--   11.  aborting an expired new-book check-in, and retrying that abort
 --   12-13. the checkout GUID (CONTRACTS.md v1.9/v1.10) at start: required for one's own
 --        checkout, never issued; a free or new book is locked for the send only (no hash)
 --   14.  an admin force-unlocks without the GUID; the old holder's check-in is refused
 --   15-16. a start resume racing a finish is refused at finish (TransactionChanged)
 --   17.  start taking a free lock emits a CheckOut event; abort and expiry release it
+--   18.  a deleted book can't be checked in to
+--   19.  realtime broadcast on collection:{uuid} (skipped without the Realtime service)
 --   (5 also covers the GUID at finish: it must not have changed since start, and
 --   keepCheckedOut keeps it.)
 -- (The edge functions call the finish RPCs with the service-role key; here the suite's
@@ -26,7 +28,7 @@
 
 BEGIN;
 
-SELECT plan(89);
+SELECT plan(93);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -598,6 +600,14 @@ SELECT ok(
     NOT EXISTS (SELECT 1 FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c411'),
     '11b: and removes the never-finished book'
 );
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM tc.checkin_transactions WHERE id = current_setting('tests.tx11')::uuid),
+    '11c: sanity: removing the book removed its transaction too'
+);
+SELECT lives_ok(
+    format($$SELECT tc.checkin_abort_tx(%L)$$, current_setting('tests.tx11')),
+    '11d: a retried abort of that (now gone) transaction still succeeds, as a no-op'
+);
 
 -- =============================================================================
 -- 12. Existing book: starting a check-in of one's own lock needs its checkout GUID (the
@@ -898,4 +908,47 @@ SELECT throws_like(
     '%book_not_found%',
     '18b: finish refuses a book deleted after start (no invisible version)'
 );
+-- =============================================================================
+-- 19. Realtime: each event is broadcast on the private channel collection:{uuid}.
+--     realtime.messages and its daily partitions belong to the Realtime service, so these
+--     are skipped in a database started without it (as the db-only pgTAP job may be).
+-- =============================================================================
+
+-- Dynamic SQL, so this file still parses where realtime.messages does not exist.
+CREATE OR REPLACE FUNCTION tests.realtime_sent(p_event_id bigint, p_topic text)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_found boolean;
+BEGIN
+    EXECUTE 'SELECT EXISTS (SELECT 1 FROM realtime.messages
+                             WHERE topic = $1 AND private AND event = ''tc_event''
+                               AND extension = ''broadcast'' AND payload ->> ''eventId'' = $2)'
+        INTO v_found USING p_topic, p_event_id::text;
+    RETURN v_found;
+END;
+$$;
+
+SELECT set_config('tests.ev19', tc.log_event('c0000000-0000-0000-0000-00000000c401', NULL, 3,
+    'realtime probe')::text, true);
+SELECT CASE
+    WHEN to_regprocedure('realtime.send(jsonb,text,text,boolean)') IS NULL
+         OR to_regclass('realtime.messages_' || to_char(now() AT TIME ZONE 'UTC', 'YYYY_MM_DD')) IS NULL
+        THEN skip('Realtime (realtime.send and today''s realtime.messages partition) is not installed here', 1)
+    ELSE ok(
+        tests.realtime_sent(current_setting('tests.ev19')::bigint,
+                            'collection:c0000000-0000-0000-0000-00000000c401'),
+        '19a: inserting an event puts a private tc_event broadcast on collection:{uuid} in realtime.messages')
+END;
+SELECT CASE
+    WHEN to_regclass('realtime.messages') IS NULL
+        THEN skip('realtime.messages is not installed here', 1)
+    ELSE ok(
+        EXISTS (SELECT 1 FROM pg_policies
+                WHERE schemaname = 'realtime' AND tablename = 'messages'
+                  AND policyname = 'tc_members_receive_collection_broadcasts'
+                  AND cmd = 'SELECT' AND 'authenticated' = ANY(roles)),
+        '19b: members-only receive policy on realtime.messages is in place')
+END;
 SELECT * FROM finish();ROLLBACK;
