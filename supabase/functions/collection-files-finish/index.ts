@@ -85,7 +85,7 @@ export const handler = async (
     });
 
     if (result.manifest) {
-        await writeManifestBackup(client, bucket, prefix, result.manifest);
+        await writeManifestBackup(client, bucket, prefix, result.version, result.manifest);
     }
 
     return jsonResponse(200, { version: result.version });

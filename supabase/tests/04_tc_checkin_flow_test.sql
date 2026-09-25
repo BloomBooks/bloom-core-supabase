@@ -10,12 +10,14 @@
 --   10.  the sweep's paged worklist and per-key re-check
 --   11.  aborting an expired new-book check-in, and retrying that abort
 --   12-13. the checkout GUID (CONTRACTS.md v1.9/v1.10) at start: required for one's own
---        checkout, never issued; a free or new book is locked for the send only (no hash)
+--        checkout, never issued; a free or new book is locked for the send only (no hash);
+--        a resumed new book's name is conflict-checked (13e)
 --   14.  an admin force-unlocks without the GUID; the old holder's check-in is refused
 --   15-16. a start resume racing a finish is refused at finish (TransactionChanged)
 --   17.  start taking a free lock emits a CheckOut event; abort and expiry release it
 --   18.  a deleted book can't be checked in to
 --   19.  realtime broadcast on collection:{uuid} (skipped without the Realtime service)
+--   20.  undoing a checkout records CheckOutReleased, so polling sees the book unlocked
 --   (5 also covers the GUID at finish: it must not have changed since start, and
 --   keepCheckedOut keeps it.)
 -- (The edge functions call the finish RPCs with the service-role key; here the suite's
@@ -28,7 +30,7 @@
 
 BEGIN;
 
-SELECT plan(93);
+SELECT plan(98);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -710,6 +712,18 @@ SELECT ok(
     '13d: after the resumes the new book and its one transaction still have no hash'
 );
 
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.books
+      WHERE collection_id = 'c0000000-0000-0000-0000-00000000c401' AND name = 'Book Two' AND deleted_at IS NULL),
+    '13e-sanity: another live book is called "Book Two"'
+);
+SELECT throws_like(
+    $$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c413',
+        'book two', NULL, 'cs-13', '6.5.0', '[]')$$,
+    '%NameConflict%',
+    '13e: resuming a never-committed new book under another live book''s name (any case) is a NameConflict'
+);
+
 -- =============================================================================
 -- 14. An admin can always cancel someone else's checkout without its GUID; the old
 --     holder's in-flight check-in is then refused.
@@ -951,4 +965,40 @@ SELECT CASE
                   AND cmd = 'SELECT' AND 'authenticated' = ANY(roles)),
         '19b: members-only receive policy on realtime.messages is in place')
 END;
+
+-- =============================================================================
+-- 20. Undoing a checkout is visible to polling: unlock_book records CheckOutReleased (101),
+--     so get_changes after the previous cursor returns the book, unlocked.
+-- =============================================================================
+
+SELECT tests.set_jwt('user-alice-cif', 'alice-cif@example.com', 'Alice');
+SELECT set_config('tests.tx20', tc.checkin_start_tx(
+    'c0000000-0000-0000-0000-00000000c401', NULL, 'd0000000-0000-0000-0000-00000000c420',
+    'Book Twenty', NULL, 'cs-20', '6.5.0', '[]') ->> 'transactionId', true);
+SELECT tc.checkin_finish_tx(current_setting('tests.tx20')::uuid, 'user-alice-cif', 'alice-cif@example.com',
+    'Alice', 'twenty', false, '[]', tests.rev(current_setting('tests.tx20')));
+SELECT set_config('tests.book20',
+    (SELECT id::text FROM tc.books WHERE instance_id = 'd0000000-0000-0000-0000-00000000c420'), true);
+SELECT set_config('tests.a20', tests.checkout(current_setting('tests.book20')::uuid, 'AliceMachine'), true);
+SELECT set_config('tests.ev20', (SELECT max(id) FROM tc.events)::text, true);
+SELECT ok(
+    (SELECT current_version_seq = 1 AND locked_by = 'user-alice-cif' FROM tc.books
+      WHERE id = current_setting('tests.book20')::uuid),
+    '20-sanity: book twenty is committed and checked out to Alice'
+);
+SELECT tc.unlock_book(current_setting('tests.book20')::uuid, current_setting('tests.a20'));
+SELECT ok(
+    (SELECT count(*) = 1 FROM tc.events
+      WHERE id > current_setting('tests.ev20')::bigint
+        AND book_id = current_setting('tests.book20')::uuid
+        AND type = 101 AND by_user_id = 'user-alice-cif' AND book_name = 'Book Twenty'),
+    '20a: unlock_book records one CheckOutReleased (type 101) event'
+);
+SELECT ok(
+    (SELECT (c -> 'books') @> jsonb_build_array(jsonb_build_object(
+                'id', current_setting('tests.book20'), 'locked_by', NULL))
+       FROM (SELECT tc.get_changes('c0000000-0000-0000-0000-00000000c401',
+                                   current_setting('tests.ev20')::bigint) AS c) s),
+    '20b: get_changes after the previous cursor returns the book, unlocked'
+);
 SELECT * FROM finish();ROLLBACK;

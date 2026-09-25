@@ -34,8 +34,8 @@
       - dotnet on PATH (for parity-check tool)
 
     First green run: 6 Jul 2026 against Podman 5.8.3 (rootful WSL machine),
-    Supabase CLI 2.109.0, MinIO latest. Step 3 reports HTTP 404 until task 02
-    deploys the edge functions; that counts as reachable/pass.
+    Supabase CLI 2.109.0, MinIO latest. Step 3 fails with HTTP 404 when the edge
+    functions are not being served (the gateway's "function not found").
 #>
 
 [CmdletBinding()]
@@ -165,7 +165,7 @@ Write-Step "3. Edge function smoke - call download-start with a valid JWT"
 # We need a collection-id to call download-start.  Use a well-known dev UUID.
 $testCollectionId = "00000000-aaaa-bbbb-cccc-000000000001"
 
-Invoke-Check "POST /functions/v1/download-start returns 200 or 403/404 (function reachable)" {
+Invoke-Check "POST /functions/v1/download-start returns 200 or 401/403 (function deployed)" {
     if (-not $script:TestJwt) {
         throw "No JWT from step 1 - cannot test edge function."
     }
@@ -189,13 +189,15 @@ Invoke-Check "POST /functions/v1/download-start returns 200 or 403/404 (function
             Write-Host "  Function returned 200 but no credentials - check task 02 implementation."
         }
     } catch {
-        # Accept 403/404 as "function is reachable but the collection does not exist yet."
-        # A connection-refused error means the function is not running.
+        # 403 (not_a_member: the collection is not seeded) or 401 are the function itself
+        # refusing, so it is deployed and running. 404 is the gateway saying there is no such
+        # function (not deployed or not served), and a connection error means nothing is
+        # running: both fail.
         $statusCode = $_.Exception.Response.StatusCode.value__
-        if ($statusCode -in @(403, 404, 401)) {
-            Write-Host "  HTTP $statusCode - function is reachable; collection not seeded (expected)."
+        if ($statusCode -in @(401, 403)) {
+            Write-Host "  HTTP $statusCode - the function answered; collection not seeded (expected)."
         } else {
-            throw "Unexpected error calling download-start: $_"
+            throw "Unexpected error calling download-start (HTTP $statusCode; 404 means the function is not deployed): $_"
         }
     }
 }

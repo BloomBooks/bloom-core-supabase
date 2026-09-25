@@ -38,13 +38,15 @@ CREATE OR REPLACE FUNCTION tc._checkin_reap_book(p_book_id uuid) RETURNS void
     AS $$
 DECLARE
     v_new_book boolean;
+    v_book     tc.books%ROWTYPE;
+    v_released integer;
 BEGIN
-    SELECT (current_version_id IS NULL) INTO v_new_book
-    FROM tc.books WHERE id = p_book_id;
+    SELECT * INTO v_book FROM tc.books WHERE id = p_book_id;
 
     IF NOT FOUND THEN
         RETURN;
     END IF;
+    v_new_book := v_book.current_version_id IS NULL;
 
     -- A send-only lock (no checkout GUID) exists only for its check-in, so it goes when
     -- that check-in expires; otherwise nobody could release it without an admin.
@@ -63,6 +65,15 @@ BEGIN
           WHERE t.book_id = p_book_id AND t.started_by = b.locked_by
             AND t.status = 'open' AND t.expires_at >= now()
       );
+    GET DIAGNOSTICS v_released = ROW_COUNT;
+
+    -- A committed book's lock was visible to teammates: record its release (CheckOutReleased,
+    -- type = 101, on behalf of the holder) so polling clients see it. A new book is invisible.
+    IF v_released > 0 AND NOT v_new_book THEN
+        INSERT INTO tc.events (collection_id, book_id, type, by_user_id, book_name, message)
+        VALUES (v_book.collection_id, v_book.id, 101, v_book.locked_by, v_book.name,
+                'check-in expired');
+    END IF;
 
     IF v_new_book THEN
         -- Deleting the book cascades its (expired, still-open) transactions.
@@ -259,15 +270,24 @@ BEGIN
     -- A send-only lock (start took the free book, with no checkout GUID) exists only for
     -- this check-in, so it goes with it; a real checkout stays.
     IF v_tx.checkout_guid_hash IS NULL THEN
-        UPDATE tc.books
-        SET locked_by = NULL, locked_by_machine = NULL, locked_at = NULL
-        WHERE id = v_tx.book_id
-          AND locked_by = v_user_id
-          AND checkout_guid_hash IS NULL
-          AND NOT EXISTS (
-              SELECT 1 FROM tc.checkin_transactions
-              WHERE book_id = v_tx.book_id AND started_by = v_user_id AND status = 'open'
-          );
+        -- A committed book's lock was visible to teammates, so its release is recorded
+        -- (CheckOutReleased, type = 101) for polling clients to see; a new book is invisible.
+        WITH released AS (
+            UPDATE tc.books
+            SET locked_by = NULL, locked_by_machine = NULL, locked_at = NULL
+            WHERE id = v_tx.book_id
+              AND locked_by = v_user_id
+              AND checkout_guid_hash IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM tc.checkin_transactions
+                  WHERE book_id = v_tx.book_id AND started_by = v_user_id AND status = 'open'
+              )
+            RETURNING id, collection_id, name, current_version_id
+        )
+        INSERT INTO tc.events (collection_id, book_id, type, by_user_id, by_user_name, by_email, book_name)
+        SELECT r.collection_id, r.id, 101, v_user_id, (auth.jwt() ->> 'name'), tc.current_user_email(), r.name
+        FROM released r
+        WHERE r.current_version_id IS NOT NULL;
     END IF;
 END;
 $$;
@@ -530,6 +550,19 @@ BEGIN
             END IF;
             -- else: our own resumable row. A first check-in is a send, not a checkout, so
             -- the row is locked to the sender with no checkout GUID and resuming needs none.
+            -- The resumed send may propose a different name from the first try (the book was
+            -- renamed locally meanwhile): refuse a clash with another live book here, as for a
+            -- fresh new book, rather than as a unique-index violation at finish.
+            IF EXISTS (
+                SELECT 1 FROM tc.books
+                WHERE collection_id = p_collection_id
+                  AND id <> v_book.id
+                  AND deleted_at IS NULL
+                  AND lower(normalize(name, NFC)) = lower(normalize(p_proposed_name, NFC))
+            ) THEN
+                RAISE EXCEPTION '%', json_build_object('error', 'NameConflict')::text
+                    USING ERRCODE = 'PT409';
+            END IF;
         ELSE
             IF EXISTS (
                 SELECT 1 FROM tc.books
@@ -2302,10 +2335,16 @@ BEGIN
            locked_by_machine = NULL,
            locked_at         = NULL
     WHERE  id = p_book_id;
+
+    -- CheckOutReleased (type = 101): get_changes only returns books named by newer events,
+    -- so without one, polling teammates would go on seeing the book checked out.
+    INSERT INTO tc.events (collection_id, book_id, type, by_user_id, by_user_name, by_email, book_name)
+    SELECT b.collection_id, b.id, 101, v_user_id, (auth.jwt() ->> 'name'), tc.current_user_email(), b.name
+    FROM tc.books b WHERE b.id = p_book_id;
 END;
 $$;
 
-COMMENT ON FUNCTION tc.unlock_book(p_book_id uuid, p_checkout_guid text) IS 'CONTRACTS.md: unlock_book — release own lock (undo checkout, no content change). Only the lock holder may call this, and (v1.9) only with the current checkout GUID (else CheckoutElsewhere); use force_unlock for admin override. Releasing the lock clears the GUID.';
+COMMENT ON FUNCTION tc.unlock_book(p_book_id uuid, p_checkout_guid text) IS 'CONTRACTS.md: unlock_book — release own lock (undo checkout, no content change). Only the lock holder may call this, and (v1.9) only with the current checkout GUID (else CheckoutElsewhere); use force_unlock for admin override. Releasing the lock clears the GUID. Emits CheckOutReleased (type=101) so polling clients see the book unlocked.';
 
 
 -- ==== 03_tables.sql ====
@@ -2487,10 +2526,10 @@ CREATE TABLE IF NOT EXISTS tc.events (
     message text,
     bloom_version text,
     occurred_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT events_type_check CHECK ((type = ANY (ARRAY[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 100])))
+    CONSTRAINT events_type_check CHECK ((type = ANY (ARRAY[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 101])))
 );
 
-COMMENT ON TABLE tc.events IS 'History log, realtime broadcast source, and polling cursor. type values mirror C# BookHistoryEventType (HistoryEvent.cs): 0=CheckOut, 1=CheckIn, 2=Created, 3=Renamed, 4=Uploaded(legacy), 5=ForcedUnlock, 6=ImportSpreadsheet, 7=SyncProblem(legacy), 8=Deleted, 9=Moved. Cloud-TC incident extensions start at 100 to avoid colliding with future C# additions: 100=WorkPreservedLocally.';
+COMMENT ON TABLE tc.events IS 'History log, realtime broadcast source, and polling cursor. type values mirror C# BookHistoryEventType (HistoryEvent.cs): 0=CheckOut, 1=CheckIn, 2=Created, 3=Renamed, 4=Uploaded(legacy), 5=ForcedUnlock, 6=ImportSpreadsheet, 7=SyncProblem(legacy), 8=Deleted, 9=Moved. Cloud-TC extensions start at 100 to avoid colliding with future C# additions: 100=WorkPreservedLocally, 101=CheckOutReleased (a lock released without a check-in by its holder: unlock_book, or an aborted or expired check-in''s send-only lock).';
 
 ALTER TABLE tc.events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME tc.events_id_seq

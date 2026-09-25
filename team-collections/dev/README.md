@@ -348,7 +348,8 @@ documented fallback strategy and exits with code 1.
 The smoke script:
 1. Signs up a random user via local GoTrue.
 2. Puts a versioned object via the parity-check tool (or mc).
-3. Calls the `download-start` edge function with a valid JWT.
+3. Calls the `download-start` edge function with a valid JWT (401/403 from the function pass;
+   a 404 means the functions are not being served, and fails).
 4. Reports PASS/FAIL with clear error messages on any failure.
 
 **Note**: As of initial authoring this script is authored but unrun — requires Docker Desktop
