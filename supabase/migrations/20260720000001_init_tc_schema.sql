@@ -41,6 +41,16 @@ DECLARE
     v_book     tc.books%ROWTYPE;
     v_released integer;
 BEGIN
+    -- Lock order is transaction rows, then book row, as in checkin_start_tx,
+    -- checkin_finish_tx and checkin_abort_tx: the updates below lock the book first and the
+    -- transactions after, so without this a start/abort on the same book (holding its
+    -- transaction row and waiting for the book) and this sweep, run from another request,
+    -- would deadlock.
+    PERFORM 1 FROM tc.checkin_transactions
+    WHERE book_id = p_book_id AND status = 'open' AND expires_at < now()
+    ORDER BY id
+    FOR UPDATE;
+
     SELECT * INTO v_book FROM tc.books WHERE id = p_book_id;
 
     IF NOT FOUND THEN
@@ -2324,9 +2334,12 @@ DECLARE
     v_count   integer := 0;
     v_updated integer;
 BEGIN
+    -- In book id order, like members_remove, so two sweeps (or a sweep and a member
+    -- removal) take the book rows in the same order.
     FOR v_book_id IN
         SELECT DISTINCT book_id FROM tc.checkin_transactions
         WHERE status = 'open' AND expires_at < now()
+        ORDER BY book_id
     LOOP
         PERFORM tc._checkin_reap_book(v_book_id);
         v_count := v_count + 1;
