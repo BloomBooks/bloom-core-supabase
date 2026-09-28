@@ -185,14 +185,18 @@ CREATE TABLE IF NOT EXISTS tc.events (
 
 COMMENT ON TABLE tc.events IS 'History log, realtime broadcast source, and polling cursor. type values mirror C# BookHistoryEventType (HistoryEvent.cs): 0=CheckOut, 1=CheckIn, 2=Created, 3=Renamed, 4=Uploaded(legacy), 5=ForcedUnlock, 6=ImportSpreadsheet, 7=SyncProblem(legacy), 8=Deleted, 9=Moved. Cloud-TC extensions start at 100 to avoid colliding with future C# additions: 100=WorkPreservedLocally, 101=CheckOutReleased (a lock released without a check-in by its holder: unlock_book, or an aborted or expired check-in''s send-only lock).';
 
-ALTER TABLE tc.events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME tc.events_id_seq
+-- Not an identity column: a default is evaluated before BEFORE triggers run, and the id must
+-- be drawn only once the event-order lock is held (events_assign_id_tg).
+CREATE SEQUENCE IF NOT EXISTS tc.events_id_seq
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
     NO MAXVALUE
-    CACHE 1
-);
+    CACHE 1;
+
+ALTER SEQUENCE tc.events_id_seq OWNED BY tc.events.id;
+
+COMMENT ON COLUMN tc.events.id IS 'The polling cursor. Assigned from tc.events_id_seq by the events_assign_id_tg trigger (tc._events_assign_id) while the collection''s event-order lock is held, so get_changes/get_collection_state never return a max_event_id past an event that commits later; an explicit id is refused.';
 
 CREATE TABLE IF NOT EXISTS tc.members (
     id bigint NOT NULL,
@@ -370,6 +374,8 @@ CREATE OR REPLACE TRIGGER books_clear_checkout_on_unlock BEFORE UPDATE ON tc.boo
 CREATE OR REPLACE TRIGGER books_nfc_normalize_name_tg BEFORE INSERT OR UPDATE OF name ON tc.books FOR EACH ROW EXECUTE FUNCTION tc.nfc_normalize_book_name();
 
 CREATE OR REPLACE TRIGGER collection_group_files_nfc_normalize_path_tg BEFORE INSERT OR UPDATE OF path ON tc.collection_group_files FOR EACH ROW EXECUTE FUNCTION tc.nfc_normalize_path();
+
+CREATE OR REPLACE TRIGGER events_assign_id_tg BEFORE INSERT ON tc.events FOR EACH ROW EXECUTE FUNCTION tc._events_assign_id();
 
 CREATE OR REPLACE TRIGGER events_realtime_broadcast_tg AFTER INSERT ON tc.events FOR EACH ROW EXECUTE FUNCTION tc.events_realtime_broadcast();
 

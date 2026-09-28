@@ -109,6 +109,35 @@ $$;
 
 COMMENT ON FUNCTION tc._clear_checkout_on_unlock() IS 'Internal: clears tc.books.checkout_guid_hash whenever locked_by is cleared (and whenever the lock changes hands without a new GUID being set, except in checkout_book_takeover, which keeps the GUID on purpose), so every unlock path (unlock_book, force_unlock, members_remove, checkin_finish_tx, future ones) stays consistent without each having to remember the column.';
 
+CREATE OR REPLACE FUNCTION tc._event_order_lock_key(p_collection_id uuid) RETURNS bigint
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT hashtextextended('tc.events:' || p_collection_id::text, 0)
+$$;
+
+COMMENT ON FUNCTION tc._event_order_lock_key(p_collection_id uuid) IS 'Internal: the transaction-scoped advisory lock key that orders a collection''s event ids against its cursor readers. Every event insert holds it SHARED until commit (tc._events_assign_id); get_changes and get_collection_state take it EXCLUSIVE before reading, so they never return a cursor (max_event_id) past an id whose transaction has not committed yet.';
+
+CREATE OR REPLACE FUNCTION tc._events_assign_id() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.id IS NOT NULL THEN
+        RAISE EXCEPTION 'tc.events.id is assigned by the events_assign_id_tg trigger'
+            USING ERRCODE = '428C9';
+    END IF;
+    -- Shared, so writers never wait for one another; held until commit, so a cursor reader
+    -- (which takes it exclusive) waits for this event's transaction to finish, and no id is
+    -- handed out while the reader reads. Without this, an event whose transaction commits
+    -- after one with a higher id could be skipped for good: a poll between the two commits
+    -- would return the higher id as the cursor.
+    PERFORM pg_advisory_xact_lock_shared(tc._event_order_lock_key(NEW.collection_id));
+    NEW.id := nextval('tc.events_id_seq');
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION tc._events_assign_id() IS 'Trigger function (BEFORE INSERT on tc.events): assigns the event id from tc.events_id_seq only after taking the collection''s event-order lock (tc._event_order_lock_key) SHARED, so get_changes/get_collection_state, which take it exclusive, see every id below their cursor committed (or rolled back). An explicitly supplied id is refused (428C9).';
+
 CREATE OR REPLACE FUNCTION tc._normalize_proposed_files(p_files jsonb) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE
     AS $$
@@ -1483,6 +1512,12 @@ BEGIN
         RAISE EXCEPTION 'not_a_member' USING ERRCODE = '42501';
     END IF;
 
+    -- Wait for every transaction still writing events in this collection, and hold off new
+    -- ones until this call ends, so the cursor returned never passes an id that commits
+    -- later (see tc._events_assign_id). Taken before _touch_member's row lock: a writer
+    -- waiting on this lock never holds a member row.
+    PERFORM pg_advisory_xact_lock(tc._event_order_lock_key(p_collection_id));
+
     -- The caller is polling this collection, so they have it open (v1.11).
     PERFORM tc._touch_member(p_collection_id);
 
@@ -1555,7 +1590,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash). v1.11: VOLATILE, because it records that the caller has the collection open (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress on every call (clearing it emits no event).';
+COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash). v1.11: VOLATILE, because it records that the caller has the collection open (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress on every call (clearing it emits no event). v1.12 clarification: waits for transactions still writing events in the collection (tc._event_order_lock_key), so no event with an id at or below the returned max_event_id can commit later; a cursor advanced to it never skips one.';
 
 CREATE OR REPLACE FUNCTION tc.get_collection_file_manifest(p_collection_id uuid, p_group_key text) RETURNS jsonb
     LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -1619,6 +1654,9 @@ BEGIN
     IF NOT tc.is_member(p_collection_id) THEN
         RAISE EXCEPTION 'not_a_member' USING ERRCODE = '42501';
     END IF;
+
+    -- As in get_changes: max_event_id must not pass an event whose transaction commits later.
+    PERFORM pg_advisory_xact_lock(tc._event_order_lock_key(p_collection_id));
 
     -- The caller is opening (or re-syncing) this collection (v1.11).
     PERFORM tc._touch_member(p_collection_id);
@@ -1709,7 +1747,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current). v1.11: VOLATILE, because it records that the caller opened the collection (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress (tc.collections.initial_upload_in_progress), so the uploading admin''s other machines can show that the upload has not finished.';
+COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current). v1.11: VOLATILE, because it records that the caller opened the collection (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress (tc.collections.initial_upload_in_progress), so the uploading admin''s other machines can show that the upload has not finished. v1.12 clarification: as get_changes, waits for transactions still writing events in the collection, so max_event_id is a cursor that never skips an event committed later.';
 
 CREATE OR REPLACE FUNCTION tc.is_admin(p_collection_id uuid) RETURNS boolean
     LANGUAGE sql STABLE SECURITY DEFINER
