@@ -1230,7 +1230,10 @@ DECLARE
 BEGIN
     v_user_id := tc.current_user_id();
 
-    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id;
+    -- FOR UPDATE: the holder and GUID checks below must still be true when the row is
+    -- tombstoned; otherwise a checkout that changed hands meanwhile (force_unlock, then
+    -- someone else's checkout_book) would be deleted and its new lock cleared.
+    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id FOR UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'book_not_found' USING ERRCODE = 'P0002';
@@ -1360,7 +1363,8 @@ DECLARE
 BEGIN
     v_user_id := tc.current_user_id();
 
-    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id;
+    -- FOR UPDATE, so the audit event names the lock that is actually cleared.
+    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id FOR UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'book_not_found' USING ERRCODE = 'P0002';
@@ -2524,10 +2528,13 @@ DECLARE
 BEGIN
     v_user_id := tc.current_user_id();
 
+    -- FOR UPDATE, as in delete_book: the checks below must still hold when the lock is
+    -- cleared, or a new holder's checkout could be released.
     SELECT b.collection_id, b.locked_by, b.checkout_guid_hash
     INTO v_collection, v_locked_by, v_guid_hash
     FROM tc.books b
-    WHERE b.id = p_book_id;
+    WHERE b.id = p_book_id
+    FOR UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'book_not_found' USING ERRCODE = 'P0002';
