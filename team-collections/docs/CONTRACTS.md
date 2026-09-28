@@ -7,7 +7,21 @@
 > design notes live.
 
 Changes to this file require an orchestrator commit and a version-note bump here.
-**Contract version: 1.11** (25 Sep 2026, BL-16673 — additive, non-breaking: per-collection **last
+**Contract version: 1.12** (28 Sep 2026, BL-16676 — additive, non-breaking: **starting a cloud
+collection**, i.e. the initial upload of an existing collection, whether sharing an ordinary one or
+migrating a folder Team Collection (BloomDesktop's `Design/CloudTeamCollections.md` §5).
+`create_collection` gains an optional third argument `initial_upload` (default false); true creates
+the collection with `tc.collections.initial_upload_in_progress` set, and only creation can set it.
+The new admin-only `finish_initial_upload(collection_id)` clears it, once and for good (idempotent).
+While it is set, `my_collections()` leaves the collection out for everyone, its admin included (so
+the uploading admin's other machines do not list it either), and the new admin-only
+`lock_book_for_legacy_checkout(book_id, legacy_email, checkout_guid, machine)` may lock a free,
+committed book to a **placeholder holder** `legacy:<email>` (see "Placeholder holders" below), which
+only `checkout_book_takeover` (with the GUID) or `force_unlock` can end. `get_collection_state` and
+`get_changes` return a top-level `initial_upload_in_progress` boolean. `resolve_member_display`
+(hence `locked_by_email` / `lockedByEmail` everywhere) shows a placeholder's email, with no name.
+Nothing an existing client sends changes. Ops only: `support_delete_collection` (service-role)
+deletes a failed attempt's rows; GOING-LIVE.md "Deleting a failed migration". v1.11, 25 Sep 2026, BL-16673 — additive, non-breaking: per-collection **last
 seen**, for the Share dialog's "Last seen <when>" (else "Invited <when>"). `tc.members` gains
 `last_seen_at` (NULL = never seen, i.e. invited only), and `members_list` rows carry it. It is per
 membership, not per account: it records when that person last had THIS collection open. "Seen"
@@ -220,11 +234,13 @@ with `p_`, and PostgREST matches JSON keys to parameter names — so clients sen
 
 | RPC | Args → Result |
 |-----|----------------|
-| `create_collection(id uuid, name text)` | creates collection + caller as sole claimed admin |
-| `my_collections()` | collections where caller's email is approved (claimed or not) |
+| `create_collection(id uuid, name text, initial_upload boolean = false)` | creates collection + caller as sole claimed admin. v1.12: `initial_upload: true` creates it with its initial upload in progress (see "Starting a cloud collection" below); this is the only way the flag is ever set |
+| `my_collections()` | collections where caller's email is approved (claimed or not). v1.12: leaves out collections whose initial upload is in progress, for everyone (the uploading admin too) |
+| `finish_initial_upload(collection_id)` | v1.12: admin (else SQLSTATE 42501 `admin_required`; unknown id P0002 `collection_not_found`). Clears the initial-upload flag for good; already clear = no-op success, so retry freely. Emits no event |
+| `lock_book_for_legacy_checkout(book_id, legacy_email text, checkout_guid text, machine text)` | v1.12: admin; only while the collection's initial upload is in progress. Locks a FREE, committed, live book to the placeholder holder `legacy:<email>` with the GUID's hash, `machine` as `locked_by_machine`, and emits a CheckOut (0) event. Result and refusals as for `checkout_book`; see "Placeholder holders" below |
 | `claim_memberships()` | fills user_id on rows matching caller's verified email |
-| `get_collection_state(collection_id, since_event_id?)` | full/delta snapshot: book rows (locks, current version seq + checksum), collection-file group versions, `max_event_id`. v1.9: book rows carry `checkoutGuidHash` (see "Checkout GUID" below; NULL when unlocked). v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST |
-| `get_changes(collection_id, since_event_id)` | events + touched book rows (polling/catch-up). v1.9: book rows carry `checkoutGuidHash`. v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST |
+| `get_collection_state(collection_id, since_event_id?)` | full/delta snapshot: book rows (locks, current version seq + checksum), collection-file group versions, `max_event_id`. v1.9: book rows carry `checkoutGuidHash` (see "Checkout GUID" below; NULL when unlocked). v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST. v1.12: also `initial_upload_in_progress` (boolean) |
+| `get_changes(collection_id, since_event_id)` | events + touched book rows (polling/catch-up). v1.9: book rows carry `checkoutGuidHash`. v1.11: also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes), so it writes; call by POST. v1.12: also `initial_upload_in_progress` (boolean), on every call, since clearing it emits no event |
 | `get_book_manifest(book_id)` | v1.2: per-file current manifest `{bookId, versionId, seq, checksum, files:[{path, sha256, size, s3VersionId}]}` for pinned-version Receive; never-committed books invisible except to their mid-Send lock holder |
 | `get_collection_file_manifest(collection_id, group_key)` | v1.7: per-file current manifest `{groupKey, version, files:[{path, sha256, size, s3VersionId}]}` for one collection-file group, so the download path fetches only changed files pinned to their committed `s3_version_id` (E9); a never-written group returns `version 0` / empty `files`. Mirrors `get_book_manifest`. |
 | `checkout_book(book_id, machine text, checkout_guid text)` | conditional lock of a FREE book; returns resulting status (winner's identity on failure). v1.10: `checkout_guid` is made by the client and saved in `.checkout` before the call (see "Checkout GUID" below); NULL or blank raises SQLSTATE 22023 `invalid_checkout_guid`. On success returns `{success: true, locked_by, locked_by_machine, locked_at}` (no GUID). A retry by the caller with the SAME GUID after it succeeded returns the same success, changing nothing and emitting no second event. A book the caller holds under a different GUID (another copy), or under a send-only check-in lock, returns `{success: false, locked_by_me: true, locked_by, locked_by_machine, locked_at}` and changes nothing, because replacing the GUID would orphan the copy holding the current one. Locked by someone else (or deleted): `{success: false, locked_by, locked_by_machine, locked_at}`. `machine` is for display only. |
@@ -261,6 +277,47 @@ the row is locked by the caller and `checkoutGuidHash` equals the hash of its GU
 by another account; `force_unlock` and member removal (admin) never do, and clear it with the
 lock. The hash is also cleared whenever the lock is released or passes to another account without
 a new GUID (only `checkout_book_takeover` hands the same GUID on).
+
+#### Starting a cloud collection (v1.12)
+
+The admin's Bloom calls `create_collection(id, name, initial_upload: true)`, uploads the collection
+files and every book (ordinary first check-ins), places the placeholder locks below, and finally
+calls `finish_initial_upload(id)`. Until then `my_collections()` does not list the collection to
+anyone, so invitees cannot join a half-uploaded collection; this also hides it from the uploading
+admin's other machines (accepted: they can join once it is finished). Members who already have it
+open see `initial_upload_in_progress: true` from `get_collection_state` / `get_changes`. The flag
+does not restrict anything else: check-in, checkout and membership work as usual meanwhile.
+
+#### Placeholder holders (v1.12)
+
+A book checked out to someone in the old folder Team Collection is locked, after it is uploaded,
+to a **placeholder holder**: `tc.books.locked_by = 'legacy:' + lower(NFC(trim(email)))`, where
+`email` is the old checkout's email. It is never an account: no account id starts with `legacy:`
+(GoTrue ids are UUIDs, Firebase's generated UIDs are 28 letters and digits, and a CHECK on
+`tc.members.user_id` enforces it), so nobody can check such a book in, unlock it or delete it.
+
+- **Placing one:** `lock_book_for_legacy_checkout(book_id, legacy_email, checkout_guid, machine)`.
+  The admin's client makes the GUID and writes it to the old shared folder's
+  `Migration Keys/<instanceId>.json` first. Admin-only (42501 `admin_required`); only while the
+  flag is set (else P0001 `initial_upload_not_in_progress: ...`); only for a book with a committed
+  version (else P0001 `book_not_committed: ...`); NULL/blank GUID or email ⇒ 22023; unknown book
+  P0002. A free live book is locked (`checkout_guid_hash` = hash of the GUID, `locked_by_machine`
+  = `machine`, the old machine) and gets a CheckOut (0) event whose actor (`by_user_id`,
+  `by_email`) is the **admin**, with `lock_info: {locked_by: 'legacy:<email>', machine,
+  locked_at}` and `message` "checked out in the old Team Collection". Returns `{success: true,
+  locked_by, locked_by_machine, locked_at}`. The same placeholder with the same GUID again returns
+  the same success with nothing changed and no event (resuming after a crash). Anything else
+  (locked by anyone, including another placeholder or the same one under another GUID, or deleted)
+  returns `{success: false, locked_by, locked_by_machine, locked_at}` and changes nothing.
+- **Display:** `resolve_member_display` returns `email = <email>`, `display_name = NULL`, so
+  `locked_by_email` is the old email and `locked_by_name` is NULL (the usual rule, name else
+  email, then shows the email). `locked_by` itself is the raw `legacy:<email>`.
+- **Ending one:** `checkout_book_takeover(book_id, checkout_guid, machine)` by any member presenting
+  the GUID (from the key file) moves the lock to the caller, keeps the GUID and emits CheckOut, as
+  for any other account's lock; from then on it is an ordinary checkout. `force_unlock` (admin)
+  clears it with a ForcedUnlock event whose `lock_info.locked_by` is the placeholder. Member removal
+  never touches it (a placeholder is nobody's membership). Placeholder locks survive
+  `finish_initial_upload`.
 
 ### Edge functions (`/functions/v1/<name>`, JWT-verified; only these hold AWS creds)
 

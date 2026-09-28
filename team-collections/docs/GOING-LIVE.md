@@ -255,6 +255,47 @@ but giving the feature to real testers does:
 
   Deliberately left for later (not needed now): a self-service break-glass (e.g. the original
   `collections.created_by` creator reclaiming admin) — revisit only if recovery volume warrants.
+- **[IMPLEMENTED 28 Sep 2026, BL-16676] Deleting a failed migration.** If the admin starting a
+  cloud collection (sharing a collection, or migrating a folder Team Collection; CONTRACTS.md
+  v1.12, BloomDesktop's `Design/CloudTeamCollections.md` §5 "If it goes badly wrong") cannot finish
+  the upload — say their computer dies — the Bloom team deletes the incomplete cloud collection and
+  someone starts again. It works for any collection, finished or not, so check the id carefully.
+  Tooling: `tc.support_delete_collection(collection_id, dry_run = false)` (service-role only)
+  deletes the collection row and every `tc` row that belongs to it and returns the row counts per
+  table (`dry_run` only counts; an unknown id returns `found: false`); and
+  `team-collections/support/delete-collection.ps1`, which calls it through PostgREST with the
+  service-role key and then deletes every object version and delete marker under the bucket's
+  `tc/<collectionId>/` prefix with the AWS CLI (`-EndpointUrl` for MinIO).
+
+  **Runbook:**
+  1. Find the collection and check it is the right one (and, for a migration, that its initial
+     upload never finished):
+     ```sql
+     select id, name, created_at, initial_upload_in_progress from tc.collections
+      where name ilike '%<name fragment>%';
+     select email, role from tc.members where collection_id = '<collection-uuid>';
+     ```
+  2. Make sure the admin's Bloom is not still uploading (credentials already vended stay valid for
+     up to an hour), then report, and delete:
+     ```powershell
+     .\team-collections\support\delete-collection.ps1 -CollectionId <collection-uuid> `
+         -SupabaseUrl https://<ref>.supabase.co -ServiceRoleKey <service-role key> `
+         -Bucket bloom-teams-production            # report only
+     # ... same arguments plus -Execute to delete
+     ```
+     (Without the script: `select tc.support_delete_collection('<collection-uuid>');` in the SQL
+     editor, then delete the prefix's versions with any S3 tool; `aws s3 rm --recursive` is NOT
+     enough on the versioned bucket.) Re-running is harmless; `-SkipDatabase` / `-SkipS3` redo one
+     part.
+  3. On the client side (nothing here does these; tell the team):
+     - in the old shared folder's collection settings (the `.bloomCollection` in
+       `Other/Other Collection Files.zip`), set `AllowSharedFolderChanges` and `AllowCheckouts` back
+       to `True` (or leave them for the next attempt), and make sure the settings carry no cloud
+       collection id;
+     - delete the old shared folder's `Migration Keys` folder;
+     - give the other members back write access to the old shared folder (Dropbox "Can edit", or the
+       LAN share's file permissions);
+     - if the admin is gone for good, the team picks another admin, who starts again.
 - **[DECIDED + IMPLEMENTED 17 Jul 2026 → OPS to schedule] Orphaned-upload sweep.** A check-in
   uploads changed files to S3 (creating new object versions) *before* it commits. If the upload
   succeeds but the commit fails, the garbage upload becomes S3's *current* version while the

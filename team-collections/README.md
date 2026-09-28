@@ -21,6 +21,7 @@ the project's design notes (`Design/CloudTeamCollections/`); comments here that 
 | Local dev users | `supabase/seeds/tc_dev.sql` (run by `supabase db reset`) |
 | Local stack: MinIO compose, function secrets, smoke test, S3 parity check | `team-collections/dev/` (start with its README) |
 | AWS bucket/IAM provisioning for hosted environments | `team-collections/aws/provision-aws.ps1` |
+| Support tool: delete a collection's rows and S3 objects (e.g. a failed migration) | `team-collections/support/delete-collection.ps1` (see `docs/GOING-LIVE.md`, "Deleting a failed migration") |
 | Firebase custom-claim reference code (deployed from BloomLibrary infra) | `team-collections/firebase/` |
 | API contracts, schema overview, go-live runbook | `team-collections/docs/` (`CONTRACTS.md`, `SCHEMA.md`, `GOING-LIVE.md`) |
 

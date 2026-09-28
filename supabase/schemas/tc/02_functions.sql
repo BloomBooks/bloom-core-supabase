@@ -1161,7 +1161,7 @@ $$;
 
 COMMENT ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) IS 'Internal to the collection-files-start edge function. NFC-normalizes/validates the proposed manifest (PT400 InvalidManifest), then optimistic-version gate (PT409 VersionConflict) + manifest diff + transaction open/resume (a resume bumps the transaction''s revision; see collection_files_finish_tx).';
 
-CREATE OR REPLACE FUNCTION tc.create_collection(p_id uuid, p_name text) RETURNS void
+CREATE OR REPLACE FUNCTION tc.create_collection(p_id uuid, p_name text, p_initial_upload boolean DEFAULT false) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 DECLARE
@@ -1175,9 +1175,10 @@ BEGIN
         RAISE EXCEPTION 'unauthenticated' USING ERRCODE = '28000';
     END IF;
 
-    -- Insert collection
-    INSERT INTO tc.collections (id, name, created_by)
-    VALUES (p_id, normalize(p_name, NFC), v_user_id);
+    -- Insert collection. The initial-upload flag can only be set here, at creation, and
+    -- finish_initial_upload clears it for good, so it can never come back on.
+    INSERT INTO tc.collections (id, name, created_by, initial_upload_in_progress)
+    VALUES (p_id, normalize(p_name, NFC), v_user_id, COALESCE(p_initial_upload, false));
 
     -- Insert caller as sole claimed admin
     INSERT INTO tc.members (collection_id, email, role, user_id, added_by, claimed_at)
@@ -1185,7 +1186,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.create_collection(p_id uuid, p_name text) IS 'CONTRACTS.md: create_collection — creates collection + caller as sole claimed admin.';
+COMMENT ON FUNCTION tc.create_collection(p_id uuid, p_name text, p_initial_upload boolean) IS 'CONTRACTS.md: create_collection — creates collection + caller as sole claimed admin. v1.12: p_initial_upload (default false) = true creates it with tc.collections.initial_upload_in_progress set, for an admin who is about to upload an existing collection (sharing it, or migrating a folder Team Collection): my_collections hides it and lock_book_for_legacy_checkout is allowed until finish_initial_upload clears the flag. Creation is the only time the flag can be set.';
 
 CREATE OR REPLACE FUNCTION tc.current_user_email() RETURNS text
     LANGUAGE sql STABLE SECURITY DEFINER
@@ -1324,6 +1325,30 @@ END;
 $$;
 
 COMMENT ON FUNCTION tc.events_realtime_broadcast() IS 'Broadcasts every new event row with realtime.send (Supabase Realtime broadcast from the database) as event "tc_event" on the PRIVATE channel collection:{collection_id}, in the message shape of CONTRACTS.md §Realtime (realtime.send adds its own "id" key). A no-op where the realtime schema is not installed; delivery failures are only warnings.';
+
+CREATE OR REPLACE FUNCTION tc.finish_initial_upload(p_collection_id uuid) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tc.collections WHERE id = p_collection_id) THEN
+        RAISE EXCEPTION 'collection_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    IF NOT tc.is_admin(p_collection_id) THEN
+        RAISE EXCEPTION 'admin_required' USING ERRCODE = '42501';
+    END IF;
+
+    -- One way only: nothing sets the flag again after this (create_collection is the only
+    -- place it is ever set). Clearing an already-clear flag is a no-op, so a retry after a
+    -- lost response succeeds.
+    UPDATE tc.collections
+    SET    initial_upload_in_progress = false
+    WHERE  id = p_collection_id
+      AND  initial_upload_in_progress;
+END;
+$$;
+
+COMMENT ON FUNCTION tc.finish_initial_upload(p_collection_id uuid) IS 'CONTRACTS.md v1.12: finish_initial_upload — admin-only (else 42501 admin_required; unknown collection P0002 collection_not_found). Clears tc.collections.initial_upload_in_progress once the admin''s Bloom has uploaded every book, collection file and placeholder lock, so my_collections lists the collection and lock_book_for_legacy_checkout is refused from then on. One way: nothing can set the flag again. Idempotent (already clear = no-op success). Emits no event; get_collection_state and get_changes report the flag.';
 
 CREATE OR REPLACE FUNCTION tc.force_unlock(p_book_id uuid) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
@@ -1508,12 +1533,15 @@ BEGIN
             SELECT max(id) FROM tc.events
             WHERE collection_id = p_collection_id
               AND id > p_since_event_id
-        )
+        ),
+        -- Clearing the flag emits no event, so a poll reports it every time (v1.12).
+        'initial_upload_in_progress',
+            (SELECT c.initial_upload_in_progress FROM tc.collections c WHERE c.id = p_collection_id)
     );
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash). v1.11: VOLATILE, because it records that the caller has the collection open (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes).';
+COMMENT ON FUNCTION tc.get_changes(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_changes — events + touched book rows since the cursor. Used for polling (60s fallback) and realtime reconnect catch-up. v1.2 (20260707000006): touched book rows also carry locked_by_email/locked_by_name for display. v1.6 (20260713000001): event rows also carry by_display_name (the current durable display name of by_user_id). v1.9: touched book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash). v1.11: VOLATILE, because it records that the caller has the collection open (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress on every call (clearing it emits no event).';
 
 CREATE OR REPLACE FUNCTION tc.get_collection_file_manifest(p_collection_id uuid, p_group_key text) RETURNS jsonb
     LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -1660,12 +1688,14 @@ BEGIN
     RETURN jsonb_build_object(
         'books',        COALESCE(v_books,  '[]'::jsonb),
         'groups',       COALESCE(v_groups, '[]'::jsonb),
-        'max_event_id', v_max_event_id
+        'max_event_id', v_max_event_id,
+        'initial_upload_in_progress',
+            (SELECT c.initial_upload_in_progress FROM tc.collections c WHERE c.id = p_collection_id)
     );
 END;
 $$;
 
-COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current). v1.11: VOLATILE, because it records that the caller opened the collection (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes).';
+COMMENT ON FUNCTION tc.get_collection_state(p_collection_id uuid, p_since_event_id bigint) IS 'CONTRACTS.md: get_collection_state — full/delta snapshot of book rows + group versions + max_event_id. since_event_id = NULL → full; otherwise delta. v1.2 (20260707000006): book rows also carry locked_by_email/locked_by_name for display. v1.9: book rows also carry checkoutGuidHash (tc.books.checkout_guid_hash, so a client can tell whether its .checkout file is current). v1.11: VOLATILE, because it records that the caller opened the collection (tc._touch_member sets their tc.members.last_seen_at, at most once per 10 minutes). v1.12: also returns initial_upload_in_progress (tc.collections.initial_upload_in_progress), so the uploading admin''s other machines can show that the upload has not finished.';
 
 CREATE OR REPLACE FUNCTION tc.is_admin(p_collection_id uuid) RETURNS boolean
     LANGUAGE sql STABLE SECURITY DEFINER
@@ -1836,6 +1866,124 @@ COMMENT ON FUNCTION tc.stale_upload_key_state(p_s3_key text) IS 'For the sweep-s
 
 COMMENT ON FUNCTION tc.list_stale_upload_garbage() IS 'The whole, unpaged worklist behind the sweep-stale-uploads edge function (which reads it a page at a time through tc.list_stale_upload_keys, and one key at a time through tc.stale_upload_key_state): per-file S3 keys touched by DEAD (aborted/expired) check-in transactions, with the currently-referenced s3_version_id as the delete-newer-than watermark (NULL = nothing references the key). Excludes paths a live transaction is still uploading. service-role only. See GOING-LIVE.md "Orphaned-upload sweep".';
 
+CREATE OR REPLACE FUNCTION tc.lock_book_for_legacy_checkout(p_book_id uuid, p_legacy_email text, p_checkout_guid text, p_machine text) RETURNS jsonb
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+DECLARE
+    v_user_id    text;
+    v_holder     text;
+    v_guid_hash  text;
+    v_uploading  boolean;
+    v_updated    integer;   -- row count from the conditional UPDATE (0 or 1)
+    v_row        tc.books%ROWTYPE;
+BEGIN
+    v_user_id := tc.current_user_id();
+
+    -- As in checkout_book, the admin's client writes the GUID (here into the old shared
+    -- folder's Migration Keys file) before asking, so a lost response can be retried.
+    IF p_checkout_guid IS NULL OR btrim(p_checkout_guid) = '' THEN
+        RAISE EXCEPTION 'invalid_checkout_guid: a checkout GUID is required' USING ERRCODE = '22023';
+    END IF;
+    IF p_legacy_email IS NULL OR btrim(p_legacy_email) = '' THEN
+        RAISE EXCEPTION 'invalid_legacy_email: the old checkout''s email is required' USING ERRCODE = '22023';
+    END IF;
+    v_guid_hash := tc._checkout_guid_hash(p_checkout_guid);
+    -- Normalized like tc.members.email (members_add), so it displays as the old email does.
+    v_holder := 'legacy:' || lower(normalize(btrim(p_legacy_email), NFC));
+
+    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'book_not_found' USING ERRCODE = 'P0002';
+    END IF;
+
+    IF NOT tc.is_admin(v_row.collection_id) THEN
+        RAISE EXCEPTION 'admin_required' USING ERRCODE = '42501';
+    END IF;
+
+    SELECT c.initial_upload_in_progress INTO v_uploading
+    FROM tc.collections c WHERE c.id = v_row.collection_id;
+
+    IF NOT v_uploading THEN
+        RAISE EXCEPTION 'initial_upload_not_in_progress: placeholder locks are only possible during a collection''s initial upload'
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    -- The book must already be uploaded: a placeholder holder can only take it over, never
+    -- make its first check-in.
+    IF v_row.current_version_id IS NULL THEN
+        RAISE EXCEPTION 'book_not_committed: upload the book before locking it'
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    -- Race-free conditional UPDATE, as in checkout_book: only a FREE live book.
+    UPDATE tc.books
+    SET    locked_by          = v_holder,
+           locked_by_machine  = p_machine,
+           locked_at          = now(),
+           checkout_guid_hash = v_guid_hash
+    WHERE  id = p_book_id
+      AND  deleted_at IS NULL
+      AND  current_version_id IS NOT NULL
+      AND  locked_by IS NULL;
+
+    GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+    SELECT * INTO v_row FROM tc.books WHERE id = p_book_id;
+
+    IF v_updated > 0 THEN
+        -- CheckOut (type = 0), as checkout_book emits. The actor is the admin who placed the
+        -- lock (events record who did something, and by_user_id must be a real caller);
+        -- lock_info names the placeholder holder the book was locked to.
+        INSERT INTO tc.events (
+            collection_id, book_id, type,
+            by_user_id, by_user_name, by_email,
+            lock_info, book_name, message
+        )
+        VALUES (
+            v_row.collection_id, p_book_id, 0,
+            v_user_id, (auth.jwt() ->> 'name'), tc.current_user_email(),
+            jsonb_build_object(
+                'locked_by', v_holder,
+                'machine',   p_machine,
+                'locked_at', v_row.locked_at
+            ),
+            v_row.name,
+            'checked out in the old Team Collection'
+        );
+
+        RETURN jsonb_build_object(
+            'success',           true,
+            'locked_by',         v_row.locked_by,
+            'locked_by_machine', v_row.locked_by_machine,
+            'locked_at',         v_row.locked_at
+        );
+    ELSIF v_row.locked_by = v_holder
+          AND v_row.deleted_at IS NULL
+          AND v_row.checkout_guid_hash = v_guid_hash THEN
+        -- A retry (e.g. resuming after a crash, or a lost response): the same success, with
+        -- nothing changed and no second event.
+        RETURN jsonb_build_object(
+            'success',           true,
+            'locked_by',         v_row.locked_by,
+            'locked_by_machine', v_row.locked_by_machine,
+            'locked_at',         v_row.locked_at
+        );
+    ELSE
+        -- Locked by anyone else, to this placeholder under another GUID, or deleted: nothing
+        -- changes. Same shape as checkout_book's refusal.
+        RETURN jsonb_build_object(
+            'success',           false,
+            'locked_by',         v_row.locked_by,
+            'locked_by_machine', v_row.locked_by_machine,
+            'locked_at',         v_row.locked_at
+        );
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION tc.lock_book_for_legacy_checkout(p_book_id uuid, p_legacy_email text, p_checkout_guid text, p_machine text) IS 'CONTRACTS.md v1.12: lock_book_for_legacy_checkout — during a collection''s initial upload (migrating a folder Team Collection), locks a book that is checked out to someone in the old system to a PLACEHOLDER holder: tc.books.locked_by = ''legacy:'' || lower(NFC(trim(p_legacy_email))), with checkout_guid_hash = tc._checkout_guid_hash(p_checkout_guid) (the GUID the admin''s client first wrote into the old shared folder''s Migration Keys file) and locked_by_machine = p_machine (the old machine). Admin-only (42501 admin_required); only while tc.collections.initial_upload_in_progress is set (else P0001 initial_upload_not_in_progress); only for a committed book (else P0001 book_not_committed); NULL/blank GUID or email ⇒ 22023. A free live book is locked and a CheckOut event (type=0) is emitted with the ADMIN as its actor (by_user_id/by_email) and the placeholder in lock_info.locked_by. The same placeholder with the same GUID again succeeds with no change and no event (resume/retry). Anything else locked, or a deleted book, returns {success: false, locked_by, locked_by_machine, locked_at} and changes nothing, as checkout_book does. No account can hold or match a placeholder (members_user_id_not_placeholder), so the lock ends only by checkout_book_takeover with the GUID (which moves it to the caller and keeps the GUID) or force_unlock.';
+
 CREATE OR REPLACE FUNCTION tc.log_event(p_collection_id uuid, p_book_id uuid DEFAULT NULL::uuid, p_type integer DEFAULT NULL::integer, p_message text DEFAULT NULL::text, p_book_name text DEFAULT NULL::text, p_bloom_version text DEFAULT NULL::text) RETURNS bigint
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
@@ -1918,6 +2066,12 @@ BEGIN
     -- soon-to-be-gone admin and both slip through to zero admins.
     PERFORM 1 FROM tc.collections WHERE id = v_collection_id FOR UPDATE;
 
+    -- The collection itself is being deleted (its members go with it by cascade, as in
+    -- support_delete_collection): there is nothing left to orphan.
+    IF NOT FOUND THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
     SELECT count(*) INTO admin_count
     FROM tc.members
     WHERE collection_id = v_collection_id
@@ -1934,7 +2088,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.members_last_admin_guard() IS 'Trigger function: prevents deleting or demoting the last admin of a collection. Locks the parent collection row (FOR UPDATE) before counting so concurrent admin removals/demotions serialize instead of racing to zero admins (fixed 20260717000001).';
+COMMENT ON FUNCTION tc.members_last_admin_guard() IS 'Trigger function: prevents deleting or demoting the last admin of a collection. Locks the parent collection row (FOR UPDATE) before counting so concurrent admin removals/demotions serialize instead of racing to zero admins (fixed 20260717000001). Allows the delete when the collection row is already gone, i.e. the members are being removed by the cascade from deleting the collection (support_delete_collection, v1.12).';
 
 CREATE OR REPLACE FUNCTION tc.members_list(p_collection_id uuid) RETURNS TABLE(id bigint, email text, display_name text, role tc.member_role, user_id text, added_by text, added_at timestamp with time zone, claimed_at timestamp with time zone, last_seen_at timestamp with time zone)
     LANGUAGE sql STABLE SECURITY DEFINER
@@ -2099,10 +2253,12 @@ CREATE OR REPLACE FUNCTION tc.my_collections() RETURNS TABLE(id uuid, name text,
     JOIN tc.members m
         ON m.collection_id = c.id
        AND lower(m.email)  = tc.current_user_email()
+    -- A collection still being uploaded is not joinable yet (v1.12), even by its admin.
+    WHERE NOT c.initial_upload_in_progress
     ORDER BY c.name
 $$;
 
-COMMENT ON FUNCTION tc.my_collections() IS 'CONTRACTS.md: my_collections — returns collections where the caller''s email is approved (claimed or not).';
+COMMENT ON FUNCTION tc.my_collections() IS 'CONTRACTS.md: my_collections — returns collections where the caller''s email is approved (claimed or not). v1.12: leaves out collections whose initial upload is still in progress (tc.collections.initial_upload_in_progress), for everyone, the uploading admin included, so nobody joins a half-uploaded collection; they appear once finish_initial_upload clears the flag.';
 
 CREATE OR REPLACE FUNCTION tc.nfc_normalize_book_name() RETURNS trigger
     LANGUAGE plpgsql
@@ -2193,27 +2349,89 @@ COMMENT ON FUNCTION tc.rename_check(p_book_id uuid, p_new_name text) IS 'CONTRAC
 CREATE OR REPLACE FUNCTION tc.resolve_member_display(p_collection_id uuid, p_user_id text, OUT email text, OUT display_name text) RETURNS record
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-    SELECT
-        m.email,
-        COALESCE(
-            m.display_name,
-            (
-                SELECT e.by_user_name
-                FROM tc.events e
-                WHERE e.collection_id = p_collection_id
-                  AND e.by_user_id     = p_user_id
-                  AND e.by_user_name IS NOT NULL
-                ORDER BY e.id DESC
-                LIMIT 1
-            )
-        )
-    FROM tc.members m
-    WHERE m.collection_id = p_collection_id
-      AND m.user_id        = p_user_id
+    SELECT r.email, r.display_name
+    FROM (
+        SELECT
+            m.email,
+            COALESCE(
+                m.display_name,
+                (
+                    SELECT e.by_user_name
+                    FROM tc.events e
+                    WHERE e.collection_id = p_collection_id
+                      AND e.by_user_id     = p_user_id
+                      AND e.by_user_name IS NOT NULL
+                    ORDER BY e.id DESC
+                    LIMIT 1
+                )
+            ) AS display_name,
+            0 AS rank
+        FROM tc.members m
+        WHERE m.collection_id = p_collection_id
+          AND m.user_id        = p_user_id
+        UNION ALL
+        -- A placeholder holder (v1.12) is no member: show the old email it carries.
+        SELECT substr(p_user_id, 8), NULL::text, 1
+        WHERE p_user_id LIKE 'legacy:%'
+    ) r
+    ORDER BY r.rank
     LIMIT 1;
 $$;
 
-COMMENT ON FUNCTION tc.resolve_member_display(p_collection_id uuid, p_user_id text, OUT email text, OUT display_name text) IS 'Best-effort resolution of a locked_by/created_by user_id to a display email (from tc.members, authoritative) and display name. v1.6 (20260713000001): prefers the durable tc.members.display_name; falls back to the most recent tc.events.by_user_name JWT-claim capture (often NULL in dev-auth mode). Returns an all-NULL row (never an error) when p_user_id is NULL or unknown.';
+COMMENT ON FUNCTION tc.resolve_member_display(p_collection_id uuid, p_user_id text, OUT email text, OUT display_name text) IS 'Best-effort resolution of a locked_by/created_by user_id to a display email (from tc.members, authoritative) and display name. v1.6 (20260713000001): prefers the durable tc.members.display_name; falls back to the most recent tc.events.by_user_name JWT-claim capture (often NULL in dev-auth mode). Returns an all-NULL row (never an error) when p_user_id is NULL or unknown. v1.12: a placeholder holder ''legacy:<email>'' (lock_book_for_legacy_checkout) resolves to email = <email> and display_name = NULL, so the book shows as checked out to the old email.';
+
+CREATE OR REPLACE FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean DEFAULT false) RETURNS jsonb
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+DECLARE
+    v_name   text;
+    v_counts jsonb;
+BEGIN
+    IF p_collection_id IS NULL THEN
+        RAISE EXCEPTION 'support_delete_collection: collection id required' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT c.name INTO v_name FROM tc.collections c WHERE c.id = p_collection_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        -- Already gone (e.g. a re-run to finish the S3 part): nothing to do.
+        RETURN jsonb_build_object('collectionId', p_collection_id, 'found', false,
+                                  'deleted', false);
+    END IF;
+
+    SELECT jsonb_build_object(
+        'members',                      (SELECT count(*) FROM tc.members WHERE collection_id = p_collection_id),
+        'books',                        (SELECT count(*) FROM tc.books WHERE collection_id = p_collection_id),
+        'versions',                     (SELECT count(*) FROM tc.versions v JOIN tc.books b ON b.id = v.book_id WHERE b.collection_id = p_collection_id),
+        'version_files',                (SELECT count(*) FROM tc.version_files f JOIN tc.books b ON b.id = f.book_id WHERE b.collection_id = p_collection_id),
+        'checkin_transactions',         (SELECT count(*) FROM tc.checkin_transactions WHERE collection_id = p_collection_id),
+        'collection_file_groups',       (SELECT count(*) FROM tc.collection_file_groups WHERE collection_id = p_collection_id),
+        'collection_group_files',       (SELECT count(*) FROM tc.collection_group_files f JOIN tc.collection_file_groups g ON g.id = f.group_id WHERE g.collection_id = p_collection_id),
+        'collection_file_transactions', (SELECT count(*) FROM tc.collection_file_transactions WHERE collection_id = p_collection_id),
+        'color_palette_entries',        (SELECT count(*) FROM tc.color_palette_entries WHERE collection_id = p_collection_id),
+        'events',                       (SELECT count(*) FROM tc.events WHERE collection_id = p_collection_id)
+    ) INTO v_counts;
+
+    IF NOT p_dry_run THEN
+        -- The transactions reference versions without ON DELETE CASCADE, so they go first;
+        -- everything else goes with the collection row by ON DELETE CASCADE (the last-admin
+        -- guard lets the members go once the collection row is gone).
+        DELETE FROM tc.checkin_transactions WHERE collection_id = p_collection_id;
+        DELETE FROM tc.collection_file_transactions WHERE collection_id = p_collection_id;
+        DELETE FROM tc.collections WHERE id = p_collection_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'collectionId', p_collection_id,
+        'name',         v_name,
+        'found',        true,
+        'deleted',      NOT p_dry_run,
+        'rows',         v_counts
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) IS 'Support tool (v1.12), SERVICE-ROLE only: permanently deletes a collection and every tc row that belongs to it (members, books, versions, version_files, both transaction tables, collection file groups and their files, palette entries, events), e.g. a cloud collection whose initial upload failed. Returns {collectionId, name, found, deleted, rows: {<table>: count}}; p_dry_run = true only counts. An unknown id returns found = false, so a re-run is harmless. Does NOT touch S3: team-collections/support/delete-collection.ps1 calls this and then deletes the tc/{collectionId}/ prefix. See GOING-LIVE.md "Deleting a failed migration".';
 
 CREATE OR REPLACE FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER

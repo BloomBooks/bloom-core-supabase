@@ -24,6 +24,8 @@ COMMENT ON COLUMN tc.books.name IS 'NFC-normalized on write by the nfc_normalize
 
 COMMENT ON COLUMN tc.books.deleted_at IS 'Soft tombstone: non-NULL = deleted. Tombstoned names are reusable (excluded from the live-name uniqueness index).';
 
+COMMENT ON COLUMN tc.books.locked_by IS 'User id (JWT sub) of the lock holder; NULL = not checked out. No foreign key. v1.12: may also be a placeholder holder ''legacy:<email>'' (lowercased, trimmed, NFC), set by lock_book_for_legacy_checkout during a collection''s initial upload for a book checked out to <email> in the old folder Team Collection; no account id has that form (members_user_id_not_placeholder), so only checkout_book_takeover (with the GUID) or force_unlock ends it, and resolve_member_display shows <email>.';
+
 COMMENT ON COLUMN tc.books.locked_by_machine IS 'Name of the machine the lock was taken from. Display only: it grants nothing (the checkout GUID decides which local copy may check in).';
 
 COMMENT ON COLUMN tc.books.checkout_guid_hash IS 'Lowercase hex SHA-256 of the UTF-8 bytes of the current checkout GUID (canonical lowercase form), i.e. tc._checkout_guid_hash(guid). The GUID itself is never stored: the client that checks the book out makes it (v1.10), keeps it in the book folder''s .checkout file and sends it to checkout_book. NULL while locked = a send-only lock that checkin-start took for a first check-in or a check-in of a free book (released when that check-in finishes, aborts or expires). Check-in, unlock and delete by the holder, and takeover by another account, all require the GUID. Readable by members (a hash of 122 random bits cannot be reversed) and returned as checkoutGuidHash by get_collection_state/get_changes so a client can tell whether its local .checkout is still current. NULL = unlocked. Cleared by the books_clear_checkout_on_unlock trigger whenever the lock is released or changes hands without a new GUID.';
@@ -131,7 +133,8 @@ CREATE TABLE IF NOT EXISTS tc.collections (
     id uuid NOT NULL,
     name text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    created_by text NOT NULL
+    created_by text NOT NULL,
+    initial_upload_in_progress boolean DEFAULT false NOT NULL
 );
 
 COMMENT ON TABLE tc.collections IS 'One row per cloud Team Collection. id = Bloom CollectionId GUID.';
@@ -139,6 +142,8 @@ COMMENT ON TABLE tc.collections IS 'One row per cloud Team Collection. id = Bloo
 COMMENT ON COLUMN tc.collections.id IS 'The collection UUID — same value as in TeamCollectionLink.txt (cloud://sil.bloom/collection/<id>).';
 
 COMMENT ON COLUMN tc.collections.created_by IS 'TEXT user id (Firebase UID or GoTrue UUID) of the creator.';
+
+COMMENT ON COLUMN tc.collections.initial_upload_in_progress IS 'v1.12: TRUE while the admin who started the collection (sharing an ordinary collection or migrating a folder Team Collection) is still uploading its books and collection files. Set only at creation (create_collection with p_initial_upload = true) and cleared, once and for good, by finish_initial_upload. While it is set my_collections leaves the collection out (so invitees cannot join a half-uploaded collection) and lock_book_for_legacy_checkout may lock books to placeholder holders. Returned by get_collection_state and get_changes as initial_upload_in_progress.';
 
 CREATE TABLE IF NOT EXISTS tc.color_palette_entries (
     id bigint NOT NULL,
@@ -199,12 +204,15 @@ CREATE TABLE IF NOT EXISTS tc.members (
     added_at timestamp with time zone DEFAULT now() NOT NULL,
     claimed_at timestamp with time zone,
     display_name text,
-    last_seen_at timestamp with time zone
+    last_seen_at timestamp with time zone,
+    CONSTRAINT members_user_id_not_placeholder CHECK ((user_id !~~ 'legacy:%'::text))
 );
 
 COMMENT ON TABLE tc.members IS 'Approved-accounts table. Unclaimed rows (user_id IS NULL) are pending until the account holder signs in and calls claim_memberships(). email is stored lowercase + NFC-normalised.';
 
 COMMENT ON COLUMN tc.members.user_id IS 'NULL until the account holder claims the seat. TEXT covers both Firebase UIDs and local-GoTrue UUIDs.';
+
+COMMENT ON CONSTRAINT members_user_id_not_placeholder ON tc.members IS 'v1.12: no member''s user id starts with ''legacy:'', the prefix of the placeholder lock holders lock_book_for_legacy_checkout creates (tc.books.locked_by = ''legacy:<email>''). Real account ids never do (GoTrue ids are UUIDs; Firebase''s generated UIDs are 28 letters and digits), and since every lock-holder check also requires the caller to be a claimed member, this guarantees no caller can ever match a placeholder holder: only takeover (by GUID) and force_unlock can end such a lock.';
 
 COMMENT ON COLUMN tc.members.display_name IS 'Human-readable name shown in place of the email wherever the member is displayed (checkout status, history, sharing panel). NULL = none set; display falls back to email. Set via tc.members_set_display_name (admin, or the claimed member themselves).';
 

@@ -35,13 +35,14 @@ erDiagram
         text name
         text created_by "user_id"
         timestamptz created_at
+        boolean initial_upload_in_progress "v1.12; set only at creation"
     }
     members {
         bigint id PK
         uuid collection_id FK
         text email "lowercased, NFC"
         member_role role "admin | member"
-        text user_id "NULL until claimed"
+        text user_id "NULL until claimed; never legacy:*"
         text display_name "v1.6; NULL falls back to email"
         text added_by
         timestamptz claimed_at
@@ -55,7 +56,7 @@ erDiagram
         uuid current_version_id "soft FK to versions"
         bigint current_version_seq "denormalized"
         text current_checksum
-        text locked_by "NULL = not checked out"
+        text locked_by "NULL = not checked out; user id or legacy:email"
         text locked_by_machine "display only"
         text checkout_guid_hash "v1.9; hex SHA-256 of the checkout GUID; member-readable"
         timestamptz locked_at
@@ -198,6 +199,18 @@ erDiagram
   per membership: `get_collection_state` and `get_changes` set the caller's own row to now() unless
   it is already less than 10 minutes old, so a polling client writes it about once per 10 minutes.
   NULL means never seen (invited only). The Share dialog shows it as "Last seen"; it emits no event.
+- **`collections.initial_upload_in_progress`** (v1.12) is TRUE while the admin who started the
+  collection is still uploading it (sharing an ordinary collection or migrating a folder Team
+  Collection). Only `create_collection(..., initial_upload: true)` sets it and
+  `finish_initial_upload` clears it for good; meanwhile `my_collections` leaves the collection out
+  and placeholder locks may be placed.
+- **Placeholder lock holders** (v1.12). `books.locked_by` is plain text with no foreign key: a user
+  id (JWT `sub`), or a placeholder `legacy:<email>` (lowercased, trimmed, NFC) for a book that was
+  checked out to `<email>` in the old folder Team Collection when it was migrated
+  (`lock_book_for_legacy_checkout`). No account has such an id (the
+  `members_user_id_not_placeholder` CHECK keeps `legacy:` ids out of `members.user_id`, and every
+  holder check also requires a claimed membership), so only `checkout_book_takeover` with the GUID
+  or `force_unlock` ends it; `resolve_member_display` shows the email.
 - **`events`** is the append-only history log behind the History panel and realtime broadcasts;
   `type` is the numeric `BookHistoryEventType`. `book_id` is nullable (`ON DELETE SET NULL`) so a
   book's history survives its deletion.

@@ -71,7 +71,8 @@ CREATE POLICY versions_select ON tc.versions FOR SELECT USING (tc.is_member(coll
 GRANT USAGE ON SCHEMA tc TO authenticated;
 
 -- The service role calls only the service-role-only SECURITY DEFINER functions below
--- (finish RPCs, sweep worklist/re-check, support_set_admin); it needs the schema.
+-- (finish RPCs, sweep worklist/re-check, support_set_admin, support_delete_collection); it
+-- needs the schema.
 GRANT USAGE ON SCHEMA tc TO service_role;
 
 -- Internal: only get_collection_state and get_changes (SECURITY DEFINER) call it.
@@ -103,7 +104,7 @@ GRANT ALL ON FUNCTION tc.collection_files_finish_tx(p_transaction_id uuid, p_use
 
 GRANT ALL ON FUNCTION tc.collection_files_start_tx(p_collection_id uuid, p_group_key text, p_expected_version bigint, p_files jsonb) TO authenticated;
 
-GRANT ALL ON FUNCTION tc.create_collection(p_id uuid, p_name text) TO authenticated;
+GRANT ALL ON FUNCTION tc.create_collection(p_id uuid, p_name text, p_initial_upload boolean) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.current_caller() TO authenticated;
 
@@ -111,6 +112,7 @@ GRANT ALL ON FUNCTION tc.delete_book(p_book_id uuid, p_checkout_guid text) TO au
 
 GRANT ALL ON FUNCTION tc.download_start_check(p_collection_id uuid) TO authenticated;
 
+GRANT ALL ON FUNCTION tc.finish_initial_upload(p_collection_id uuid) TO authenticated;
 GRANT ALL ON FUNCTION tc.force_unlock(p_book_id uuid) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.get_book_manifest(p_book_id uuid) TO authenticated;
@@ -130,6 +132,7 @@ GRANT ALL ON FUNCTION tc.list_stale_upload_keys(p_after_key text, p_limit intege
 REVOKE ALL ON FUNCTION tc.stale_upload_key_state(p_s3_key text) FROM PUBLIC;
 GRANT ALL ON FUNCTION tc.stale_upload_key_state(p_s3_key text) TO service_role;
 
+GRANT ALL ON FUNCTION tc.lock_book_for_legacy_checkout(p_book_id uuid, p_legacy_email text, p_checkout_guid text, p_machine text) TO authenticated;
 GRANT ALL ON FUNCTION tc.log_event(p_collection_id uuid, p_book_id uuid, p_type integer, p_message text, p_book_name text, p_bloom_version text) TO authenticated;
 
 GRANT ALL ON FUNCTION tc.members_add(p_collection_id uuid, p_email text, p_role tc.member_role) TO authenticated;
@@ -150,6 +153,9 @@ GRANT ALL ON FUNCTION tc.rename_check(p_book_id uuid, p_new_name text) TO authen
 
 GRANT ALL ON FUNCTION tc.resolve_member_display(p_collection_id uuid, p_user_id text, OUT email text, OUT display_name text) TO authenticated;
 
+-- Deletes a whole collection's rows: the Bloom team's support tool, never a client's.
+REVOKE ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) TO service_role;
 REVOKE ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) FROM PUBLIC;
 GRANT ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) TO service_role;
 
