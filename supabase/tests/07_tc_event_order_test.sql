@@ -1,6 +1,6 @@
 -- =============================================================================
 -- pgTAP tests: event ids and the polling cursor. An event's id is drawn from
--- tc.events_id_seq by the events_assign_id_tg trigger while the event's transaction holds
+-- tc.history_events_id_seq by the history_events_assign_id_tg trigger while the event's transaction holds
 -- its collection's event-order advisory lock SHARED (until commit); get_changes and
 -- get_collection_state take that lock EXCLUSIVE before reading. So a cursor they return
 -- (max_event_id) never passes an event whose transaction commits later. The concurrency
@@ -61,12 +61,22 @@ AS $$
     )
 $$;
 
+INSERT INTO core.users (authentication_id, email) VALUES ('user-alice-eo', 'alice-eo@example.com');
+
+-- Alice's core.users id.
+CREATE OR REPLACE FUNCTION tests.alice()
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT id FROM core.users WHERE authentication_id = 'user-alice-eo'
+$$;
+
 INSERT INTO tc.collections (id, name, created_by) VALUES
-    ('c0000000-0000-0000-0000-0000000f0001', 'Event Order One', 'user-alice-eo'),
-    ('c0000000-0000-0000-0000-0000000f0002', 'Event Order Two', 'user-alice-eo');
+    ('c0000000-0000-0000-0000-0000000f0001', 'Event Order One', tests.alice()),
+    ('c0000000-0000-0000-0000-0000000f0002', 'Event Order Two', tests.alice());
 INSERT INTO tc.members (collection_id, email, role, user_id, added_by, claimed_at) VALUES
-    ('c0000000-0000-0000-0000-0000000f0001', 'alice-eo@example.com', 'admin', 'user-alice-eo', 'user-alice-eo', now()),
-    ('c0000000-0000-0000-0000-0000000f0002', 'alice-eo@example.com', 'admin', 'user-alice-eo', 'user-alice-eo', now());
+    ('c0000000-0000-0000-0000-0000000f0001', 'alice-eo@example.com', 'admin', tests.alice(), tests.alice(), now()),
+    ('c0000000-0000-0000-0000-0000000f0002', 'alice-eo@example.com', 'admin', tests.alice(), tests.alice(), now());
 
 -- -----------------------------------------------------------------------------
 -- 1. The id column: no identity/default (it would be drawn before the lock), a trigger.
@@ -74,13 +84,13 @@ INSERT INTO tc.members (collection_id, email, role, user_id, added_by, claimed_a
 
 SELECT is(
     (SELECT attidentity::text FROM pg_attribute
-     WHERE attrelid = 'tc.events'::regclass AND attname = 'id'),
+     WHERE attrelid = 'tc.history_events'::regclass AND attname = 'id'),
     '',
-    '1a: tc.events.id is not an identity column');
+    '1a: tc.history_events.id is not an identity column');
 
-SELECT col_hasnt_default('tc', 'events', 'id', '1b: tc.events.id has no default');
+SELECT col_hasnt_default('tc', 'history_events', 'id', '1b: tc.history_events.id has no default');
 
-SELECT has_trigger('tc', 'events', 'events_assign_id_tg', '1c: events_assign_id_tg exists');
+SELECT has_trigger('tc', 'history_events', 'history_events_assign_id_tg', '1c: history_events_assign_id_tg exists');
 
 -- -----------------------------------------------------------------------------
 -- 2. Inserting events
@@ -98,20 +108,20 @@ SELECT ok(
     '2b: before any event insert, neither collection''s lock is held');
 
 SELECT throws_ok(
-    $$INSERT INTO tc.events (id, collection_id, type, by_user_id)
-      VALUES (999999999, 'c0000000-0000-0000-0000-0000000f0001', 100, 'user-alice-eo')$$,
+    $$INSERT INTO tc.history_events (id, collection_id, type, by_user_id)
+      VALUES (999999999, 'c0000000-0000-0000-0000-0000000f0001', 100, tests.alice())$$,
     '428C9',
     NULL,
     '2c: an explicitly supplied event id is refused');
 
 SELECT is(
-    (SELECT count(*)::int FROM tc.events WHERE id = 999999999),
+    (SELECT count(*)::int FROM tc.history_events WHERE id = 999999999),
     0,
     '2d: and no event with that id exists');
 
 WITH e1 AS (
-    INSERT INTO tc.events (collection_id, type, by_user_id, message)
-    VALUES ('c0000000-0000-0000-0000-0000000f0001', 100, 'user-alice-eo', 'eo-1')
+    INSERT INTO tc.history_events (collection_id, type, by_user_id, message)
+    VALUES ('c0000000-0000-0000-0000-0000000f0001', 100, tests.alice(), 'eo-1')
     RETURNING id
 )
 SELECT set_config('tests.eo1', (SELECT id FROM e1)::text, true);
@@ -122,15 +132,15 @@ SELECT ok(
     '2e: an event insert holds its own collection''s lock SHARED (and no other''s)');
 
 WITH e2 AS (
-    INSERT INTO tc.events (collection_id, type, by_user_id, message)
-    VALUES ('c0000000-0000-0000-0000-0000000f0002', 100, 'user-alice-eo', 'eo-2')
+    INSERT INTO tc.history_events (collection_id, type, by_user_id, message)
+    VALUES ('c0000000-0000-0000-0000-0000000f0002', 100, tests.alice(), 'eo-2')
     RETURNING id
 )
 SELECT set_config('tests.eo2', (SELECT id FROM e2)::text, true);
 
 WITH e3 AS (
-    INSERT INTO tc.events (collection_id, type, by_user_id, message)
-    VALUES ('c0000000-0000-0000-0000-0000000f0001', 100, 'user-alice-eo', 'eo-3')
+    INSERT INTO tc.history_events (collection_id, type, by_user_id, message)
+    VALUES ('c0000000-0000-0000-0000-0000000f0001', 100, tests.alice(), 'eo-3')
     RETURNING id
 )
 SELECT set_config('tests.eo3', (SELECT id FROM e3)::text, true);
@@ -141,9 +151,9 @@ SELECT ok(
     '2f: the trigger assigns increasing ids, across collections');
 
 SELECT is(
-    (SELECT last_value FROM tc.events_id_seq),
+    (SELECT last_value FROM tc.history_events_id_seq),
     current_setting('tests.eo3')::bigint,
-    '2g: the ids come from tc.events_id_seq, one per event');
+    '2g: the ids come from tc.history_events_id_seq, one per event');
 
 -- -----------------------------------------------------------------------------
 -- 3. Cursor readers take the lock exclusive

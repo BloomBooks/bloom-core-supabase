@@ -1,5 +1,5 @@
 -- =============================================================================
--- pgTAP tests: tc.members.last_seen_at (CONTRACTS.md v1.11, BL-16673)
+-- pgTAP tests: tc.members.last_seen_at (BL-16673)
 -- get_collection_state and get_changes set the caller's own last_seen_at in that
 -- collection, at most once per 10 minutes; members_list returns it.
 -- =============================================================================
@@ -117,7 +117,7 @@ SELECT is(tests.seen('c0000000-0000-0000-0000-00000000e001', 'carol-ls@example.c
 
 -- Events before any touch, to check the touches emit none.
 SELECT set_config('tests.events_before',
-    (SELECT count(*)::text FROM tc.events
+    (SELECT count(*)::text FROM tc.history_events
      WHERE collection_id IN ('c0000000-0000-0000-0000-00000000e001', 'c0000000-0000-0000-0000-00000000e002')),
     true);
 
@@ -223,10 +223,10 @@ SELECT is(
 );
 
 SELECT is(
-    (SELECT count(*)::text FROM tc.events
+    (SELECT count(*)::text FROM tc.history_events
      WHERE collection_id IN ('c0000000-0000-0000-0000-00000000e001', 'c0000000-0000-0000-0000-00000000e002')),
     current_setting('tests.events_before'),
-    '4f: touching last_seen_at emitted no tc.events'
+    '4f: touching last_seen_at emitted no tc.history_events'
 );
 
 -- =============================================================================

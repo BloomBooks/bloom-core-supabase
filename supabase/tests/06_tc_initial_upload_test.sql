@@ -1,10 +1,11 @@
 -- =============================================================================
--- pgTAP tests: starting a cloud collection (CONTRACTS.md v1.12). An admin creates the
--- collection with its initial-upload flag set, uploads it, locks books that are checked out
--- to people in the old folder Team Collection to placeholder holders 'legacy:<email>'
--- (lock_book_for_legacy_checkout), then clears the flag (finish_initial_upload). While the
--- flag is set my_collections hides the collection. A placeholder lock ends only by
--- checkout_book_takeover with its GUID or by force_unlock. support_delete_collection removes
+-- pgTAP tests: starting a cloud collection. An admin creates the collection with its
+-- initial-upload flag set, uploads it, locks books that are checked out to people in the old
+-- folder Team Collection to the user with that checkout's email, an unclaimed user if nobody
+-- has it yet (lock_book_for_legacy_checkout), then clears the flag (finish_initial_upload).
+-- While the flag is set my_collections hides the collection. Nobody can sign in as an
+-- unclaimed user, so such a lock ends by claiming (03_tc_users_test.sql), by
+-- checkout_book_takeover with its GUID, or by force_unlock. support_delete_collection removes
 -- a failed attempt's rows.
 -- =============================================================================
 -- Run against a local Supabase stack:
@@ -50,57 +51,76 @@ AS $$
     SELECT encode(sha256(convert_to(lower(p_guid), 'UTF8')), 'hex')
 $$;
 
--- Setup helper: a book, committed (with one version and one file) unless p_committed is false.
+-- Setup helper: a book, committed (version 1, one file) unless p_committed is false. Its
+-- instance id is its id with the first character replaced by 'a'.
 CREATE OR REPLACE FUNCTION tests.add_book(p_id uuid, p_collection uuid, p_name text,
                                           p_committed boolean DEFAULT true,
                                           p_deleted boolean DEFAULT false)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    v_version uuid := gen_random_uuid();
 BEGIN
-    INSERT INTO tc.books (id, collection_id, instance_id, name, created_by, deleted_at)
-    VALUES (p_id, p_collection, gen_random_uuid(), p_name, 'user-alice-iu',
+    INSERT INTO tc.books (id, collection_id, instance_id, name, deleted_at)
+    VALUES (p_id, p_collection, ('a' || substr(p_id::text, 2))::uuid, p_name,
             CASE WHEN p_deleted THEN now() END);
     IF p_committed THEN
-        INSERT INTO tc.versions (id, book_id, collection_id, seq, checksum, created_by)
-        VALUES (v_version, p_id, p_collection, 1, 'cs-' || p_name, 'user-alice-iu');
-        INSERT INTO tc.version_files (book_id, version_id, path, sha256, size_bytes, s3_version_id)
-        VALUES (p_id, v_version, p_name || '.htm', 'sha-' || p_name, 10, 'v1');
+        INSERT INTO tc.book_files (book_id, path, sha256, size_bytes, s3_version_id)
+        VALUES (p_id, 'index.htm', 'sha-' || p_name, 10, 'v1');
         UPDATE tc.books
-        SET current_version_id = v_version, current_version_seq = 1,
-            current_checksum = 'cs-' || p_name
+        SET current_version = 1, current_checksum = 'cs-' || p_name
         WHERE id = p_id;
     END IF;
 END;
 $$;
 
--- Setup helper: one row in every other per-collection table (a check-in transaction based on
--- a version, a collection-file group with a file, a collection-file transaction, a palette
--- entry, an event), so support_delete_collection has something everywhere.
+-- The collection and the instance id of a book (the API names a book by the pair).
+CREATE OR REPLACE FUNCTION tests.coll(p_book uuid)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT collection_id FROM tc.books WHERE id = p_book
+$$;
+CREATE OR REPLACE FUNCTION tests.inst(p_book uuid)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT instance_id FROM tc.books WHERE id = p_book
+$$;
+
+-- The core.users id of the person signed in as p_sub, and of the user with an email.
+CREATE OR REPLACE FUNCTION tests.uid(p_sub text)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT id FROM core.users WHERE authentication_id = p_sub
+$$;
+CREATE OR REPLACE FUNCTION tests.user_with_email(p_email text)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT id FROM core.users WHERE email = p_email
+$$;
+
+-- Setup helper: one row in every other per-collection table (a check-in attempt, a
+-- collection file, a collection-file attempt, a palette entry, an event), so
+-- support_delete_collection has something everywhere.
 CREATE OR REPLACE FUNCTION tests.populate(p_collection uuid, p_book uuid)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    v_group bigint;
 BEGIN
-    INSERT INTO tc.checkin_transactions (collection_id, book_id, started_by, proposed_name,
-                                         base_version_id, status)
-    SELECT p_collection, p_book, 'user-alice-iu', b.name, b.current_version_id, 'aborted'
+    INSERT INTO tc.checkin_attempts (collection_id, book_id, started_by, proposed_name,
+                                     base_book_version, status)
+    SELECT p_collection, p_book, tests.uid('user-alice-iu'), b.name, b.current_version, 'aborted'
     FROM tc.books b WHERE b.id = p_book;
-    INSERT INTO tc.collection_file_groups (collection_id, group_key, version, updated_by)
-    VALUES (p_collection, 'other', 1, 'user-alice-iu')
-    RETURNING id INTO v_group;
-    INSERT INTO tc.collection_group_files (group_id, path, sha256, size_bytes, s3_version_id)
-    VALUES (v_group, 'x.bloomCollection', 'sha-x', 5, 'v1');
-    INSERT INTO tc.collection_file_transactions (collection_id, group_key, started_by, expected_version)
-    VALUES (p_collection, 'other', 'user-alice-iu', 1);
+    INSERT INTO tc.collection_files (collection_id, path, sha256, size_bytes, s3_version_id)
+    VALUES (p_collection, 'x.bloomCollection', 'sha-x', 5, 'v1');
+    INSERT INTO tc.collection_file_checkin_attempts (collection_id, started_by, expected_version)
+    VALUES (p_collection, tests.uid('user-alice-iu'), 1);
     INSERT INTO tc.color_palette_entries (collection_id, palette, color, added_by)
-    VALUES (p_collection, 'text', '#123456', 'user-alice-iu');
-    INSERT INTO tc.events (collection_id, book_id, type, by_user_id, book_name)
-    VALUES (p_collection, p_book, 2, 'user-alice-iu', 'populated');
+    VALUES (p_collection, 'text', '#123456', tests.uid('user-alice-iu'));
+    INSERT INTO tc.history_events (collection_id, book_id, type, by_user_id, book_name)
+    VALUES (p_collection, p_book, 2, tests.uid('user-alice-iu'), 'populated');
 END;
 $$;
 
@@ -113,17 +133,13 @@ AS $$
         'collections',   (SELECT count(*) FROM tc.collections WHERE id = p_collection),
         'members',       (SELECT count(*) FROM tc.members WHERE collection_id = p_collection),
         'books',         (SELECT count(*) FROM tc.books WHERE collection_id = p_collection),
-        'versions',      (SELECT count(*) FROM tc.versions WHERE collection_id = p_collection),
-        'version_files', (SELECT count(*) FROM tc.version_files f
+        'book_files',    (SELECT count(*) FROM tc.book_files f
                           JOIN tc.books b ON b.id = f.book_id WHERE b.collection_id = p_collection),
-        'checkin_transactions', (SELECT count(*) FROM tc.checkin_transactions WHERE collection_id = p_collection),
-        'collection_file_groups', (SELECT count(*) FROM tc.collection_file_groups WHERE collection_id = p_collection),
-        'collection_group_files', (SELECT count(*) FROM tc.collection_group_files f
-                                   JOIN tc.collection_file_groups g ON g.id = f.group_id
-                                   WHERE g.collection_id = p_collection),
-        'collection_file_transactions', (SELECT count(*) FROM tc.collection_file_transactions WHERE collection_id = p_collection),
+        'checkin_attempts', (SELECT count(*) FROM tc.checkin_attempts WHERE collection_id = p_collection),
+        'collection_files', (SELECT count(*) FROM tc.collection_files WHERE collection_id = p_collection),
+        'collection_file_checkin_attempts', (SELECT count(*) FROM tc.collection_file_checkin_attempts WHERE collection_id = p_collection),
         'color_palette_entries', (SELECT count(*) FROM tc.color_palette_entries WHERE collection_id = p_collection),
-        'events',        (SELECT count(*) FROM tc.events WHERE collection_id = p_collection)
+        'history_events', (SELECT count(*) FROM tc.history_events WHERE collection_id = p_collection)
     )
 $$;
 
@@ -136,14 +152,12 @@ AS $$
         'collections',   (SELECT count(*) FROM tc.collections),
         'members',       (SELECT count(*) FROM tc.members),
         'books',         (SELECT count(*) FROM tc.books),
-        'versions',      (SELECT count(*) FROM tc.versions),
-        'version_files', (SELECT count(*) FROM tc.version_files),
-        'checkin_transactions', (SELECT count(*) FROM tc.checkin_transactions),
-        'collection_file_groups', (SELECT count(*) FROM tc.collection_file_groups),
-        'collection_group_files', (SELECT count(*) FROM tc.collection_group_files),
-        'collection_file_transactions', (SELECT count(*) FROM tc.collection_file_transactions),
+        'book_files',    (SELECT count(*) FROM tc.book_files),
+        'checkin_attempts', (SELECT count(*) FROM tc.checkin_attempts),
+        'collection_files', (SELECT count(*) FROM tc.collection_files),
+        'collection_file_checkin_attempts', (SELECT count(*) FROM tc.collection_file_checkin_attempts),
         'color_palette_entries', (SELECT count(*) FROM tc.color_palette_entries),
-        'events',        (SELECT count(*) FROM tc.events)
+        'history_events', (SELECT count(*) FROM tc.history_events)
     )
 $$;
 
@@ -161,7 +175,7 @@ CREATE OR REPLACE FUNCTION tests.checkout_events(p_book uuid)
 RETURNS bigint
 LANGUAGE sql
 AS $$
-    SELECT count(*) FROM tc.events WHERE book_id = p_book AND type = 0
+    SELECT count(*) FROM tc.history_events WHERE book_id = p_book AND type = 0
 $$;
 
 -- =============================================================================
@@ -173,11 +187,11 @@ SELECT has_column('tc', 'collections', 'initial_upload_in_progress',
 SELECT col_not_null('tc', 'collections', 'initial_upload_in_progress', '0b: it is NOT NULL');
 SELECT col_default_is('tc', 'collections', 'initial_upload_in_progress', 'false', '0c: it defaults to false');
 SELECT has_function('tc', 'finish_initial_upload', ARRAY['uuid'], '0d: tc.finish_initial_upload(uuid) exists');
-SELECT has_function('tc', 'lock_book_for_legacy_checkout', ARRAY['uuid', 'text', 'text', 'text'],
-    '0e: tc.lock_book_for_legacy_checkout(uuid, text, text, text) exists');
+SELECT has_function('tc', 'lock_book_for_legacy_checkout', ARRAY['uuid', 'uuid', 'text', 'text', 'text'],
+    '0e: tc.lock_book_for_legacy_checkout(uuid, uuid, text, text, text) exists');
 SELECT ok(
     has_function_privilege('authenticated', 'tc.finish_initial_upload(uuid)', 'EXECUTE')
-    AND has_function_privilege('authenticated', 'tc.lock_book_for_legacy_checkout(uuid, text, text, text)', 'EXECUTE')
+    AND has_function_privilege('authenticated', 'tc.lock_book_for_legacy_checkout(uuid, uuid, text, text, text)', 'EXECUTE')
     AND has_function_privilege('authenticated', 'tc.create_collection(uuid, text, boolean)', 'EXECUTE'),
     '0f: members can call finish_initial_upload, lock_book_for_legacy_checkout and create_collection (the RPCs check admin themselves)'
 );
@@ -225,11 +239,9 @@ SELECT tests.add_book('b0000000-0000-0000-0000-00000000e105', 'c0000000-0000-000
 SELECT tests.add_book('b0000000-0000-0000-0000-00000000e106', 'c0000000-0000-0000-0000-0000000e0001', 'Late Book');
 SELECT tests.add_book('b0000000-0000-0000-0000-00000000e201', 'c0000000-0000-0000-0000-0000000e0002', 'Other Book');
 
-SELECT throws_ok(
-    $$INSERT INTO tc.members (collection_id, email, user_id, added_by)
-      VALUES ('c0000000-0000-0000-0000-0000000e0002', 'x@example.com', 'legacy:x@example.com', 'test')$$,
-    '23514', NULL,
-    '1e: no member can have a placeholder (legacy:) user id'
+SELECT ok(
+    tests.user_with_email('bob-old@example.com') IS NULL,
+    '1e: sanity: there is no user with the old checkout''s email yet'
 );
 
 -- =============================================================================
@@ -261,7 +273,7 @@ SELECT is(
 
 -- Bob checks B3 out normally (he is the current holder of it in the cloud).
 SELECT is(
-    (tc.checkout_book('b0000000-0000-0000-0000-00000000e103', 'BOBPC', gen_random_uuid()::text) ->> 'success'),
+    (tc.checkout_book(tests.coll('b0000000-0000-0000-0000-00000000e103'), tests.inst('b0000000-0000-0000-0000-00000000e103'), 'BOBPC', gen_random_uuid()::text) ->> 'success'),
     'true', '2g: Bob checks out a book normally during the upload (fixture)');
 
 -- =============================================================================
@@ -271,10 +283,10 @@ SELECT is(
 SELECT set_config('tests.g1', gen_random_uuid()::text, true);
 
 SELECT throws_ok(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'bob-old@example.com', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'bob-old@example.com', %L, 'OLDPC')$$,
            current_setting('tests.g1')),
     '42501', 'admin_required',
-    '3a: a non-admin member cannot place a placeholder lock'
+    '3a: a non-admin member cannot lock a carried-over checkout'
 );
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by', NULL,
     '3b: ... and the book stays free');
@@ -282,37 +294,37 @@ SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by',
 SELECT tests.set_jwt('user-alice-iu', 'alice-iu@example.com');
 
 SELECT throws_ok(
-    $$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'bob-old@example.com', NULL, 'OLDPC')$$,
+    $$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'bob-old@example.com', NULL, 'OLDPC')$$,
     '22023', NULL, '3c: no GUID is refused');
 SELECT throws_ok(
-    $$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'bob-old@example.com', '  ', 'OLDPC')$$,
+    $$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'bob-old@example.com', '  ', 'OLDPC')$$,
     '22023', NULL, '3d: a blank GUID is refused');
 SELECT throws_ok(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', ' ', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), ' ', %L, 'OLDPC')$$,
            current_setting('tests.g1')),
     '22023', NULL, '3e: a blank email is refused');
 SELECT throws_ok(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000efff', 'bob-old@example.com', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout('c0000000-0000-0000-0000-0000000e0001', 'a0000000-0000-0000-0000-00000000efff', 'bob-old@example.com', %L, 'OLDPC')$$,
            current_setting('tests.g1')),
     'P0002', NULL, '3f: an unknown book is refused');
 SELECT throws_like(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e102', 'bob-old@example.com', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e102'), tests.inst('b0000000-0000-0000-0000-00000000e102'), 'bob-old@example.com', %L, 'OLDPC')$$,
            current_setting('tests.g1')),
     'book_not_committed%', '3g: a book with no committed version is refused');
 
 SELECT set_config('tests.b3_before', tests.lock_of('b0000000-0000-0000-0000-00000000e103')::text, true);
 SELECT set_config('tests.r_locked',
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e103', 'bob-old@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e103'), tests.inst('b0000000-0000-0000-0000-00000000e103'), 'bob-old@example.com',
         current_setting('tests.g1'), 'OLDPC')::text, true);
 SELECT is(current_setting('tests.r_locked')::jsonb ->> 'success', 'false',
     '3h: a book someone holds is refused');
-SELECT is(current_setting('tests.r_locked')::jsonb ->> 'locked_by', 'user-bob-iu',
+SELECT is(current_setting('tests.r_locked')::jsonb ->> 'locked_by', tests.uid('user-bob-iu')::text,
     '3i: ... naming the holder, as checkout_book does');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e103'), current_setting('tests.b3_before')::jsonb,
     '3j: ... and Bob''s lock is unchanged');
 
 SELECT is(
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e104', 'bob-old@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e104'), tests.inst('b0000000-0000-0000-0000-00000000e104'), 'bob-old@example.com',
         current_setting('tests.g1'), 'OLDPC') ->> 'success',
     'false', '3k: a deleted book is refused');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e104') ->> 'locked_by', NULL,
@@ -320,12 +332,12 @@ SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e104') ->> 'locked_by',
 
 -- The real thing: B1 is checked out to bob-old@example.com on OLDPC in the old system.
 SELECT set_config('tests.r1',
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', '  Bob-Old@Example.COM ',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), '  Bob-Old@Example.COM ',
         current_setting('tests.g1'), 'OLDPC')::text, true);
-SELECT is(current_setting('tests.r1')::jsonb ->> 'success', 'true', '3m: the admin locks a free committed book to a placeholder');
-SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by', 'legacy:bob-old@example.com',
-    '3n: locked_by is legacy: + the trimmed, lowercased email');
-SELECT is(current_setting('tests.r1')::jsonb ->> 'locked_by', 'legacy:bob-old@example.com',
+SELECT is(current_setting('tests.r1')::jsonb ->> 'success', 'true', '3m: the admin locks a free committed book to the old checkout''s email');
+SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by', tests.user_with_email('bob-old@example.com')::text,
+    '3n: locked_by is the user with the trimmed, lowercased email');
+SELECT is(current_setting('tests.r1')::jsonb ->> 'locked_by', tests.user_with_email('bob-old@example.com')::text,
     '3o: ... which the result reports');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'hash', tests.guid_hash(current_setting('tests.g1')),
     '3p: the stored hash is the contract hash of the GUID');
@@ -334,111 +346,113 @@ SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'machine', '
 SELECT ok(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_at' IS NOT NULL, '3r: locked_at is set');
 SELECT is(tests.checkout_events('b0000000-0000-0000-0000-00000000e101'), 1::bigint, '3s: one CheckOut event');
 SELECT is(
-    (SELECT jsonb_build_object('by', by_user_id, 'email', by_email, 'holder', lock_info ->> 'locked_by',
+    (SELECT jsonb_build_object('by', by_user_id, 'holder', lock_info ->> 'locked_by',
                                'machine', lock_info ->> 'machine')
-     FROM tc.events WHERE book_id = 'b0000000-0000-0000-0000-00000000e101' AND type = 0),
-    jsonb_build_object('by', 'user-alice-iu', 'email', 'alice-iu@example.com',
-                       'holder', 'legacy:bob-old@example.com', 'machine', 'OLDPC'),
-    '3t: the event''s actor is the admin, and lock_info names the placeholder'
+     FROM tc.history_events WHERE book_id = 'b0000000-0000-0000-0000-00000000e101' AND type = 0),
+    jsonb_build_object('by', tests.uid('user-alice-iu'),
+                       'holder', tests.user_with_email('bob-old@example.com'), 'machine', 'OLDPC'),
+    '3t: the event''s actor is the admin, and lock_info names the holder'
 );
 
 -- Idempotent: resuming after a crash repeats the call with the same GUID.
 SELECT set_config('tests.b1_locked', tests.lock_of('b0000000-0000-0000-0000-00000000e101')::text, true);
 SELECT is(
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'bob-old@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'bob-old@example.com',
         upper(current_setting('tests.g1')), 'OTHERPC') ->> 'success',
-    'true', '3u: the same placeholder with the same GUID succeeds again');
+    'true', '3u: the same holder with the same GUID succeeds again');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
     '3v: ... changing nothing (not even the machine)');
 SELECT is(tests.checkout_events('b0000000-0000-0000-0000-00000000e101'), 1::bigint, '3w: ... and emitting no second event');
 
 SELECT is(
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'bob-old@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'bob-old@example.com',
         gen_random_uuid()::text, 'OLDPC') ->> 'success',
-    'false', '3x: the same placeholder with a different GUID is refused');
+    'false', '3x: the same holder with a different GUID is refused');
 SELECT is(
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e101', 'someone-else@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'someone-else@example.com',
         current_setting('tests.g1'), 'OLDPC') ->> 'success',
-    'false', '3y: another placeholder with the same GUID is refused');
+    'false', '3y: another holder with the same GUID is refused');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
     '3z: ... and neither changed the lock');
 
 -- NFC, like member emails: a decomposed accent is stored composed.
 SELECT set_config('tests.g5', gen_random_uuid()::text, true);
 SELECT is(
-    tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e105', U&'Jose\0301@example.com',
+    tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e105'), tests.inst('b0000000-0000-0000-0000-00000000e105'), U&'Jose\0301@example.com',
         current_setting('tests.g5'), 'OLDPC2') ->> 'success',
-    'true', '3aa: a second placeholder lock (fixture for NFC and force unlock)');
+    'true', '3aa: a second carried-over checkout (fixture for NFC and force unlock)');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e105') ->> 'locked_by',
-    'legacy:' || normalize(U&'jose\0301@example.com', NFC),
-    '3ab: the placeholder email is NFC-normalized');
+    tests.user_with_email(normalize(U&'jose\0301@example.com', NFC))::text,
+    '3ab: the holder''s email is NFC-normalized');
 
 -- =============================================================================
--- 4. How a placeholder lock displays
+-- 4. How a carried-over checkout displays
 -- =============================================================================
 
-SELECT is(
-    (SELECT to_jsonb(r) FROM tc.resolve_member_display('c0000000-0000-0000-0000-0000000e0001', 'legacy:bob-old@example.com') r),
-    jsonb_build_object('email', 'bob-old@example.com', 'display_name', NULL),
-    '4a: resolve_member_display gives the old email and no display name'
-);
-SELECT is(
-    (SELECT to_jsonb(r) FROM tc.resolve_member_display('c0000000-0000-0000-0000-0000000e0001', 'user-bob-iu') r),
-    jsonb_build_object('email', 'bob-iu@example.com', 'display_name', NULL),
-    '4b: a real member still resolves from tc.members'
+SELECT ok(
+    (SELECT authentication_id IS NULL AND name IS NULL FROM core.users
+      WHERE id = tests.user_with_email('bob-old@example.com')),
+    '4a: the holder is an unclaimed user: no login and no name'
 );
 SELECT is(
     (SELECT b ->> 'locked_by_email'
      FROM jsonb_array_elements(tc.get_collection_state('c0000000-0000-0000-0000-0000000e0001') -> 'books') b
-     WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000e101'),
+     WHERE b ->> 'instance_id' = tests.inst('b0000000-0000-0000-0000-00000000e103')::text),
+    'bob-iu@example.com',
+    '4b: a book an ordinary member holds shows that member''s email'
+);
+SELECT is(
+    (SELECT b ->> 'locked_by_email'
+     FROM jsonb_array_elements(tc.get_collection_state('c0000000-0000-0000-0000-0000000e0001') -> 'books') b
+     WHERE b ->> 'instance_id' = tests.inst('b0000000-0000-0000-0000-00000000e101')::text),
     'bob-old@example.com', '4c: get_collection_state shows the book as checked out to the old email');
 SELECT is(
     (SELECT b ->> 'locked_by_email'
      FROM jsonb_array_elements(tc.get_changes('c0000000-0000-0000-0000-0000000e0001', 0) -> 'books') b
-     WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000e101'),
+     WHERE b ->> 'instance_id' = tests.inst('b0000000-0000-0000-0000-00000000e101')::text),
     'bob-old@example.com', '4d: so does get_changes');
 SELECT is(
-    tc.get_book_manifest('b0000000-0000-0000-0000-00000000e101') ->> 'lockedByEmail',
+    tc.get_book_manifest(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101')) ->> 'lockedByEmail',
     'bob-old@example.com', '4e: so does get_book_manifest');
 
 -- =============================================================================
--- 5. Nobody can use a placeholder lock without taking it over
+-- 5. Nobody can use a carried-over checkout without taking it over
 -- =============================================================================
 
 SELECT tests.set_jwt('user-bob-iu', 'bob-iu@example.com');
 SELECT throws_like(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000e101', %L)$$, current_setting('tests.g1')),
+    format($$SELECT tc.unlock_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), %L)$$, current_setting('tests.g1')),
     'lock_not_held%', '5a: a member with the GUID still cannot unlock it');
 SELECT throws_like(
-    format($$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000e101', %L)$$, current_setting('tests.g1')),
+    format($$SELECT tc.delete_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), %L)$$, current_setting('tests.g1')),
     'lock_required%', '5b: nor delete it');
 SELECT throws_ok(
-    format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-0000000e0001', 'b0000000-0000-0000-0000-00000000e101',
-             (SELECT instance_id FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000e101'),
+    format($$SELECT tc.checkin_start_tx('c0000000-0000-0000-0000-0000000e0001',
+             tests.inst('b0000000-0000-0000-0000-00000000e101'),
              'Bob Old Book', NULL, 'cs-new', '6.6.0',
-             jsonb_build_array(jsonb_build_object('path', 'Bob Old Book.htm', 'sha256', 'sha-new', 'size', 11)),
+             jsonb_build_array(jsonb_build_object('path', 'index.htm', 'sha256', 'sha-new', 'size', 11)),
              %L)$$, current_setting('tests.g1')),
     'PT409', NULL, '5c: nor check it in (LockHeldByOther)');
 SELECT is(
-    tc.checkout_book('b0000000-0000-0000-0000-00000000e101', 'BOBPC', current_setting('tests.g1')) ->> 'success',
+    tc.checkout_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), 'BOBPC', current_setting('tests.g1')) ->> 'success',
     'false', '5d: nor check it out');
 SELECT tests.set_jwt('user-alice-iu', 'alice-iu@example.com');
 SELECT throws_like(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000e101', %L)$$, current_setting('tests.g1')),
+    format($$SELECT tc.unlock_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), %L)$$, current_setting('tests.g1')),
     'lock_not_held%', '5e: the admin who placed it cannot unlock it either (force_unlock is the way)');
 SELECT throws_like(
-    format($$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000e101', %L)$$, current_setting('tests.g1')),
+    format($$SELECT tc.delete_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), %L)$$, current_setting('tests.g1')),
     'lock_required%', '5f: nor delete it');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
     '5g: none of that changed the lock');
 
--- Removing a member who never claimed (user_id NULL) touches no placeholder lock.
+-- Removing a member who never claimed (user_id NULL) touches no carried-over checkout.
 SELECT lives_ok(
     $$SELECT tc.members_remove('c0000000-0000-0000-0000-0000000e0001',
         (SELECT id FROM tc.members WHERE email = 'carol-iu@example.com'))$$,
-    '5h: members_remove of an unclaimed member works with placeholder locks present');
+    '5h: members_remove of an unclaimed member works with carried-over checkouts present');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
-    '5i: ... and leaves the placeholder lock alone');
+    '5i: ... and leaves the carried-over checkout alone');
 
 -- =============================================================================
 -- 6. finish_initial_upload
@@ -489,67 +503,67 @@ SELECT is(
 );
 SELECT tests.set_jwt('user-alice-iu', 'alice-iu@example.com');
 SELECT throws_like(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e106', 'bob-old@example.com', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e106'), tests.inst('b0000000-0000-0000-0000-00000000e106'), 'bob-old@example.com', %L, 'OLDPC')$$,
            gen_random_uuid()::text),
-    'initial_upload_not_in_progress%', '6m: no placeholder lock once the flag is clear');
+    'initial_upload_not_in_progress%', '6m: no carried-over checkout once the flag is clear');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e106') ->> 'locked_by', NULL, '6n: ... and the book stays free');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
-    '6o: placeholder locks placed during the upload survive clearing the flag');
+    '6o: carried-over checkouts placed during the upload survive clearing the flag');
 SELECT throws_like(
-    format($$SELECT tc.lock_book_for_legacy_checkout('b0000000-0000-0000-0000-00000000e201', 'bob-old@example.com', %L, 'OLDPC')$$,
+    format($$SELECT tc.lock_book_for_legacy_checkout(tests.coll('b0000000-0000-0000-0000-00000000e201'), tests.inst('b0000000-0000-0000-0000-00000000e201'), 'bob-old@example.com', %L, 'OLDPC')$$,
            gen_random_uuid()::text),
-    'initial_upload_not_in_progress%', '6p: an ordinary collection (never flagged) refuses placeholder locks too');
+    'initial_upload_not_in_progress%', '6p: an ordinary collection (never flagged) refuses carried-over checkouts too');
 
 -- =============================================================================
--- 7. Takeover moves a placeholder lock to whoever presents the GUID
+-- 7. Takeover moves a carried-over checkout to whoever presents the GUID
 -- =============================================================================
 
 SELECT tests.set_jwt('user-bob-iu', 'bob-iu@example.com');
 SELECT is(
-    tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000e101', gen_random_uuid()::text, 'BOBNEWPC') ->> 'success',
+    tc.checkout_book_takeover(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), gen_random_uuid()::text, 'BOBNEWPC') ->> 'success',
     'false', '7a: takeover with the wrong GUID is refused');
 SELECT is(
-    tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000e101', tests.guid_hash(current_setting('tests.g1')), 'BOBNEWPC') ->> 'success',
+    tc.checkout_book_takeover(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), tests.guid_hash(current_setting('tests.g1')), 'BOBNEWPC') ->> 'success',
     'false', '7b: takeover presenting the (member-readable) hash is refused');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101'), current_setting('tests.b1_locked')::jsonb,
-    '7c: ... and the placeholder still holds it');
+    '7c: ... and the unclaimed user still holds it');
 SELECT is(tests.checkout_events('b0000000-0000-0000-0000-00000000e101'), 1::bigint, '7d: ... with no new event');
 
 SELECT is(
-    tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000e101', upper(current_setting('tests.g1')), 'BOBNEWPC') ->> 'success',
+    tc.checkout_book_takeover(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), upper(current_setting('tests.g1')), 'BOBNEWPC') ->> 'success',
     'true', '7e: a member presenting the GUID from the Migration Keys file takes it over');
-SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by', 'user-bob-iu',
+SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'locked_by', tests.uid('user-bob-iu')::text,
     '7f: the lock is now the caller''s (whatever the old email was)');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'hash', tests.guid_hash(current_setting('tests.g1')),
     '7g: the GUID is kept');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e101') ->> 'machine', 'BOBNEWPC',
     '7h: the new machine is recorded');
 SELECT is(
-    (SELECT by_user_id FROM tc.events
+    (SELECT by_user_id FROM tc.history_events
      WHERE book_id = 'b0000000-0000-0000-0000-00000000e101' AND type = 0 ORDER BY id DESC LIMIT 1),
-    'user-bob-iu', '7i: a CheckOut event by the new holder');
+    tests.uid('user-bob-iu'), '7i: a CheckOut event by the new holder');
 SELECT is(tests.checkout_events('b0000000-0000-0000-0000-00000000e101'), 2::bigint, '7j: (two CheckOut events in all)');
 SELECT lives_ok(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000e101', %L)$$, current_setting('tests.g1')),
+    format($$SELECT tc.unlock_book(tests.coll('b0000000-0000-0000-0000-00000000e101'), tests.inst('b0000000-0000-0000-0000-00000000e101'), %L)$$, current_setting('tests.g1')),
     '7k: from then on it is an ordinary checkout (the holder can unlock it with the GUID)');
 
 -- =============================================================================
--- 8. force_unlock clears a placeholder lock
+-- 8. force_unlock clears a carried-over checkout
 -- =============================================================================
 
 SELECT tests.set_jwt('user-alice-iu', 'alice-iu@example.com');
 SELECT set_config('tests.b5_locked', tests.lock_of('b0000000-0000-0000-0000-00000000e105')::text, true);
 SELECT lives_ok(
-    $$SELECT tc.force_unlock('b0000000-0000-0000-0000-00000000e105')$$,
-    '8a: an admin force-unlocks a placeholder lock (its owner never switched)');
+    $$SELECT tc.force_unlock(tests.coll('b0000000-0000-0000-0000-00000000e105'), tests.inst('b0000000-0000-0000-0000-00000000e105'))$$,
+    '8a: an admin force-unlocks a carried-over checkout (its owner never switched)');
 SELECT is(tests.lock_of('b0000000-0000-0000-0000-00000000e105'),
     jsonb_build_object('locked_by', NULL, 'machine', NULL, 'locked_at', NULL, 'hash', NULL),
     '8b: lock and GUID hash are cleared');
 SELECT is(
-    (SELECT lock_info ->> 'locked_by' FROM tc.events
+    (SELECT lock_info ->> 'locked_by' FROM tc.history_events
      WHERE book_id = 'b0000000-0000-0000-0000-00000000e105' AND type = 5),
     current_setting('tests.b5_locked')::jsonb ->> 'locked_by',
-    '8c: the ForcedUnlock event records the placeholder holder in lock_info');
+    '8c: the ForcedUnlock event records the unclaimed holder in lock_info');
 
 -- =============================================================================
 -- 9. support_delete_collection

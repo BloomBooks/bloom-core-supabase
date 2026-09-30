@@ -62,20 +62,39 @@ AS $$
     SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'
 $$;
 
--- What a client does to check a book out (v1.10): make a GUID, then send it. Returns the GUID
--- when the checkout succeeded, else NULL.
-CREATE OR REPLACE FUNCTION tests.checkout(p_book_id uuid, p_machine text)
+-- What a client does to check a book out: make a GUID, then send it. Returns the GUID when the
+-- checkout succeeded, else NULL.
+CREATE OR REPLACE FUNCTION tests.checkout(p_instance_id uuid, p_machine text)
 RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
     v_guid text := gen_random_uuid()::text;
 BEGIN
-    IF (tc.checkout_book(p_book_id, p_machine, v_guid) ->> 'success') = 'true' THEN
+    IF (tc.checkout_book((SELECT collection_id FROM tc.books WHERE instance_id = p_instance_id),
+                         p_instance_id, p_machine, v_guid) ->> 'success') = 'true' THEN
         RETURN v_guid;
     END IF;
     RETURN NULL;
 END;
+$$;
+
+-- The core.users id of the person signed in as p_sub.
+CREATE OR REPLACE FUNCTION tests.uid(p_sub text)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    SELECT id FROM core.users WHERE authentication_id = p_sub
+$$;
+
+-- A user row for someone who never signs in during the test (made directly, as a fixture).
+CREATE OR REPLACE FUNCTION tests.user(p_sub text, p_email text)
+RETURNS uuid
+LANGUAGE sql
+AS $$
+    INSERT INTO core.users (authentication_id, email) VALUES (p_sub, p_email)
+    ON CONFLICT (authentication_id) DO UPDATE SET email = EXCLUDED.email
+    RETURNING id
 $$;
 
 -- =============================================================================
@@ -107,38 +126,37 @@ SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 
 -- Insert a test book directly (SECURITY DEFINER helper — RLS bypassed for setup), matching
 -- 01_tc_schema_test.sql section 5's own convention.
-INSERT INTO tc.books (id, collection_id, instance_id, name, created_by)
+INSERT INTO tc.books (id, collection_id, instance_id, name)
 VALUES (
     'b0000000-0000-0000-0000-00000000a001'::uuid,
     'c0000000-0000-0000-0000-00000000a001'::uuid,
     'b0000000-0000-0000-0000-00000000a002'::uuid,
-    'Takeover Test Book',
-    'user-alice-tko'
+    'Takeover Test Book'
 );
 
 -- Alice's client makes a GUID (and would save it in the .checkout file) before checking out.
 SELECT set_config('tests.alice_guid', gen_random_uuid()::text, true);
 
 SELECT throws_ok(
-    $$SELECT tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine', NULL)$$,
+    $$SELECT tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'SharedMachine', NULL)$$,
     '22023', NULL,
     '0d1: checkout_book with no GUID is refused'
 );
 
 SELECT throws_ok(
-    $$SELECT tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine', '  ')$$,
+    $$SELECT tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'SharedMachine', '  ')$$,
     '22023', NULL,
     '0d2: checkout_book with a blank GUID is refused'
 );
 
 SELECT set_config('tests.checkout1',
-    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'SharedMachine',
+    tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'SharedMachine',
         upper(current_setting('tests.alice_guid')))::text,
     true);
 
 SELECT ok(
     (current_setting('tests.checkout1')::jsonb ->> 'success') = 'true'
-    AND (current_setting('tests.checkout1')::jsonb ->> 'locked_by') = 'user-alice-tko'
+    AND (current_setting('tests.checkout1')::jsonb ->> 'locked_by') = tests.uid('user-alice-tko')::text
     AND NOT (current_setting('tests.checkout1')::jsonb ? 'checkoutGuid'),
     '0d: a checkout with a client-supplied GUID succeeds and returns no GUID'
 );
@@ -151,7 +169,7 @@ SELECT is(
 
 -- A retry with the same GUID (the first response was lost) is the same success, changing nothing.
 SELECT set_config('tests.retry',
-    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'RetryMachine',
+    tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'RetryMachine',
         current_setting('tests.alice_guid'))::text,
     true);
 
@@ -165,7 +183,7 @@ SELECT ok(
 SELECT ok(
     tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid'))
     AND (SELECT locked_by_machine FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'SharedMachine'
-    AND (SELECT count(*) = 1 FROM tc.events
+    AND (SELECT count(*) = 1 FROM tc.history_events
          WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0),
     '0e2: the retry changes nothing and emits no second CheckOut event'
 );
@@ -178,7 +196,7 @@ SELECT ok(
 SELECT is(
     (SELECT b ->> 'checkoutGuidHash'
        FROM jsonb_array_elements(tc.get_collection_state('c0000000-0000-0000-0000-00000000a001') -> 'books') b
-      WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000a001'),
+      WHERE b ->> 'instance_id' = 'b0000000-0000-0000-0000-00000000a002'),
     tests.guid_hash(current_setting('tests.alice_guid')),
     '0g: get_collection_state returns the hash as checkoutGuidHash'
 );
@@ -186,7 +204,7 @@ SELECT is(
 SELECT is(
     (SELECT b ->> 'checkoutGuidHash'
        FROM jsonb_array_elements(tc.get_changes('c0000000-0000-0000-0000-00000000a001', 0) -> 'books') b
-      WHERE b ->> 'id' = 'b0000000-0000-0000-0000-00000000a001'),
+      WHERE b ->> 'instance_id' = 'b0000000-0000-0000-0000-00000000a002'),
     tests.guid_hash(current_setting('tests.alice_guid')),
     '0h: get_changes returns the hash as checkoutGuidHash'
 );
@@ -200,9 +218,9 @@ SELECT ok(
 -- Checked as the superuser running the tests, so every column of every row counts.
 SELECT ok(
     NOT EXISTS (SELECT 1 FROM tc.books b WHERE b::text LIKE '%' || current_setting('tests.alice_guid') || '%')
-    AND NOT EXISTS (SELECT 1 FROM tc.events e WHERE e::text LIKE '%' || current_setting('tests.alice_guid') || '%')
-    AND NOT EXISTS (SELECT 1 FROM tc.checkin_transactions t WHERE t::text LIKE '%' || current_setting('tests.alice_guid') || '%'),
-    '0j: the GUID itself is stored nowhere (books, events, checkin_transactions)'
+    AND NOT EXISTS (SELECT 1 FROM tc.history_events e WHERE e::text LIKE '%' || current_setting('tests.alice_guid') || '%')
+    AND NOT EXISTS (SELECT 1 FROM tc.checkin_attempts t WHERE t::text LIKE '%' || current_setting('tests.alice_guid') || '%'),
+    '0j: the GUID itself is stored nowhere (books, history_events, checkin_attempts)'
 );
 
 -- =============================================================================
@@ -211,7 +229,7 @@ SELECT ok(
 -- =============================================================================
 
 SELECT set_config('tests.recheckout',
-    tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'OtherMachine', gen_random_uuid()::text)::text,
+    tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'OtherMachine', gen_random_uuid()::text)::text,
     true);
 
 SELECT ok(
@@ -228,7 +246,7 @@ SELECT ok(
 );
 
 SELECT ok(
-    (SELECT count(*) = 1 FROM tc.events
+    (SELECT count(*) = 1 FROM tc.history_events
      WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0),
     '1c: the refused re-checkout emits no CheckOut event'
 );
@@ -241,30 +259,30 @@ SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT ok(
     (SELECT r ->> 'success' = 'false' AND NOT (r ? 'checkoutGuid') AND NOT (r ? 'locked_by_me')
-       FROM (SELECT tc.checkout_book('b0000000-0000-0000-0000-00000000a001', 'BobsMachine',
+       FROM (SELECT tc.checkout_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', 'BobsMachine',
                                      current_setting('tests.alice_guid')) AS r) s),
     '2a: Bob''s checkout_book fails, even with Alice''s GUID, with no locked_by_me'
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', NULL, 'SharedMachine')) ->> 'success' = 'false'),
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', NULL, 'SharedMachine')) ->> 'success' = 'false'),
     '2b: Bob cannot take over with no GUID'
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text, 'SharedMachine')) ->> 'success' = 'false'),
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', gen_random_uuid()::text, 'SharedMachine')) ->> 'success' = 'false'),
     '2c: Bob cannot take over with a wrong GUID'
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002',
         (SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
         'SharedMachine')) ->> 'success' = 'false'),
     '2d: presenting the member-readable hash instead of the GUID does not work'
 );
 
 SELECT ok(
-    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-alice-tko'
+    (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = tests.uid('user-alice-tko')
     AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
     '2e: the lock and its hash are unchanged after the failed attempts'
 );
@@ -275,13 +293,13 @@ SELECT ok(
 -- =============================================================================
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002',
         current_setting('tests.alice_guid'), 'SharedMachine')) ->> 'success' = 'true'),
     '3a: Bob takes over with the GUID'
 );
 
 SELECT ok(
-    (SELECT locked_by = 'user-bob-tko' AND locked_by_machine = 'SharedMachine'
+    (SELECT locked_by = tests.uid('user-bob-tko') AND locked_by_machine = 'SharedMachine'
        FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
     '3b: the lock now belongs to Bob'
 );
@@ -293,10 +311,10 @@ SELECT is(
 );
 
 SELECT ok(
-    (SELECT count(*) = 1 FROM tc.events
+    (SELECT count(*) = 1 FROM tc.history_events
      WHERE book_id = 'b0000000-0000-0000-0000-00000000a001'
        AND type = 0
-       AND by_user_id = 'user-bob-tko'),
+       AND by_user_id = tests.uid('user-bob-tko')),
     '3d: exactly one CheckOut event (type=0) recorded for Bob''s takeover'
 );
 
@@ -307,10 +325,10 @@ SELECT is(
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002',
         current_setting('tests.alice_guid'), 'SharedMachine')) ->> 'success' = 'false')
-    AND (SELECT count(*) = 1 FROM tc.events
-         WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0 AND by_user_id = 'user-bob-tko')
+    AND (SELECT count(*) = 1 FROM tc.history_events
+         WHERE book_id = 'b0000000-0000-0000-0000-00000000a001' AND type = 0 AND by_user_id = tests.uid('user-bob-tko'))
     AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
     '3f: re-calling takeover as the current holder is a no-op (no event, hash kept)'
 );
@@ -319,7 +337,7 @@ SELECT tests.set_jwt('user-carol-tko', 'carol-tko@example.com', true);
 
 -- PT403 (not 42501): checkout_book_takeover raises the schema-wide PT### passthrough codes.
 SELECT throws_ok(
-    format($$SELECT tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001', %L, 'SharedMachine')$$,
+    format($$SELECT tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', %L, 'SharedMachine')$$,
         current_setting('tests.alice_guid')),
     'PT403',
     NULL,
@@ -333,38 +351,38 @@ SELECT throws_ok(
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT throws_like(
-    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', NULL)$$,
+    $$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', NULL)$$,
     'CheckoutElsewhere%',
     '4a: the holder cannot unlock without the GUID'
 );
 
 SELECT throws_like(
-    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text)$$,
+    $$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', gen_random_uuid()::text)$$,
     'CheckoutElsewhere%',
     '4b: the holder cannot unlock with a wrong GUID'
 );
 
 SELECT throws_like(
-    $$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001',
+    $$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002',
         (SELECT checkout_guid_hash FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'))$$,
     'CheckoutElsewhere%',
     '4c: the holder cannot unlock with the hash in place of the GUID'
 );
 
 SELECT throws_like(
-    $$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', NULL)$$,
+    $$SELECT tc.delete_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', NULL)$$,
     'CheckoutElsewhere%',
     '4d: the holder cannot delete without the GUID'
 );
 
 SELECT throws_like(
-    $$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', gen_random_uuid()::text)$$,
+    $$SELECT tc.delete_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', gen_random_uuid()::text)$$,
     'CheckoutElsewhere%',
     '4e: the holder cannot delete with a wrong GUID'
 );
 
 SELECT ok(
-    (SELECT locked_by = 'user-bob-tko' AND deleted_at IS NULL
+    (SELECT locked_by = tests.uid('user-bob-tko') AND deleted_at IS NULL
        FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001')
     AND tests.stored_hash() = tests.guid_hash(current_setting('tests.alice_guid')),
     '4f: the refused unlocks and deletes changed nothing'
@@ -373,7 +391,7 @@ SELECT ok(
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 
 SELECT throws_like(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+    format($$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', %L)$$,
         current_setting('tests.alice_guid')),
     'lock_not_held%',
     '4g: the GUID alone does not let a non-holder unlock'
@@ -382,7 +400,7 @@ SELECT throws_like(
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT lives_ok(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+    format($$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', %L)$$,
         upper(current_setting('tests.alice_guid'))),
     '4h: the holder can unlock with the GUID (compared case-insensitively)'
 );
@@ -400,7 +418,7 @@ SELECT ok(
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 
 SELECT set_config('tests.alice_guid2',
-    tests.checkout('b0000000-0000-0000-0000-00000000a001', 'SharedMachine'),
+    tests.checkout('b0000000-0000-0000-0000-00000000a002', 'SharedMachine'),
     true);
 
 SELECT ok(
@@ -410,7 +428,7 @@ SELECT ok(
 );
 
 SELECT lives_ok(
-    format($$SELECT tc.delete_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+    format($$SELECT tc.delete_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', %L)$$,
         current_setting('tests.alice_guid2')),
     '5b: the holder can delete with the GUID'
 );
@@ -421,7 +439,7 @@ SELECT ok(
     '5c: delete releases the lock and clears the hash'
 );
 
-SELECT tc.undelete_book('b0000000-0000-0000-0000-00000000a001');
+SELECT tc.undelete_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002');
 
 -- =============================================================================
 -- 6. An admin can always cancel someone else's checkout without its GUID; force_unlock
@@ -431,14 +449,14 @@ SELECT tc.undelete_book('b0000000-0000-0000-0000-00000000a001');
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT set_config('tests.bob_guid',
-    tests.checkout('b0000000-0000-0000-0000-00000000a001', 'BobsMachine'),
+    tests.checkout('b0000000-0000-0000-0000-00000000a002', 'BobsMachine'),
     true);
 
 -- Alice (admin) never saw Bob's GUID.
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 
 SELECT lives_ok(
-    $$SELECT tc.force_unlock('b0000000-0000-0000-0000-00000000a001')$$,
+    $$SELECT tc.force_unlock('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002')$$,
     '6a: an admin with no GUID can force-unlock a book another member has checked out'
 );
 
@@ -452,7 +470,7 @@ SELECT ok(
 SELECT tests.set_jwt('user-bob-tko', 'bob-tko@example.com', true);
 
 SELECT throws_like(
-    format($$SELECT tc.unlock_book('b0000000-0000-0000-0000-00000000a001', %L)$$,
+    format($$SELECT tc.unlock_book('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002', %L)$$,
         current_setting('tests.bob_guid')),
     'lock_not_held%',
     '6c: the force-unlocked GUID grants its old holder nothing afterwards'
@@ -463,29 +481,29 @@ SELECT throws_like(
 -- =============================================================================
 
 SELECT set_config('tests.bob_guid2',
-    tests.checkout('b0000000-0000-0000-0000-00000000a001', 'BobsMachine'),
+    tests.checkout('b0000000-0000-0000-0000-00000000a002', 'BobsMachine'),
     true);
 
 SELECT ok(
     current_setting('tests.bob_guid2') <> ''
-    AND (SELECT locked_by = 'user-bob-tko'
+    AND (SELECT locked_by = tests.uid('user-bob-tko')
                 AND checkout_guid_hash = tests.guid_hash(current_setting('tests.bob_guid2'))
            FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001'),
     '7a: Bob checks the free book out and gets a GUID'
 );
 
 -- A second book, checked out to Alice: removing Bob must leave it alone.
-INSERT INTO tc.books (id, collection_id, instance_id, name, created_by)
+INSERT INTO tc.books (id, collection_id, instance_id, name)
 VALUES ('b0000000-0000-0000-0000-00000000a007', 'c0000000-0000-0000-0000-00000000a001',
-        'b0000000-0000-0000-0000-00000000a008', 'Alice''s Other Book', 'user-alice-tko');
+        'b0000000-0000-0000-0000-00000000a008', 'Alice''s Other Book');
 SELECT tests.set_jwt('user-alice-tko', 'alice-tko@example.com', true);
 SELECT set_config('tests.alice_guid7',
-    tests.checkout('b0000000-0000-0000-0000-00000000a007', 'SharedMachine'), true);
+    tests.checkout('b0000000-0000-0000-0000-00000000a008', 'SharedMachine'), true);
 
 SELECT lives_ok(
     $$SELECT tc.members_remove('c0000000-0000-0000-0000-00000000a001',
         (SELECT id FROM tc.members
-          WHERE collection_id = 'c0000000-0000-0000-0000-00000000a001' AND user_id = 'user-bob-tko'))$$,
+          WHERE collection_id = 'c0000000-0000-0000-0000-00000000a001' AND user_id = tests.uid('user-bob-tko')))$$,
     '7b: the admin removes Bob'
 );
 
@@ -496,10 +514,10 @@ SELECT ok(
 );
 
 SELECT ok(
-    (SELECT locked_by = 'user-alice-tko'
+    (SELECT locked_by = tests.uid('user-alice-tko')
             AND checkout_guid_hash = tests.guid_hash(current_setting('tests.alice_guid7'))
        FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a007')
-    AND NOT EXISTS (SELECT 1 FROM tc.events
+    AND NOT EXISTS (SELECT 1 FROM tc.history_events
                      WHERE book_id = 'b0000000-0000-0000-0000-00000000a007' AND type = 5),
     '7d: another member''s checkout survives the removal, with no ForcedUnlock event for it'
 );
@@ -510,11 +528,11 @@ SELECT ok(
 -- =============================================================================
 
 SELECT set_config('tests.alice_guid4',
-    tests.checkout('b0000000-0000-0000-0000-00000000a001', 'SharedMachine'),
+    tests.checkout('b0000000-0000-0000-0000-00000000a002', 'SharedMachine'),
     true);
 
 -- Simulate a GUID-less lock change (a different holder written without a new hash).
-UPDATE tc.books SET locked_by = 'user-dave-tko' WHERE id = 'b0000000-0000-0000-0000-00000000a001';
+UPDATE tc.books SET locked_by = tests.user('user-dave-tko', 'dave-tko@example.com') WHERE id = 'b0000000-0000-0000-0000-00000000a001';
 
 SELECT ok(
     current_setting('tests.alice_guid4') IS NOT NULL
@@ -523,9 +541,9 @@ SELECT ok(
 );
 
 SELECT ok(
-    (SELECT (tc.checkout_book_takeover('b0000000-0000-0000-0000-00000000a001',
+    (SELECT (tc.checkout_book_takeover('c0000000-0000-0000-0000-00000000a001', 'b0000000-0000-0000-0000-00000000a002',
         current_setting('tests.alice_guid4'), 'SharedMachine')) ->> 'success' = 'false')
-    AND (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = 'user-dave-tko',
+    AND (SELECT locked_by FROM tc.books WHERE id = 'b0000000-0000-0000-0000-00000000a001') = tests.uid('user-dave-tko'),
     '8b: a lock with no hash cannot be taken over, even with the previous holder''s GUID'
 );
 
