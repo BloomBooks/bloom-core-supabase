@@ -1,19 +1,19 @@
 # Cloud Team Collections — going-live runbook
 
-> **Where this lives:** this copy is in the `bloom-core-supabase` repo (`team-collections/docs/`),
-> next to the backend it describes. Paths under `src/`, `Design/`, `tasks/`, `orchestration/`,
-> and mentions of `IMPLEMENTATION.md` or `../CloudTeamCollections.md`, refer to the BloomDesktop
-> repo (its `Design/CloudTeamCollections/` folder), where the desktop client and the project's
-> design notes live.
+> **Where this lives:** in the `bloom-core-supabase` repo (`team-collections/docs/`), next to the
+> backend it describes. Paths under `src/`, `Design/`, `tasks/` and `orchestration/`, and mentions of
+> `IMPLEMENTATION.md`, refer to the BloomDesktop repo (the desktop client, and on its
+> `cloud-tc-for-review` branch the project records in `Design/CloudTeamCollections/`).
 
 How to take Cloud Team Collections from the fully-local stack (local Supabase + MinIO +
 local auth; see `team-collections/dev/README.md`) to real, testable infrastructure, and what must be true
-before the `cloud-collections` branch merges to master. Each step is tagged **[HUMAN]** (needs
-credentials, org access, or a judgment call) or **[AGENT]** (a codeable task an agent can be
-given, with the human reviewing). Steps are ordered; parallelizable groups are noted.
+before the backend (this repo's PR #13) and the desktop client (BloomDesktop PR #8052) merge. Each
+step is tagged **[HUMAN]** (needs credentials, org access, or a judgment call) or **[AGENT]** (a
+codeable task an agent can be given, with the human reviewing). Steps are ordered; parallelizable
+groups are noted.
 
-Design context: BloomDesktop's `Design/CloudTeamCollections.md` · Contracts: `CONTRACTS.md` · Progress:
-BloomDesktop's `Design/CloudTeamCollections/IMPLEMENTATION.md` (this file expands its "Deferred until real infrastructure" list).
+Design: `DESIGN.md` · Contracts: `CONTRACTS.md` (v2.0, planned; the code implements v1.12) ·
+Schema: `SCHEMA.md`.
 
 ---
 
@@ -37,7 +37,7 @@ below is therefore actionable; the Bloom-side provider work (3.4) started the sa
 ### 1.2 [DECIDED 9 Jul 2026] Safety-window duration: **7 days**
 John confirmed the `provision-aws.ps1` default of 7 days for noncurrent-version expiry
 ("keeping noncurrent objects for 7 days seems plenty"). Constraint honored: strictly greater
-than the 48-hour checkin-transaction lifetime (`tc.checkin_transactions.expires_at`). No
+than the 48-hour check-in attempt lifetime (`expires_at`). No
 script change needed — step 2.1 runs as written.
 
 ---
@@ -212,6 +212,21 @@ Found during Wave-4 E2E work (see `tasks/09-e2e.md` progress log for full detail
 experimental-feature flag gates all of this UI, so merging to master does NOT require these —
 but giving the feature to real testers does:
 
+- **[PLANNED → AGENT] Bring the server and client to CONTRACTS v2.0.** The data model and API of
+  `DESIGN.md` (`core.users`, books named by instance id, no `versions` table, check-in attempts,
+  one set of collection files, `history_events`) are planned; the code implements v1.12. The work is
+  listed in `DESIGN.md`, section 9. It changes the wire contract, so the server and the client move
+  together. Nothing is deployed, so there is no data to migrate: the declarative schema changes and
+  the init migration is regenerated. Do this before Phase 4's verification against real
+  infrastructure, so that verification tests the contract that ships.
+- **[PLANNED → AGENT] Moving a person to a new login.** A person is a `core.users` row with an id
+  of Bloom's own; their memberships, checkouts and history point at it. If their email changes and
+  Firebase keeps their uid, nothing is needed (the next sign-in refreshes `users.email`). If they
+  have a new Firebase account, a support script, run with the service-role key, sets the row's
+  `authentication_id` and `email` to the new account's. It must refuse if the new account already
+  has a `core.users` row (they have signed in with it and joined something), since that makes it a
+  merge of two users, which is written when first needed.
+
 - **[DECIDED 9 Jul 2026 → AGENT] Account-switch behavior (E2E-10).** John's full spec is
   recorded as item 9 in `orchestration/DOGFOOD-BATCH-1.md`: local access is unrestricted and
   only shared-data operations are gated by the CURRENT logon; opening a collection joined
@@ -256,13 +271,15 @@ but giving the feature to real testers does:
   Deliberately left for later (not needed now): a self-service break-glass (e.g. the original
   `collections.created_by` creator reclaiming admin) — revisit only if recovery volume warrants.
 - **[IMPLEMENTED 28 Sep 2026, BL-16676] Deleting a failed migration.** If the admin starting a
-  cloud collection (sharing a collection, or migrating a folder Team Collection; CONTRACTS.md
-  v1.12, BloomDesktop's `Design/CloudTeamCollections.md` §5 "If it goes badly wrong") cannot finish
+  cloud collection (sharing a collection, or migrating a folder Team Collection; `DESIGN.md` §5
+  "If it goes badly wrong") cannot finish
   the upload — say their computer dies — the Bloom team deletes the incomplete cloud collection and
   someone starts again. It works for any collection, finished or not, so check the id carefully.
   Tooling: `tc.support_delete_collection(collection_id, dry_run = false)` (service-role only)
   deletes the collection row and every `tc` row that belongs to it and returns the row counts per
-  table (`dry_run` only counts; an unknown id returns `found: false`); and
+  table (`dry_run` only counts; an unknown id returns `found: false`). Any unclaimed users the
+  migration created for carried-over checkouts stay in `core.users`: nothing points at them any
+  more, and a later attempt reuses them; and
   `team-collections/support/delete-collection.ps1`, which calls it through PostgREST with the
   service-role key and then deletes every object version and delete marker under the bucket's
   `tc/<collectionId>/` prefix with the AWS CLI (`-EndpointUrl` for MinIO).
@@ -311,9 +328,10 @@ but giving the feature to real testers does:
     **excluding** any path a still-live transaction is uploading.
   - `tc.list_stale_upload_keys(after_key, limit)` (service-role-only) — the same worklist, one
     row per key, keyset-paged in byte ("C") order of the S3 key, at most 1000 per page (PostgREST's
-    `max_rows`). Dead transaction rows stay behind once their garbage is deleted, so the same keys
-    come back on every run; the sweep therefore reads *every* page per run (500 keys a page, the
-    last key of each page as the next cursor), and never stalls on the first page.
+    `max_rows`). The sweep reads *every* page per run (500 keys a page, the last key of each page
+    as the next cursor), and never stalls on the first page. In the v2.0 plan, the reaper deletes a
+    dead attempt once the sweep has deleted its uploads, so the worklist doesn't keep returning the
+    same keys.
   - `sweep-stale-uploads` edge function — for each worklist key, deletes every S3 version newer
     than the referenced one (all of them if nothing references the key), restoring the committed
     version to *current*. Idempotent; service-role-only. Because check-ins continue while it
@@ -387,7 +405,7 @@ the non-Supabase material under `team-collections/` (see `team-collections/READM
 
 This supersedes the single review packaging in PR #8052, which stays the interim review vehicle on
 `cloud-collections` until the split is executed. (Development stayed in one repo for velocity; the
-split happens for release — see `../CloudTeamCollections.md` "Key decisions".)
+split happens for release.)
 
 **[OPEN DECISION] Where the Supabase-dependent test code goes.** Some tests straddle the split:
 
@@ -417,9 +435,10 @@ Prerequisites (mostly already true; verify at merge time):
 1. [AGENT] Final rebase onto master; full folder-TC regression suite green (the widened
    filter `~Cloud|~TeamCollection|~SharingApi` plus the FULL BloomTests run once); vitest
    suite green; E2E matrix green locally.
-2. [HUMAN] Confirm the experimental flag ("Cloud Team Collections (experimental)" in
-   Settings → Advanced) is the ONLY way the new UI appears — merged code must be inert for
-   everyone else. (Verified in Wave 4; re-verify after rebase.)
+2. [HUMAN] Confirm how the UI is exposed. `DESIGN.md` §1: no environment variable gates cloud
+   collections, and the #8052 client's experimental checkbox goes when the Share dialog replaces
+   it; whether the Share button is hidden behind an experimental setting until the backend is live
+   is an open question on BloomDesktop PR #8394.
 3. [AGENT] XLF check: all new strings `translate="no"`, en-only, and **no `--` inside any
    `<note>`** (crashes every launch; rule + history in `.github/skills/xlf-strings/SKILL.md`).
 4. [HUMAN] Normal PR review + team heads-up that `team-collections/` and the `tc` schema are new areas in

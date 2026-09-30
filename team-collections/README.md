@@ -2,10 +2,14 @@
 
 The server side of Bloom's **Cloud Team Collections**: a Postgres schema (`tc`) with RLS and
 RPCs, a set of edge functions that broker scoped S3 credentials for check-in/download, and the
-local stack (Supabase + MinIO) for developing against it. The Bloom desktop client that uses
-this backend lives in the BloomDesktop repo (`src/BloomExe/TeamCollection/Cloud/`), along with
-the project's design notes (`Design/CloudTeamCollections/`); comments here that mention
+local stack (Supabase + MinIO) for developing against it. The design is described in
+`docs/DESIGN.md`. The Bloom desktop client that uses this backend lives in the BloomDesktop repo
+(`src/BloomExe/TeamCollection/Cloud/`, draft PR #8052), whose `cloud-tc-for-review` branch also
+carries the project records (`Design/CloudTeamCollections/`); comments here that mention
 "task NN", `src/...`, or `IMPLEMENTATION.md` refer to that repo.
+
+The docs describe the **planned** data model and API, CONTRACTS v2.0; the schema and edge
+functions here still implement v1.12. `docs/DESIGN.md` section 9 lists the work between them.
 
 ## Where each part lives
 
@@ -23,7 +27,7 @@ the project's design notes (`Design/CloudTeamCollections/`); comments here that 
 | AWS bucket/IAM provisioning for hosted environments | `team-collections/aws/provision-aws.ps1` |
 | Support tool: delete a collection's rows and S3 objects (e.g. a failed migration) | `team-collections/support/delete-collection.ps1` (see `docs/GOING-LIVE.md`, "Deleting a failed migration") |
 | Firebase custom-claim reference code (deployed from BloomLibrary infra) | `team-collections/firebase/` |
-| API contracts, schema overview, go-live runbook | `team-collections/docs/` (`CONTRACTS.md`, `SCHEMA.md`, `GOING-LIVE.md`) |
+| Design overview, API contracts, schema overview, go-live runbook | `team-collections/docs/` (`DESIGN.md`, `CONTRACTS.md`, `SCHEMA.md`, `GOING-LIVE.md`) |
 
 The edge-function names are part of the contract with the Bloom client (see
 `docs/CONTRACTS.md`), so do not rename them.

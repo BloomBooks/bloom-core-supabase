@@ -2,7 +2,8 @@
 
 **Implemented by**: task 02 (edge functions).
 **Consumed by**: task 04 (BloomS3Client), task 03 (CloudEnvironment).
-**Contract version**: 1 (matches CONTRACTS.md v1).
+**Contract**: the S3 credential shape of `CONTRACTS.md` (the `s3` object of `checkin-start`,
+`download-start` and `collection-files-start`), which is the same in versions 1.12 and 2.0.
 
 ---
 

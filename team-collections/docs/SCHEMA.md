@@ -1,191 +1,179 @@
-# Cloud Team Collections — database schema (`tc`)
+# Cloud Team Collections — database schema (`tc` and `core`)
 
-> **Where this lives:** this copy is in the `bloom-core-supabase` repo (`team-collections/docs/`),
-> next to the backend it describes. Paths under `src/`, `Design/`, `tasks/`, `orchestration/`,
-> and mentions of `IMPLEMENTATION.md` or `../CloudTeamCollections.md`, refer to the BloomDesktop
-> repo (its `Design/CloudTeamCollections/` folder), where the desktop client and the project's
-> design notes live.
+> **Status:** this is the **planned** schema of CONTRACTS v2.0, described in `DESIGN.md`. The
+> declarative schema in `supabase/schemas/` still implements CONTRACTS v1.12; the work to bring it
+> here is listed in `DESIGN.md`, section 9. Paths under `src/` refer to the BloomDesktop repo, where
+> the desktop client lives.
 
-Entity-relationship diagram of the Supabase Postgres `tc` schema. Reflects the declarative schema
-in `supabase/schemas/` (the tables live in `03_tables.sql`). Renders on GitHub and in any
-mermaid-aware viewer. See `CONTRACTS.md` for the RPC/edge-function surface that reads and writes
-these tables (clients never write them directly — all mutations go through RLS-gated RPCs / edge
-functions), including how the schema is maintained declaratively.
+Entity-relationship diagram of the Supabase Postgres `tc` schema, and the `core.users` table it
+refers to. The tables live in `supabase/schemas/tc/03_tables.sql`. Renders on GitHub and in any
+mermaid-aware viewer. See `CONTRACTS.md` for the RPC and edge-function surface that reads and
+writes these tables (clients never write them directly: all changes go through RLS-gated RPCs and
+edge functions), including how the schema is maintained declaratively.
+
+Lines are enforced foreign keys. A column that points at `users` says "→ users" rather than being
+drawn as a line, except `members.user_id`, which is how a person belongs to a collection.
+`checkin_attempts` is drawn from its book only; its `collection_id` is a convenience copy of the
+book's.
 
 ```mermaid
 erDiagram
+    collections ||--o{ books : contains
     collections ||--o{ members : "approved accounts"
-    collections ||--o{ books : "contains"
-    collections ||--o{ collection_file_groups : "shared collection files"
-    collections ||--o{ color_palette_entries : "palette colors"
-    collections ||--o{ events : "history log"
-    collections ||--o{ checkin_transactions : "in-flight sends"
-    collections ||--o{ collection_file_transactions : "in-flight group sends"
-    books ||--o{ versions : "commit history (metadata)"
-    books ||--o{ version_files : "current file manifest"
-    books ||--o{ checkin_transactions : "open send"
-    books ||--o{ events : "book events"
-    versions ||--o{ version_files : "manifest rows"
-    collection_file_groups ||--o{ collection_group_files : "current files"
-    books }o..o| versions : "current_version_id (soft)"
-    checkin_transactions }o..o| versions : "base/result (soft)"
+    collections ||--o{ history_events : "history log"
+    collections ||--o{ collection_files : "collection files"
+    collections ||--o{ collection_file_checkin_attempts : "in-flight sends"
+    collections ||--o{ color_palette_entries : palette
+    books ||--o{ book_files : "current files"
+    books ||--o{ checkin_attempts : "in-flight sends"
+    books |o--o{ history_events : "book events"
+    members }o--o| users : "claimed as"
 
     collections {
-        uuid id PK
+        uuid id PK "Bloom CollectionId"
         text name
-        text created_by "user_id"
+        uuid created_by FK "→ users"
         timestamptz created_at
-        boolean initial_upload_in_progress "v1.12; set only at creation"
+        boolean initial_upload_in_progress "set only at creation"
+        bigint collection_files_version "optimistic concurrency"
+        timestamptz collection_files_updated_at
+        uuid collection_files_updated_by FK "→ users"
     }
     members {
         bigint id PK
         uuid collection_id FK
-        text email "lowercased, NFC"
+        text email "the address invited; lowercase, NFC"
         member_role role "admin | member"
-        text user_id "NULL until claimed; never legacy:*"
-        text display_name "v1.6; NULL falls back to email"
-        text added_by
+        uuid user_id FK "→ users, NULL until claimed"
+        uuid added_by FK "→ users"
+        timestamptz added_at
         timestamptz claimed_at
-        timestamptz last_seen_at "v1.11; NULL = never seen"
+        timestamptz last_seen_at "NULL = never seen"
     }
     books {
-        uuid id PK
+        uuid id PK "internal; the API uses instance_id"
         uuid collection_id FK
-        uuid instance_id "Bloom book identity"
-        text name "NFC-normalized"
-        uuid current_version_id "soft FK to versions"
-        bigint current_version_seq "denormalized"
+        uuid instance_id "Bloom book identity; unique per collection"
+        text name "display only; not unique"
+        bigint current_version "NULL = first check-in in progress"
         text current_checksum
-        text locked_by "NULL = not checked out; user id or legacy:email"
+        uuid locked_by FK "→ users, NULL = free"
         text locked_by_machine "display only"
-        text checkout_guid_hash "v1.9; hex SHA-256 of the checkout GUID; member-readable"
         timestamptz locked_at
+        text checkout_guid_hash "hex SHA-256 of the checkout GUID; member-readable"
         timestamptz deleted_at "tombstone; NULL = live"
-        text created_by
+        timestamptz created_at
     }
-    versions {
-        uuid id PK
-        uuid book_id FK
-        uuid collection_id "denormalized (no FK)"
-        bigint seq "monotonic per book"
-        text checksum
-        text comment "check-in comment"
-        text created_by
-        text client_version
-    }
-    version_files {
-        bigint id PK
-        uuid book_id FK
-        uuid version_id FK
-        text path "NFC-normalized"
+    book_files {
+        uuid book_id PK, FK
+        text path PK "NFC; main htm stored as index.htm"
         text sha256
         bigint size_bytes
         text s3_version_id "captured at PUT"
     }
-    collection_file_groups {
-        bigint id PK
+    checkin_attempts {
+        uuid id PK
         uuid collection_id FK
-        text group_key "other | allowed-words | sample-texts"
-        bigint version
-        text updated_by
+        uuid book_id FK
+        uuid started_by FK "→ users"
+        text proposed_name
+        bigint base_book_version "finish re-checks it"
+        text changed_paths "text[], NFC"
+        jsonb proposed_files "full manifest at start, paths NFC"
+        text checksum
+        text client_version
+        text checkout_guid_hash "book's checkout at start; finish re-checks it"
+        text status "open | finished | aborted | expired"
+        timestamptz started_at
+        timestamptz expires_at
+        bigint resulting_book_version "set on finish"
     }
-    collection_group_files {
-        bigint id PK
-        bigint group_id FK
-        text path
+    history_events {
+        bigint id PK "polling cursor"
+        uuid collection_id FK
+        uuid book_id FK "SET NULL on book delete"
+        integer type "BookHistoryEventType; 100 and up for cloud"
+        uuid by_user_id FK "→ users"
+        bigint book_version
+        jsonb lock_info
+        text book_name "name at event time"
+        text message "comment / incident detail"
+        text bloom_version
+        timestamptz occurred_at
+    }
+    collection_files {
+        uuid collection_id PK, FK
+        text path PK "relative to the collection folder, NFC"
         text sha256
         bigint size_bytes
         text s3_version_id
+    }
+    collection_file_checkin_attempts {
+        uuid id PK
+        uuid collection_id FK
+        uuid started_by FK "→ users"
+        bigint expected_version "optimistic concurrency"
+        jsonb proposed_files
+        text changed_paths "text[]"
+        text status "open | finished | aborted | expired"
+        timestamptz expires_at
+        bigint resulting_version
     }
     color_palette_entries {
         bigint id PK
         uuid collection_id FK
         text palette
         text color
-        text added_by
+        uuid added_by FK "→ users"
+        timestamptz added_at
     }
-    events {
-        bigint id PK
-        uuid collection_id FK
-        uuid book_id FK "SET NULL on book delete"
-        integer type "0 CheckOut..8 Deleted, 100 WorkPreserved"
-        text by_user_id
-        text by_user_name
-        text by_email
-        bigint book_version_seq
-        jsonb lock_info
-        text book_name "name at event time"
-        text group_key
-        text message "comment / incident detail"
-        text bloom_version
-        timestamptz occurred_at
-    }
-    checkin_transactions {
-        uuid id PK
-        uuid collection_id FK
-        uuid book_id FK
-        text started_by
-        text proposed_name
-        uuid base_version_id "book's version at start; finish re-checks it"
-        text changed_paths "text[], NFC"
-        jsonb proposed_files "full manifest at start, paths NFC"
-        text checksum
-        uuid result_version_id "soft FK; set on finish"
-        bigint result_seq
-        text checkout_guid_hash "v1.9; book's checkout at start; finish re-checks it"
-        bigint revision "bumped by each start resume; finish passes the one it verified"
-        text status "open | finished | aborted | expired"
-        timestamptz expires_at
-    }
-    collection_file_transactions {
-        uuid id PK
-        uuid collection_id FK
-        text group_key
-        text started_by
-        bigint expected_version "optimistic concurrency"
-        jsonb proposed_files
-        text changed_paths "text[]"
-        text status "open | finished | aborted | expired"
-        bigint result_version
-        bigint revision "bumped by each start resume; finish passes the one it verified"
+    users {
+        uuid id PK "core schema; never changes"
+        text authentication_id "Firebase uid or local GoTrue id; NULL = unclaimed"
+        text email "unique, lowercase, NFC"
+        text name "from Bloom's Registration dialog"
+        timestamptz created_at
     }
 ```
 
 ## Notes for readers
 
-- **`collections` is the hub.** Almost everything hangs off a collection; a member's access to
-  any row is decided by their `members` row for that collection (enforced by RLS, not shown here).
-- **Book identity vs. name.** `books.instance_id` is Bloom's durable book identity (from the
-  book's `meta.json`); `books.name` is the display/folder name and can change (rename-on-checkin).
-  The client resolves by `instance_id`, never by name.
-- **Versions & files.** Each check-in appends a `versions` row (monotonic `seq`) and rebuilds the
-  current manifest in `version_files` (path + sha256 + size + the S3 object `s3_version_id`, so a
-  download can pin the exact committed bytes). `books.current_version_id/seq/checksum` are
-  denormalized pointers to the newest version for fast status reads.
-- **`version_files` holds only the CURRENT version's files, not a history.** Check-in does
-  `DELETE … WHERE book_id = …` then re-inserts, so superseded file rows are pruned; all rows for a
-  book share the current `version_id`. That is why `version_files` carries `book_id` even though it
-  is derivable via `version_id → versions.book_id`: the two hot operations — "read this book's
-  current files" (`get_book_manifest`) and "replace this book's files" (check-in) — are both keyed
-  on `book_id`, and the prune-to-current makes a `WHERE book_id` query consistent without joining
-  through `current_version_id`. `version_id` is retained as the provenance stamp (returned as
-  `versionId`) and the `ON DELETE CASCADE` tie. Consequence: `versions` keeps only per-version
-  *metadata* (seq/checksum/comment); the file list of an older version is not retained in the DB
-  (the bytes remain in the versioned S3 bucket, but no DB-side arbitrary-version restore exists).
-- **Soft references (dashed lines).** `books.current_version_id`, `checkin_transactions.base_version_id`
-  and `.result_version_id` are logical references to `versions`, deliberately **not** enforced FK
-  constraints (an enforced `books → versions` FK would be circular with `versions → books`).
-- **Collection files** (the non-book shared files: `.bloomCollection`, custom styles, Allowed
-  Words, Sample Texts) live in `collection_file_groups` (one row per `group_key`, with a version
-  counter) + `collection_group_files` (the current per-file manifest) — the collection-level
-  analogue of `versions`/`version_files`.
-- **The two `*_transactions` tables are ephemeral.** They hold in-flight state for the two-phase
-  check-in / collection-files protocols (start → upload to S3 → finish); rows are reaped when
-  `expires_at` passes. They are not part of the durable data model. Start stores the proposed
-  manifest with every path NFC-normalized, so the keys the client uploads to and the paths
-  committed at finish are spelled the same way.
+- **`collections` is the hub.** Almost everything hangs off a collection; a person's access to any
+  row is decided by their claimed `members` row for that collection (enforced by RLS, not shown
+  here).
+- **`core.users`** holds one row per person, with an id of Bloom's own. `tc.current_user_id()`
+  looks the token's `sub` up in `authentication_id`. Rows are created only when needed (a claimed
+  invitation, or a collection's first admin). An **unclaimed user** has an email and no
+  `authentication_id`, so nobody can sign in as it; it holds checkouts carried over from a folder
+  Team Collection (`lock_book_for_legacy_checkout`), and the first verified sign-in with that email
+  claims it. `name` comes from Bloom's Registration dialog at every sign-in. The `core` schema is
+  not exposed through the API; only SECURITY DEFINER functions in `tc` reach it.
+- **Book identity vs. name.** `(collection_id, instance_id)` is unique, deleted books included, and
+  is how the API names a book; `books.id` is used only inside the database. `books.name` is the name
+  the book should have, for display (status, the join list, history). It isn't unique: each copy of
+  the collection chooses its own folder names, adding a suffix when a name is taken locally.
+- **Versions and files.** A book's version is a number, `books.current_version`, which each commit
+  increases by one. Each commit replaces the book's rows in `book_files` (path, sha256, size and the
+  S3 object's `s3_version_id`, so a download can pin the exact committed bytes), so `book_files` is
+  the files that make up the book now. There is no table of past versions: the history of versions
+  is the book's CheckIn events (version number, comment, author, Bloom version, time), and an older
+  version's file list is not kept (its bytes stay in the versioned S3 bucket until they expire).
+- **The main `.htm` is stored as `index.htm`**, whatever the local folder is called, so every copy's
+  manifest lists the same files and a rename changes no files.
+- **Collection files** (the non-book shared files: `.bloomCollection`, custom styles,
+  `configuration.txt`, reader-tools settings, Allowed Words, Sample Texts) are one set per
+  collection in `collection_files`, with the version counter on `collections`: the collection-level
+  analogue of `book_files`. Only an admin sends them.
+- **The two `*_checkin_attempts` tables** hold in-flight and recently ended two-phase sends (start,
+  upload to S3, finish). A start resumes an open attempt only if its proposal is identical, and
+  otherwise aborts it and opens a new one, so a finish can only commit the proposal of the start
+  that returned its id. The reaper marks an open attempt `expired` after 48 hours, deletes a finished
+  attempt once its expiry has passed, and deletes an aborted or expired attempt once the
+  orphaned-upload sweep has deleted its uploads (those attempts are the sweep's worklist). Start
+  stores the proposed manifest with every path NFC-normalized, so the keys the client uploads to and
+  the paths committed at finish are spelled the same way.
 - **Checkout GUID.** The client checking a book out makes a random GUID, keeps it in the book
-  folder's `.checkout` file and sends it to `checkout_book` (v1.10; a retry with the same GUID is
+  folder's `.checkout` file and sends it to `checkout_book` (a retry with the same GUID is
   idempotent). `books.checkout_guid_hash` holds only its hash (lowercase hex SHA-256 of the
   lowercase GUID). A book locked with a NULL hash is under a send-only lock: `checkin-start` took it
   for a first check-in or a check-in of a free book, and finish (even with keepCheckedOut), abort
@@ -195,25 +183,24 @@ erDiagram
   holder, and `checkout_book_takeover` by another account, all require the GUID; `force_unlock`
   (admin) does not. The `books_clear_checkout_on_unlock` trigger clears the hash whenever the lock is
   released or changes hands without a new GUID (`checkout_book_takeover` alone keeps it on purpose).
-- **`members.last_seen_at`** (v1.11) is when that member last had that collection open in Bloom,
-  per membership: `get_collection_state` and `get_changes` set the caller's own row to now() unless
-  it is already less than 10 minutes old, so a polling client writes it about once per 10 minutes.
-  NULL means never seen (invited only). The Share dialog shows it as "Last seen"; it emits no event.
-- **`collections.initial_upload_in_progress`** (v1.12) is TRUE while the admin who started the
-  collection is still uploading it (sharing an ordinary collection or migrating a folder Team
-  Collection). Only `create_collection(..., initial_upload: true)` sets it and
-  `finish_initial_upload` clears it for good; meanwhile `my_collections` leaves the collection out
-  and placeholder locks may be placed.
-- **Placeholder lock holders** (v1.12). `books.locked_by` is plain text with no foreign key: a user
-  id (JWT `sub`), or a placeholder `legacy:<email>` (lowercased, trimmed, NFC) for a book that was
-  checked out to `<email>` in the old folder Team Collection when it was migrated
-  (`lock_book_for_legacy_checkout`). No account has such an id (the
-  `members_user_id_not_placeholder` CHECK keeps `legacy:` ids out of `members.user_id`, and every
-  holder check also requires a claimed membership), so only `checkout_book_takeover` with the GUID
-  or `force_unlock` ends it; `resolve_member_display` shows the email.
-- **`events`** is the append-only history log behind the History panel and realtime broadcasts;
-  `type` is the numeric `BookHistoryEventType`. `book_id` is nullable (`ON DELETE SET NULL`) so a
-  book's history survives its deletion.
+- **`members.last_seen_at`** is when that member last had that collection open in Bloom, per
+  membership: `get_collection_state` and `get_changes` set the caller's own row to now() unless it is
+  already less than 10 minutes old, so a polling client writes it about once per 10 minutes. NULL
+  means never seen (invited only). The Share dialog shows it as "Last seen"; it emits no event.
+- **`collections.initial_upload_in_progress`** is TRUE while the admin who started the collection is
+  still uploading it (sharing an ordinary collection or migrating a folder Team Collection). Only
+  `create_collection(..., initial_upload: true)` sets it and `finish_initial_upload` clears it for
+  good; meanwhile `my_collections` leaves the collection out and `lock_book_for_legacy_checkout` may
+  lock books to unclaimed users.
+- **`history_events`** is the append-only history log behind the History panel and realtime
+  broadcasts, and the change feed behind polling; `type` is the numeric `BookHistoryEventType`,
+  plus the cloud types 100 (WorkPreservedLocally), 101 (CheckOutReleased) and 102
+  (CollectionFilesCheckIn, which has no book). `book_id` is nullable (`ON DELETE SET NULL`) so a
+  book's history survives its deletion. Authors are shown by their current `users.name`.
+- **Indexes** are the unique constraints plus those the queries need; none repeats a unique
+  constraint's leading column.
+- **Open:** whether the backend should hold `color_palette_entries` at all (see `DESIGN.md`,
+  section 9).
 
 ## Updating this diagram
 
@@ -227,13 +214,12 @@ table change lands: a new / removed / renamed table or column, or a changed fore
 
    ```bash
    git grep -nE "CREATE TABLE"    -- supabase/schemas/tc/03_tables.sql   # every table
-   git grep -nE "REFERENCES tc\." -- supabase/schemas/tc/03_tables.sql   # foreign keys
+   git grep -nE "REFERENCES "     -- supabase/schemas/tc/03_tables.sql   # foreign keys
    ```
 
    (Or run `supabase db reset` and inspect the live schema, e.g. in Studio.)
 3. Preview before committing: paste the fenced ```mermaid block into <https://mermaid.live>, or
    view the file on GitHub, which renders it natively.
 
-Keep the two kinds of reference honest: solid lines are enforced foreign keys; dashed lines
-(`..`) are the deliberate soft references (`current_version_id`, `base/result_version_id`). If you
-add or enforce one of those, change its line style to match.
+Keep the diagram's conventions: lines are enforced foreign keys; a column that points at `users`
+says "→ users" instead of being drawn, except `members.user_id`.

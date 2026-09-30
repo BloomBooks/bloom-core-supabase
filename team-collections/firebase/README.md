@@ -5,9 +5,10 @@ reviewed reference, not code this repo builds, tests, or deploys.** The Bloom de
 repo) only *consumes* the resulting JWTs (BloomDesktop's `src/BloomExe/TeamCollection/Cloud/CloudAuth.cs`'s
 `FirebaseCloudAuthProvider`); it has no Firebase Admin SDK credentials and should never need
 any. See `team-collections/docs/GOING-LIVE.md` Phase 3.3 for where this sits in the
-overall go-live sequence, and BloomDesktop's `Design/CloudTeamCollections.md` "Auth" bullet for why Option A
-was chosen over exchanging the legacy Parse session (Option B) or hand-validating Firebase JWTs
-ourselves (Option C).
+overall go-live sequence (its step 1.1 records why Option A was chosen over exchanging the
+legacy Parse session, Option B, or hand-validating Firebase JWTs ourselves, Option C), and
+`team-collections/docs/DESIGN.md` section 3, "Identity", for how the server maps the token to a
+person.
 
 ## Why this claim exists
 
@@ -56,7 +57,7 @@ admin vs. member of a given collection, who can claim an approval, etc.) is enti
    ```
 4. Sanity-check: sign in to Bloom's Cloud Team Collection sign-in dialog with a pre-existing
    BloomLibrary account and confirm `sharing/loginState` reports `signedIn: true` with the
-   correct email (see `CONTRACTS.md`'s "Auth (Option A)" section for the endpoint that
+   correct email (see `CONTRACTS.md`'s "Auth: token-receipt endpoint" section for the endpoint that
    completes this).
 
 ## Local dev stack has no equivalent
