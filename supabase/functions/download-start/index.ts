@@ -1,7 +1,7 @@
 // POST /functions/v1/download-start — CONTRACTS.md §download-start
 // Req: { collectionId } -> 200 { s3: {...} } read-only creds
 // (GetObject + GetObjectVersion) scoped tc/{cid}/*, 1h.
-import { requireField, serveJsonPost } from "../_shared/tc/handler.ts";
+import { requireField, serveJsonPost, requireUuidField } from "../_shared/tc/handler.ts";
 import { jsonResponse } from "../_shared/tc/errors.ts";
 import { callTcRpc } from "../_shared/tc/rpc.ts";
 import { getScopedCredentials } from "../_shared/tc/s3.ts";
@@ -15,7 +15,7 @@ export const handler = async (
     req: Request,
     body: Record<string, unknown>,
 ): Promise<Response> => {
-    const collectionId = requireField<string>(body, "collectionId");
+    const collectionId = requireUuidField(body, "collectionId");
 
     await callTcRpc(req, "download_start_check", {
         p_collection_id: collectionId,

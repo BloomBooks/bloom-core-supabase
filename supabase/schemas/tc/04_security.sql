@@ -116,8 +116,8 @@ GRANT ALL ON FUNCTION tc.download_start_check(p_collection_id uuid) TO authentic
 GRANT ALL ON FUNCTION tc.finish_initial_upload(p_collection_id uuid) TO authenticated;
 GRANT ALL ON FUNCTION tc.force_unlock(p_collection_id uuid, p_instance_id uuid) TO authenticated;
 
-REVOKE ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) TO service_role;
+REVOKE ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[]) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[]) TO service_role;
 
 GRANT ALL ON FUNCTION tc.get_book_manifest(p_collection_id uuid, p_instance_id uuid) TO authenticated;
 

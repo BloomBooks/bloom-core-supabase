@@ -179,6 +179,7 @@ Deno.test(
             Versions: [version("something-else", true)],
         });
         s3.on(DeleteObjectCommand).resolves({});
+        const calls: RecordedCall[] = [];
 
         const res = await withMockFetch(
             worklistFetch([
@@ -187,7 +188,7 @@ Deno.test(
                     s3_key: KEY,
                     referenced_version_id: "committed-but-gone",
                 },
-            ]),
+            ], undefined, calls),
             () => callHandler(handler, mockRequest({}, serviceRoleToken), {}),
         );
 
@@ -199,6 +200,11 @@ Deno.test(
             attemptsForgotten: FORGOTTEN,
         });
         assertEquals(s3.commandCalls(DeleteObjectCommand).length, 0);
+        // The key stays on the worklist: its attempts are not forgotten.
+        assertEquals(
+            calls.find((c) => c.url.includes("rpc/forget_swept_attempts"))?.body?.p_keep_keys,
+            [KEY],
+        );
         s3.restore();
     },
 );

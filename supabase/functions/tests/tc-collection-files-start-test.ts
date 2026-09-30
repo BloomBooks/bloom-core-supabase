@@ -16,7 +16,7 @@ setTestEnv();
 const { handler } = await import("../collection-files-start/index.ts");
 
 const VALID_BODY = {
-    collectionId: "col-1",
+    collectionId: "c0110000-0000-4000-8000-000000000001",
     expectedVersion: 0,
     files: [{ path: "Allowed Words/allowed.txt", sha256: "abc", size: 3 }],
 };
@@ -42,9 +42,9 @@ Deno.test(
         const json = await res.json();
         assertEquals(json.transactionId, "tx-1");
         assertEquals(json.changedPaths, ["Allowed Words/allowed.txt"]);
-        assertEquals(json.s3.prefix, "tc/col-1/collectionFiles/");
+        assertEquals(json.s3.prefix, "tc/c0110000-0000-4000-8000-000000000001/collectionFiles/");
         assertEquals(calls[0]?.body, {
-            p_collection_id: "col-1",
+            p_collection_id: "c0110000-0000-4000-8000-000000000001",
             p_expected_version: 0,
             p_files: VALID_BODY.files,
         });

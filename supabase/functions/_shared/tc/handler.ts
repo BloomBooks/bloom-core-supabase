@@ -21,6 +21,23 @@ export const requireField = <T>(
     return value as T;
 };
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A required id field, which must be a UUID; returned lowercase, the form the database
+ * stores and prints. S3 keys are built from ids (tc/{collectionId}/books/{instanceId}/...)
+ * and compared byte for byte, while Postgres accepts other spellings of a UUID (upper case,
+ * braces), so an id is canonicalized before any key or credential scope is made from it. */
+export const requireUuidField = (
+    body: Record<string, unknown>,
+    name: string,
+): string => {
+    const value = requireField<unknown>(body, name);
+    if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+        throw new HttpError(400, { error: "invalid_request", field: name });
+    }
+    return value.toLowerCase();
+};
+
 export const optionalField = <T>(
     body: Record<string, unknown>,
     name: string,

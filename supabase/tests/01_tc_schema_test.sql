@@ -11,7 +11,7 @@
 BEGIN;
 
 -- Load pgTAP
-SELECT plan(72);   -- update count when tests are added/removed
+SELECT plan(74);   -- update count when tests are added/removed
 
 -- =============================================================================
 -- 0. Sanity: schemas and key tables exist, and the tables the plan dropped do not
@@ -662,8 +662,31 @@ SELECT ok(
     '12f: only the dead attempt is gone; the live one is kept'
 );
 SELECT ok(
-    NOT has_function_privilege('authenticated', 'tc.forget_swept_attempts(timestamp with time zone)', 'EXECUTE'),
+    NOT has_function_privilege('authenticated', 'tc.forget_swept_attempts(timestamp with time zone, text[])', 'EXECUTE'),
     '12g: authenticated cannot execute forget_swept_attempts (service-role only)'
+);
+
+-- 12h-i: a dead attempt that touched a key the sweep could not clean (its referenced version
+-- is missing) is kept, so the key stays on the worklist.
+DO $$
+BEGIN
+    INSERT INTO tc.checkin_attempts (id, collection_id, book_id, started_by, proposed_name,
+                                     changed_paths, status, started_at, expires_at)
+    VALUES ('e4000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001',
+            'eb000000-0000-0000-0000-000000000001', tests.uid('user-alice-001'), 'Sweep Fixture Book',
+            ARRAY['keep.htm'], 'expired', now() - interval '3 days', now() - interval '1 day');
+END;
+$$;
+SELECT is(
+    tc.forget_swept_attempts(now() - interval '1 day' - interval '45 hours',
+        ARRAY['tc/a0000000-0000-0000-0000-000000000001/books/cccccccc-cccc-cccc-cccc-cccccccccccc/keep.htm']),
+    0,
+    '12h: an attempt that touched a key the sweep could not clean is kept'
+);
+SELECT is(
+    tc.forget_swept_attempts(now() - interval '1 day' - interval '45 hours'),
+    1,
+    '12i: once no key needs keeping, it is forgotten'
 );
 
 -- =============================================================================

@@ -238,6 +238,11 @@ files: [{path, sha256, size}], checkoutGuid? }`
   `LockHeldByOther` with `holder: {userId, name, email, machine, lockedAt}`. If `baseVersion` is
   sent and the book has moved on, 409 `BaseVersionSuperseded` (`currentVersion`).
 - The S3 credentials are obtained before the lock is taken; a refused start returns none.
+- `collectionId` and `instanceId` must be UUIDs (else 400 `invalid_request` with `field`); the key
+  prefix uses their lowercase form, the database's, whatever case the client sends. The same holds
+  for `collectionId` in `download-start` and `collection-files-start`.
+- A person's starts for one book run one at a time, so a start re-sent while the first is still
+  running resumes (or replaces) the attempt the first one opened.
 - Every `files[].path` is NFC-normalized before anything else, and validated: it must be a
   non-empty relative path (no leading `/`, no empty, `.` or `..` segment), with a `sha256` string
   and a non-negative integer `size`; two entries whose paths are equal after normalization are
@@ -318,7 +323,9 @@ Its worklist is the aborted and expired attempts; it reads it a page at a time
 (`tc.list_stale_upload_keys(after_key, limit)`, keyset-paged by S3 key, every page per run), deletes
 only versions older than `UPLOAD_SWEEP_GRACE_MS` (48 h), and re-checks each key just before
 deleting. After the last page it calls `tc.forget_swept_attempts(cutoff)` with the run's cutoff
-(now minus the grace), which deletes each dead attempt whose uploads are all older than that: every
+(now minus the grace) and the keys it could not clean because their committed version is missing
+from S3 (those need a person to look, and their attempts are kept so they stay on the worklist). It
+deletes each other dead attempt whose uploads are all older than the cutoff: every
 upload of an attempt uses credentials from its latest start, which set its expiry to that start +
 48 h and last 1 h, so none is newer than `expires_at - 47 h` (the function allows one more hour for
 clock differences). A run that fails partway forgets nothing. Because the finish functions never

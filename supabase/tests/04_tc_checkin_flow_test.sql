@@ -31,7 +31,7 @@
 
 BEGIN;
 
-SELECT plan(107);
+SELECT plan(109);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -497,6 +497,16 @@ SELECT ok(
     pg_get_functiondef('tc.checkin_start_tx(uuid, uuid, text, bigint, text, text, jsonb, text)'::regprocedure)
         ~ 'FROM tc.checkin_attempts\s+WHERE book_id = v_book_id AND started_by = v_user_id AND status = ''open''\s+FOR UPDATE;\s+SELECT \* INTO v_book FROM tc.books WHERE id = v_book_id FOR UPDATE',
     '9a: checkin_start_tx locks the caller''s open attempt, then the book row, before checking anything'
+);
+SELECT ok(
+    pg_get_functiondef('tc.checkin_start_tx(uuid, uuid, text, bigint, text, text, jsonb, text)'::regprocedure)
+        ~ 'pg_advisory_xact_lock\(hashtextextended\(\s+''tc\.checkin_start:''.*PERFORM tc\.reap_expired_checkin_attempts\(\).*FOR UPDATE',
+    '9a2: checkin_start_tx serializes one person''s starts per book before taking any row lock (a re-sent start resumes)'
+);
+SELECT ok(
+    pg_get_functiondef('tc.collection_files_start_tx(uuid, bigint, jsonb)'::regprocedure)
+        ~ 'pg_advisory_xact_lock\(hashtextextended\(\s+''tc\.collection_files_start:''.*PERFORM tc\.reap_expired_checkin_attempts\(\).*FOR UPDATE',
+    '9a3: collection_files_start_tx does the same per person and collection'
 );
 SELECT ok(
     pg_get_functiondef('tc.checkin_finish_tx(uuid, uuid, text, boolean, jsonb)'::regprocedure)

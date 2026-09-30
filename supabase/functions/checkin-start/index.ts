@@ -10,6 +10,7 @@ import {
     optionalField,
     requireField,
     serveJsonPost,
+    requireUuidField,
 } from "../_shared/tc/handler.ts";
 import { jsonResponse } from "../_shared/tc/errors.ts";
 import { callTcRpc } from "../_shared/tc/rpc.ts";
@@ -28,8 +29,8 @@ export const handler = async (
     req: Request,
     body: Record<string, unknown>,
 ): Promise<Response> => {
-    const collectionId = requireField<string>(body, "collectionId");
-    const instanceId = requireField<string>(body, "instanceId");
+    const collectionId = requireUuidField(body, "collectionId");
+    const instanceId = requireUuidField(body, "instanceId");
     const proposedName = requireField<string>(body, "proposedName");
     const checksum = requireField<string>(body, "checksum");
     const clientVersion = requireField<string>(body, "clientVersion");

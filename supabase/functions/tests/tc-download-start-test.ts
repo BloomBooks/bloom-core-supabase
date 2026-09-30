@@ -23,14 +23,14 @@ Deno.test(
         ]);
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest({ collectionId: "col-1" }), {
-                collectionId: "col-1",
+            callHandler(handler, mockRequest({ collectionId: "c0110000-0000-4000-8000-000000000001" }), {
+                collectionId: "c0110000-0000-4000-8000-000000000001",
             }),
         );
 
         assertEquals(res.status, 200);
         const json = await res.json();
-        assertEquals(json.s3.prefix, "tc/col-1/");
+        assertEquals(json.s3.prefix, "tc/c0110000-0000-4000-8000-000000000001/");
         assertEquals(json.s3.credentials.sessionToken, "T");
 
         stsMock.restore();
@@ -50,8 +50,8 @@ Deno.test(
         ]);
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest({ collectionId: "col-1" }), {
-                collectionId: "col-1",
+            callHandler(handler, mockRequest({ collectionId: "c0110000-0000-4000-8000-000000000001" }), {
+                collectionId: "c0110000-0000-4000-8000-000000000001",
             }),
         );
 

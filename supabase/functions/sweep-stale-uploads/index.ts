@@ -91,7 +91,9 @@ export const handler = async (
 
     let keysProcessed = 0;
     let versionsDeleted = 0;
-    let referencedMissing = 0;
+    // Keys whose committed version is missing from S3: not cleaned, and needing a person
+    // to look, so their attempts must stay on the worklist.
+    const referencedMissingKeys: string[] = [];
     let keysChanged = 0;
     const cutoff = Date.now() - UPLOAD_SWEEP_GRACE_MS;
 
@@ -108,7 +110,7 @@ export const handler = async (
             keysProcessed++;
             const result = await sweepKey(req, client, bucket, row, cutoff);
             versionsDeleted += result.deleted;
-            if (result.outcome === "referencedMissing") referencedMissing++;
+            if (result.outcome === "referencedMissing") referencedMissingKeys.push(row.s3_key);
             if (result.outcome === "changed") keysChanged++;
         }
         if (page.length < SWEEP_PAGE_SIZE) break;
@@ -116,14 +118,18 @@ export const handler = async (
     }
 
     // Only after every page: a run that stopped early (an error thrown above) forgets nothing.
+    // A key skipped as "changed" needs no keeping: whatever check-in touched it since either
+    // commits (the garbage becomes noncurrent, which the lifecycle rule expires) or dies (its
+    // own attempt puts the key back on the worklist).
     const attemptsForgotten = await callTcRpc<number>(req, "forget_swept_attempts", {
         p_cutoff: new Date(cutoff).toISOString(),
+        p_keep_keys: referencedMissingKeys,
     });
 
     return jsonResponse(200, {
         keysProcessed,
         versionsDeleted,
-        referencedMissing,
+        referencedMissing: referencedMissingKeys.length,
         keysChanged,
         attemptsForgotten,
     });

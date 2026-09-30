@@ -159,6 +159,53 @@ Deno.test(
 );
 
 Deno.test(
+    "checkin-start: ids are lowercased before the prefix and the RPC use them; a non-UUID id is 400",
+    async () => {
+        const stsMock = stubAssumeRole();
+        const calls: RecordedCall[] = [];
+        const fetchStub = routedFetchStub(
+            [
+                {
+                    when: "rpc/checkin_start_tx",
+                    status: 200,
+                    body: { transactionId: "tx-1", changedPaths: [] },
+                },
+            ],
+            calls,
+        );
+        const upper = {
+            ...VALID_BODY,
+            collectionId: "ABCDEF00-1111-4111-8111-111111111111",
+            instanceId: "ABCDEF00-2222-4222-8222-222222222222",
+        };
+        assertEquals(upper.instanceId.toLowerCase() !== upper.instanceId, true, "test data sanity check");
+
+        const res = await withMockFetch(fetchStub, () =>
+            callHandler(handler, mockRequest(upper), upper),
+        );
+
+        assertEquals(res.status, 200);
+        assertEquals(
+            (await res.json()).s3.prefix,
+            "tc/abcdef00-1111-4111-8111-111111111111/books/abcdef00-2222-4222-8222-222222222222/",
+            "the key prefix must match the database's (lowercase) spelling, which finish uses",
+        );
+        assertEquals(calls[0]?.body?.p_instance_id, "abcdef00-2222-4222-8222-222222222222");
+
+        for (const bad of ["{22222222-2222-2222-2222-222222222222}", "not-a-uuid"]) {
+            const body = { ...VALID_BODY, instanceId: bad };
+            const badRes = await withMockFetch(routedFetchStub([]), () =>
+                callHandler(handler, mockRequest(body), body),
+            );
+            assertEquals(badRes.status, 400, `instanceId ${bad}`);
+            assertEquals((await badRes.json()).field, "instanceId");
+        }
+
+        stsMock.restore();
+    },
+);
+
+Deno.test(
     "checkin-start: missing required field -> 400 before any RPC/S3 call",
     async () => {
         const stsMock = stubAssumeRole();

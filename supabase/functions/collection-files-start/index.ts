@@ -2,7 +2,7 @@
 // Req: { collectionId, expectedVersion, files[] } -> two-phase like check-in. files is the
 // collection's whole set of collection files, paths relative to the collection folder.
 // Admin only (403 admin_required). 409 VersionConflict ⇒ client receives first (repo-wins rule).
-import { requireField, serveJsonPost } from "../_shared/tc/handler.ts";
+import { requireField, serveJsonPost, requireUuidField } from "../_shared/tc/handler.ts";
 import { jsonResponse } from "../_shared/tc/errors.ts";
 import { callTcRpc } from "../_shared/tc/rpc.ts";
 import { getScopedCredentials, S3_WRITE_ACTIONS } from "../_shared/tc/s3.ts";
@@ -19,7 +19,7 @@ export const handler = async (
     req: Request,
     body: Record<string, unknown>,
 ): Promise<Response> => {
-    const collectionId = requireField<string>(body, "collectionId");
+    const collectionId = requireUuidField(body, "collectionId");
     const expectedVersion = requireField<number>(body, "expectedVersion");
     const files = requireField<unknown[]>(body, "files");
 

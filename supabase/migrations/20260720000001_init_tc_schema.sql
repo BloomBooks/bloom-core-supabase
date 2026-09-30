@@ -677,6 +677,14 @@ BEGIN
     -- the committed manifest all use the same spelling of every path.
     v_files := tc._normalize_proposed_files(p_files);
 
+    -- One start at a time per person and book: a start re-sent while the first is still
+    -- running then finds the attempt the first one opened (and resumes or replaces it)
+    -- instead of missing it and opening a second one, which checkin_attempts_one_open_uq
+    -- would refuse. Taken before any row lock; finish and abort do not take it.
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'tc.checkin_start:' || p_collection_id::text || ':' || p_instance_id::text
+        || ':' || v_user_id::text, 0));
+
     PERFORM tc.reap_expired_checkin_attempts();
 
     -- ---- Find the book, or create a new book's row -----------------------------------
@@ -1180,9 +1188,17 @@ BEGIN
     -- Same NFC normalization/validation as checkin_start_tx, for the same reason.
     v_files := tc._normalize_proposed_files(p_files);
 
+    -- One start at a time per person and collection, as in checkin_start_tx: a re-sent start
+    -- then finds the attempt the first one opened (and resumes it) instead of opening a
+    -- second one. Taken before any row lock; the finish does not take it.
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'tc.collection_files_start:' || p_collection_id::text || ':' || v_user_id::text, 0));
+
     PERFORM tc.reap_expired_checkin_attempts();
 
-    -- Lock order: the caller's open attempt, then the collection row (as in the finish).
+    -- The caller's open attempt is locked before it is compared below, so a finish of it
+    -- either commits first (and this start no longer finds it open) or waits for this start.
+    -- The collection's version is read unlocked: the finish re-checks it under a row lock.
     SELECT * INTO v_existing FROM tc.collection_file_checkin_attempts
     WHERE collection_id = p_collection_id AND started_by = v_user_id AND status = 'open'
     FOR UPDATE;
@@ -1444,7 +1460,7 @@ $$;
 
 COMMENT ON FUNCTION tc.force_unlock(p_collection_id uuid, p_instance_id uuid) IS 'CONTRACTS.md: force_unlock — admin-only; releases any lock (and with it the checkout GUID); emits ForcedUnlock (type=5) with the old lock in lock_info.';
 
-CREATE OR REPLACE FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) RETURNS integer
+CREATE OR REPLACE FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[] DEFAULT '{}'::text[]) RETURNS integer
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 DECLARE
@@ -1460,21 +1476,35 @@ BEGIN
     -- expires_at - 47 h. A sweep run that deleted versions older than p_cutoff has therefore
     -- deleted all of a dead attempt's garbage once expires_at - 47 h < p_cutoff; one more hour
     -- covers clock differences between S3, the edge runtime and the database.
-    DELETE FROM tc.checkin_attempts
-    WHERE status IN ('aborted', 'expired')
-      AND expires_at - interval '46 hours' < p_cutoff;
+    --
+    -- An attempt that touched one of p_keep_keys stays: the sweep could not clean those keys
+    -- (their referenced version is missing from S3, which needs a person to look at it), and
+    -- the attempt is what keeps them on the worklist.
+    DELETE FROM tc.checkin_attempts t
+    WHERE t.status IN ('aborted', 'expired')
+      AND t.expires_at - interval '46 hours' < p_cutoff
+      AND NOT EXISTS (
+          SELECT 1 FROM tc.list_stale_upload_garbage() g
+          WHERE g.transaction_kind = 'book' AND g.transaction_id = t.id
+            AND g.s3_key = ANY(COALESCE(p_keep_keys, '{}'))
+      );
     GET DIAGNOSTICS v_count = ROW_COUNT;
 
-    DELETE FROM tc.collection_file_checkin_attempts
-    WHERE status IN ('aborted', 'expired')
-      AND expires_at - interval '46 hours' < p_cutoff;
+    DELETE FROM tc.collection_file_checkin_attempts t
+    WHERE t.status IN ('aborted', 'expired')
+      AND t.expires_at - interval '46 hours' < p_cutoff
+      AND NOT EXISTS (
+          SELECT 1 FROM tc.list_stale_upload_garbage() g
+          WHERE g.transaction_kind = 'collection_file' AND g.transaction_id = t.id
+            AND g.s3_key = ANY(COALESCE(p_keep_keys, '{}'))
+      );
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
 
     RETURN v_count + v_deleted;
 END;
 $$;
 
-COMMENT ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) IS 'For the sweep-stale-uploads edge function, after a complete run that deleted garbage versions older than p_cutoff: deletes the aborted and expired attempts (both tables) all of whose uploads were old enough for that run to have deleted them (expires_at - 46 h < p_cutoff), since they are the sweep''s worklist and have nothing left to say. Returns the number deleted. service-role only.';
+COMMENT ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[]) IS 'For the sweep-stale-uploads edge function, after a complete run that deleted garbage versions older than p_cutoff: deletes the aborted and expired attempts (both tables) all of whose uploads were old enough for that run to have deleted them (expires_at - 46 h < p_cutoff), since they are the sweep''s worklist and have nothing left to say. An attempt that touched one of p_keep_keys (keys the run could not clean because their referenced version is missing from S3) is kept, so those keys stay on the worklist. Returns the number deleted. service-role only.';
 
 CREATE OR REPLACE FUNCTION tc.get_book_manifest(p_collection_id uuid, p_instance_id uuid) RETURNS jsonb
     LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -3113,8 +3143,8 @@ GRANT ALL ON FUNCTION tc.download_start_check(p_collection_id uuid) TO authentic
 GRANT ALL ON FUNCTION tc.finish_initial_upload(p_collection_id uuid) TO authenticated;
 GRANT ALL ON FUNCTION tc.force_unlock(p_collection_id uuid, p_instance_id uuid) TO authenticated;
 
-REVOKE ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone) TO service_role;
+REVOKE ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[]) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.forget_swept_attempts(p_cutoff timestamp with time zone, p_keep_keys text[]) TO service_role;
 
 GRANT ALL ON FUNCTION tc.get_book_manifest(p_collection_id uuid, p_instance_id uuid) TO authenticated;
 
