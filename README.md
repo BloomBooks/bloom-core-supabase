@@ -89,6 +89,14 @@ curl -H "Range: bytes=0-1023" "http://localhost:54321/functions/v1/fs/harvest/Vu
 
 See [`supabase/functions/fs/README.md`](supabase/functions/fs/README.md) for details.
 
+## Team Collections
+
+The backend for Bloom's Cloud Team Collections also lives here: the `tc` database schema
+(`supabase/schemas/tc/`, its generated migration, and pgTAP tests in `supabase/tests/`), the
+`checkin-*`, `collection-files-*`, `download-start` and `sweep-stale-uploads` edge functions,
+and a local Supabase + MinIO dev stack. See [`team-collections/README.md`](team-collections/README.md)
+for the layout, how to change the schema, and how to run its tests.
+
 ## 🌐 Deployment
 
 This project uses a **staging → production** deployment workflow:

@@ -15,6 +15,7 @@
     "dev:debug": "supabase start && pnpm dev:functions:debug",
     "dev:functions": "supabase functions serve",
     "dev:functions:debug": "supabase functions serve --inspect",
+    "dev:functions:tc": "supabase functions serve --env-file team-collections/dev/functions.env",
     "stop": "supabase stop",
     "restart": "supabase stop && supabase start",
     "status": "supabase status",
@@ -25,7 +26,9 @@
     "test": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local",
     "test:secrets-optional": "deno test --allow-all supabase/functions/tests/*-test.ts --env-file=.env.local -- --secrets-optional",
     "test:ci": "deno test --allow-all --frozen supabase/functions/tests/*-test.ts -- --secrets-optional",
-    "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local"
+    "test:watch": "deno test --allow-all --watch supabase/functions/tests/*-test.ts --env-file=.env.local",
+    "test:db": "supabase test db",
+    "tc:regen-migration": "bash team-collections/regen-init-migration.sh"
   },
   "keywords": [
     "supabase",
