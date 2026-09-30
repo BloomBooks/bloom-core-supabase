@@ -12,7 +12,8 @@ step is tagged **[HUMAN]** (needs credentials, org access, or a judgment call) o
 codeable task an agent can be given, with the human reviewing). Steps are ordered; parallelizable
 groups are noted.
 
-Design: `DESIGN.md` · Contracts: `CONTRACTS.md` (v2.0, planned; the code implements v1.12) ·
+Design: `DESIGN.md` · Contracts: `CONTRACTS.md` (v2.0, which the server implements; the client
+still speaks v1.12) ·
 Schema: `SCHEMA.md`.
 
 ---
@@ -212,20 +213,31 @@ Found during Wave-4 E2E work (see `tasks/09-e2e.md` progress log for full detail
 experimental-feature flag gates all of this UI, so merging to master does NOT require these —
 but giving the feature to real testers does:
 
-- **[PLANNED → AGENT] Bring the server and client to CONTRACTS v2.0.** The data model and API of
-  `DESIGN.md` (`core.users`, books named by instance id, no `versions` table, check-in attempts,
-  one set of collection files, `history_events`) are planned; the code implements v1.12. The work is
-  listed in `DESIGN.md`, section 9. It changes the wire contract, so the server and the client move
-  together. Nothing is deployed, so there is no data to migrate: the declarative schema changes and
-  the init migration is regenerated. Do this before Phase 4's verification against real
-  infrastructure, so that verification tests the contract that ships.
-- **[PLANNED → AGENT] Moving a person to a new login.** A person is a `core.users` row with an id
-  of Bloom's own; their memberships, checkouts and history point at it. If their email changes and
-  Firebase keeps their uid, nothing is needed (the next sign-in refreshes `users.email`). If they
-  have a new Firebase account, a support script, run with the service-role key, sets the row's
-  `authentication_id` and `email` to the new account's. It must refuse if the new account already
-  has a `core.users` row (they have signed in with it and joined something), since that makes it a
-  merge of two users, which is written when first needed.
+- **[SERVER DONE Sep 2026 → AGENT] Bring the client to CONTRACTS v2.0.** The server implements the
+  data model and API of `DESIGN.md` (`core.users`, books named by instance id, no `versions` table,
+  check-in attempts, one set of collection files, `history_events`); the client (#8052) still
+  speaks v1.12, and its work is listed in `DESIGN.md`, section 9. The two must merge together. Do
+  this before Phase 4's verification against real infrastructure, so that verification tests the
+  contract that ships.
+- **[IMPLEMENTED 30 Sep 2026, BL-16531] Moving a user to a new login.** A person is a `core.users`
+  row with an id of Bloom's own; their memberships, checkouts and history point at it. If their
+  email changes and Firebase keeps their uid, nothing is needed (the next sign-in refreshes
+  `users.email`). If they have a new Firebase account, the Bloom team moves the row to it. Tooling:
+  `tc.support_move_user_to_login(current_email, authentication_id, email, dry_run = false)`
+  (service-role only) finds the row by its current email and sets its `authentication_id` and
+  `email`; it refuses if another row already has that login or that email (they have signed in with
+  the new account and joined something), since that makes it a merge of two users, which is written
+  when first needed. `team-collections/support/move-user-to-login.ps1` calls it through PostgREST
+  with the service-role key.
+
+  **Runbook:**
+  1. Get the person's old email, and the new account's email and Firebase uid (Firebase console →
+     Authentication → Users).
+  2. Check: `.\move-user-to-login.ps1 -CurrentEmail <old> -AuthenticationId <new uid> -NewEmail
+     <new> -SupabaseUrl https://<ref>.supabase.co` (with `$env:SUPABASE_SERVICE_ROLE_KEY` set). It
+     reports the row it would move and changes nothing.
+  3. Run it again with `-Execute`. The person signs in to Bloom with the new account and carries on,
+     with the same memberships and checkouts.
 
 - **[DECIDED 9 Jul 2026 → AGENT] Account-switch behavior (E2E-10).** John's full spec is
   recorded as item 9 in `orchestration/DOGFOOD-BATCH-1.md`: local access is unrestricted and
@@ -323,24 +335,26 @@ but giving the feature to real testers does:
   compound risk (failed commit **and** a completed S3 upload **and** the sweep not running for ~7 d).
   Implemented as:
   - `tc.list_stale_upload_garbage()` (in `supabase/schemas/tc/02_functions.sql`, service-role-only) — the
-    reference-aware worklist: per-file S3 keys touched by DEAD (aborted/expired) transactions, each
+    reference-aware worklist: per-file S3 keys touched by DEAD (aborted/expired) attempts, each
     with the currently-referenced `s3_version_id` as a "delete newer than this" watermark, and
-    **excluding** any path a still-live transaction is uploading.
+    **excluding** any path a still-live attempt is uploading.
   - `tc.list_stale_upload_keys(after_key, limit)` (service-role-only) — the same worklist, one
     row per key, keyset-paged in byte ("C") order of the S3 key, at most 1000 per page (PostgREST's
     `max_rows`). The sweep reads *every* page per run (500 keys a page, the last key of each page
-    as the next cursor), and never stalls on the first page. In the v2.0 plan, the reaper deletes a
-    dead attempt once the sweep has deleted its uploads, so the worklist doesn't keep returning the
-    same keys.
+    as the next cursor), and never stalls on the first page.
+  - `tc.forget_swept_attempts(cutoff)` (service-role-only) — called by the sweep after its last
+    page, with that run's cutoff: deletes the dead attempts all of whose uploads were older than it
+    (an attempt's uploads are never newer than `expires_at - 47 h`), so the worklist doesn't keep
+    returning keys whose garbage is gone. A run that fails partway forgets nothing.
   - `sweep-stale-uploads` edge function — for each worklist key, deletes every S3 version newer
     than the referenced one (all of them if nothing references the key), restoring the committed
     version to *current*. Idempotent; service-role-only. Because check-ins continue while it
     runs, it only deletes versions older than `UPLOAD_SWEEP_GRACE_MS` (48 h), and right before
     deleting a key's candidates it re-reads that key (`tc.stale_upload_key_state`, service-role
-    only), skipping it if a check-in has since committed a new version or a live transaction now
+    only), skipping it if a check-in has since committed a new version or a live attempt now
     touches it (counted as `keysChanged` in the response; harmless, the next run retries).
   - The re-check and the deletes are not atomic (S3 and the database share no lock), and a
-    resumed check-in's transaction can be far older than its expiry suggests. What actually rules
+    resumed check-in attempt can be far older than its expiry suggests. What actually rules
     out deleting a version as it is committed is a second, shorter window:
     `checkin-finish` and `collection-files-finish` refuse to commit any upload whose S3
     `LastModified` is older than `UPLOAD_COMMIT_WINDOW_MS` (24 h) — `409 MissingOrBadUploads`

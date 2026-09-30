@@ -13,13 +13,12 @@ what is still open.
 >   and the project's requirements are drafted there too
 >   ([Cloud Team Collections requirements](https://app.notion.com/p/3eb20c4397cb813e8501ec6f0cce2e9b)).
 > - **Server** (Postgres schemas `tc` and `core`, RLS, RPCs, edge functions, local dev stack): this
->   repository, PR #13, branch `BL-16531-tc-backend`. Not deployed anywhere yet. The data model
->   described here, and `CONTRACTS.md` v2.0, are the **plan**: the SQL and edge functions on the
->   branch still implement CONTRACTS v1.12, and the work to bring them to the plan is listed in
->   [section 9](#9-planned-work-and-open-questions).
+>   repository, PR #13, branch `BL-16531-tc-backend`. Not deployed anywhere yet. It implements the
+>   data model described here and `CONTRACTS.md` v2.0.
 > - **Desktop client** (`CloudTeamCollection` and its helpers, the sign-in and join UI, unit and
->   E2E tests): BloomDesktop draft PR #8052, branch `cloud-tc-for-review`. It implements the v1.12
->   contract, and needs the client work of section 9.
+>   E2E tests): BloomDesktop draft PR #8052, branch `cloud-tc-for-review`. It still speaks the
+>   earlier contract (v1.12), and needs the client work of
+>   [section 9](#9-planned-work-and-open-questions) to work with this server.
 > - **The Share dialog** (who has access, and in what role): BloomDesktop PR #8394, branch
 >   `BL-16673-share-dialog`. It stores its data in a local stand-in file until it is wired to the
 >   server (see [Sharing UI](#sharing-ui-built)).
@@ -154,8 +153,9 @@ taken that way. The machine name the client sends is for display only.
   that email claims the row, instead of a new row being made, so `users.email` stays unique.
 - **An email change is a database-admin task.** If Firebase keeps the uid, nothing is needed: the
   next sign-in refreshes `users.email`. If the person has a new Firebase account, a support script
-  sets the row's `authentication_id` and `email` to the new account's; it refuses if the new
-  account already has a row, which would make it a merge. Merging two users (re-pointing the
+  (`team-collections/support/move-user-to-login.ps1`) finds the row by its current email and sets
+  its `authentication_id` and `email` to the new account's; it refuses if the new account or email
+  already has a row, which would make it a merge. Merging two users (re-pointing the
   identity columns, and settling a collection both belong to) is written when first needed.
 - **One login per person.** If a person ever needs several logins at once, `authentication_id` and
   `email` move to a `core.user_identities` table and `current_user_id()` looks there; the foreign
@@ -441,9 +441,9 @@ attempt is a 200 no-op).
 **Keeping the attempts table small.** An open attempt lives 48 hours and is resumable; after that
 the reaper, which runs at every start, marks it expired. The reaper also deletes a finished attempt
 once its expiry has passed (a repeated finish only comes from the same Bloom session, which keeps
-the attempt id in memory), and an aborted or expired attempt once the orphaned-upload sweep has
-deleted its uploads (those attempts are the sweep's worklist). So the table holds only attempts in
-progress and recently ended ones; the record of check-ins that happened is the history.
+the attempt id in memory). Aborted and expired attempts are the orphaned-upload sweep's worklist, and
+the sweep deletes each one once a complete run has deleted its uploads. So the table holds only
+attempts in progress and recently ended ones; the record of check-ins that happened is the history.
 
 **Send-only locks.** A check-in never creates a checkout and never returns a GUID. A **first
 check-in** of a new book creates the book row locked to the sender with **no hash and no current
@@ -928,31 +928,9 @@ them yet.
 
 ## 9. Planned work and open questions
 
-**Bringing the server to this design** (PR #13 implements CONTRACTS v1.12; the plan is v2.0):
+**The server** (PR #13) implements this design and CONTRACTS v2.0, with pgTAP and Deno tests.
 
-- `core.users` and `current_user_id()` returning `users.id`; the ten identity columns
-  (`members.user_id` and `added_by`, `books.locked_by`, `history_events.by_user_id`,
-  `checkin_attempts.started_by`, `collections.created_by` and `collection_files_updated_by`,
-  `collection_file_checkin_attempts.started_by`, `color_palette_entries.added_by`) as `uuid`
-  foreign keys; `claim_memberships()` creating and claiming user rows, recording the Registration
-  name and returning the caller's id; unclaimed users for `lock_book_for_legacy_checkout`; the
-  support script for moving a user to a new login.
-- Book versions as a number per book, with no `versions` table; `book_files` keyed by
-  `(book_id, path)`; `index.htm` for the main `.htm`; books named by collection id and instance id
-  throughout the API; no name uniqueness (no unique index, no `rename_check`, no name checks).
-- `checkin_attempts` and `collection_file_checkin_attempts`: resume only an identical attempt,
-  otherwise abort it (with the start locking the open attempt first, and a new book keeping its
-  uncommitted row); the reaper deleting attempts once nothing needs them.
-- `history_events` with type 102 for collection-file check-ins, and `log_event` requiring a book
-  for book types; history showing `users.name`.
-- One set of collection files per collection, sent only by an admin.
-- Dropping the indexes that repeat a unique constraint's leading column, and the columns the plan
-  no longer has (`members.display_name`, the events' name and email snapshots, `books.created_by`,
-  and the attempts' `finished_at`, `aborted_at` and `revision`).
-- CONTRACTS v2.0 and the pgTAP and Deno tests to match. Since nothing is deployed, there is no data
-  to migrate: the declarative schema changes and the init migration is regenerated.
-
-**Bringing the client to this design** (#8052):
+**Bringing the client to this design** (#8052, which speaks CONTRACTS v1.12):
 
 - Identifying the signed-in person, lock holders and history authors by `users.id` (the `.checkout`
   record's `userId`); sending the Registration name with `claim_memberships()`.

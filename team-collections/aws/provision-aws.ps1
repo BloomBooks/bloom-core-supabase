@@ -54,7 +54,7 @@
     Days after which a noncurrent (superseded) object version is permanently deleted.
     Default: 7, matching CONTRACTS.md's "S3 layout" section and the local MinIO setup.
     MUST stay strictly greater than the checkin/collection-files transaction lifetime
-    (48h - see tc.checkin_transactions.expires_at in
+    (48h - see tc.checkin_attempts.expires_at in
     supabase/migrations/20260706000001_tc_schema.sql, and the enforced invariant in
     supabase/functions/tests/tc-invariants-test.ts) or an in-flight transaction could
     have its referenced object version deleted out from under it.

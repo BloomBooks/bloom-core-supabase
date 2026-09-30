@@ -328,9 +328,9 @@ export const withStalePaths = (
     return error;
 };
 
-/** The S3 user-metadata key (x-amz-meta-manifest-seq) that records which committed version a
+/** The S3 user-metadata key (x-amz-meta-manifest-version) that records which committed version a
  * manifest backup is of. */
-const MANIFEST_SEQ_METADATA = "manifest-seq";
+const MANIFEST_VERSION_METADATA = "manifest-version";
 
 /** How many times writeManifestBackup retries the conditional `.manifest.json` update when
  * another finish changed that object between our read and our write. */
@@ -340,28 +340,28 @@ const httpStatusOf = (err: unknown): number | undefined =>
     (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
 
 /** Best-effort manifest backup (CONTRACTS.md S3 layout), written after the DB commit of
- * version `seq` (a book's version seq, or a collection-file group's version). Never throws —
+ * `version` (a book's version, or the collection files' version). Never throws —
  * this is a convenience backup, not the source of truth (that's the DB).
  *
  * Two overlapping finishes can reach this out of commit order, so the backup must never
- * regress: every version gets its own immutable `.manifests/{seq}.json`, and `.manifest.json`
- * (the latest) is replaced only by a newer seq, with a conditional PUT (If-Match on the ETag
+ * regress: every version gets its own immutable `.manifests/{version}.json`, and `.manifest.json`
+ * (the latest) is replaced only by a newer version, with a conditional PUT (If-Match on the ETag
  * we read, or If-None-Match when there is none yet) so a concurrent writer is never
  * overwritten blindly; on a lost race it re-reads and tries again. */
 export const writeManifestBackup = async (
     client: S3Client,
     bucket: string,
     prefix: string,
-    seq: number,
+    version: number,
     manifest: unknown,
 ): Promise<void> => {
     const body = JSON.stringify(manifest, null, 2);
-    const metadata = { [MANIFEST_SEQ_METADATA]: String(seq) };
+    const metadata = { [MANIFEST_VERSION_METADATA]: String(version) };
     try {
         await client.send(
             new PutObjectCommand({
                 Bucket: bucket,
-                Key: `${prefix}.manifests/${seq}.json`,
+                Key: `${prefix}.manifests/${version}.json`,
                 Body: body,
                 ContentType: "application/json",
                 Metadata: metadata,
@@ -375,8 +375,8 @@ export const writeManifestBackup = async (
                 const head = await client.send(
                     new HeadObjectCommand({ Bucket: bucket, Key: latestKey }),
                 );
-                const existingSeq = Number(head.Metadata?.[MANIFEST_SEQ_METADATA]);
-                if (Number.isFinite(existingSeq) && existingSeq >= seq) {
+                const existingVersion = Number(head.Metadata?.[MANIFEST_VERSION_METADATA]);
+                if (Number.isFinite(existingVersion) && existingVersion >= version) {
                     return; // an equal or newer version is already the latest backup
                 }
                 etag = head.ETag;
@@ -403,7 +403,7 @@ export const writeManifestBackup = async (
             }
         }
         console.error(
-            `writeManifestBackup: gave up updating ${latestKey} for seq ${seq} after ${MANIFEST_POINTER_ATTEMPTS} conflicting attempts (non-fatal; .manifests/${seq}.json was written)`,
+            `writeManifestBackup: gave up updating ${latestKey} for version ${version} after ${MANIFEST_POINTER_ATTEMPTS} conflicting attempts (non-fatal; .manifests/${version}.json was written)`,
         );
     } catch (err) {
         console.error("writeManifestBackup failed (non-fatal):", err);

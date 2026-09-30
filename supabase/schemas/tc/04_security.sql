@@ -154,8 +154,8 @@ GRANT ALL ON FUNCTION tc.reap_expired_checkin_attempts() TO authenticated;
 -- Deletes a whole collection's rows: the Bloom team's support tool, never a client's.
 REVOKE ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
 GRANT ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) TO service_role;
-REVOKE ALL ON FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean) TO service_role;
+REVOKE ALL ON FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean) TO service_role;
 REVOKE ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) FROM PUBLIC;
 GRANT ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) TO service_role;
 

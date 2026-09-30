@@ -231,7 +231,7 @@ Deno.test(
 // between our read and our write.
 interface StoredObject {
     body: string;
-    seq: string | undefined;
+    version: string | undefined;
     etag: string;
 }
 const fakeManifestStore = (
@@ -253,7 +253,7 @@ const fakeManifestStore = (
                 $metadata: { httpStatusCode: 404 },
             });
         }
-        return { ETag: o.etag, Metadata: o.seq ? { "manifest-seq": o.seq } : {} };
+        return { ETag: o.etag, Metadata: o.version ? { "manifest-version": o.version } : {} };
     });
     s3Mock.on(PutObjectCommand).callsFake(
         (input: {
@@ -273,7 +273,7 @@ const fakeManifestStore = (
             }
             store.set(input.Key, {
                 body: input.Body,
-                seq: input.Metadata?.["manifest-seq"],
+                version: input.Metadata?.["manifest-version"],
                 etag: `"e${nextEtag++}"`,
             });
             return { ETag: `"e${nextEtag}"` };
@@ -294,11 +294,11 @@ Deno.test(
         // Version 5's finish writes its backup first; version 4's, which committed earlier,
         // only gets there afterwards.
         await writeManifestBackup(client, "bucket", PREFIX, 5, { v: 5 });
-        assertEquals(store.get(`${PREFIX}.manifest.json`)?.seq, "5", "sanity check: v5 is latest");
+        assertEquals(store.get(`${PREFIX}.manifest.json`)?.version, "5", "sanity check: v5 is latest");
         await writeManifestBackup(client, "bucket", PREFIX, 4, { v: 4 });
 
         const latest = store.get(`${PREFIX}.manifest.json`);
-        assertEquals(latest?.seq, "5");
+        assertEquals(latest?.version, "5");
         assertEquals(JSON.parse(latest?.body ?? "null"), { v: 5 });
         // Every committed version still has its own backup.
         assertEquals(JSON.parse(store.get(`${PREFIX}.manifests/4.json`)?.body ?? "null"), { v: 4 });
@@ -316,9 +316,9 @@ Deno.test(
         const client = new S3Client({ region: "us-east-1" });
 
         await writeManifestBackup(client, "bucket", PREFIX, 1, { v: 1 });
-        assertEquals(store.get(`${PREFIX}.manifest.json`)?.seq, "1", "created with If-None-Match");
+        assertEquals(store.get(`${PREFIX}.manifest.json`)?.version, "1", "created with If-None-Match");
         await writeManifestBackup(client, "bucket", PREFIX, 2, { v: 2 });
-        assertEquals(store.get(`${PREFIX}.manifest.json`)?.seq, "2", "replaced with If-Match");
+        assertEquals(store.get(`${PREFIX}.manifest.json`)?.version, "2", "replaced with If-Match");
 
         s3Mock.restore();
     },
@@ -333,15 +333,15 @@ Deno.test(
             // The first time we try to replace v3, version 5's finish gets there first.
             if (raced) return;
             raced = true;
-            s.set(`${PREFIX}.manifest.json`, { body: '{"v":5}', seq: "5", etag: '"other"' });
+            s.set(`${PREFIX}.manifest.json`, { body: '{"v":5}', version: "5", etag: '"other"' });
         });
-        store.set(`${PREFIX}.manifest.json`, { body: '{"v":3}', seq: "3", etag: '"e0"' });
+        store.set(`${PREFIX}.manifest.json`, { body: '{"v":3}', version: "3", etag: '"e0"' });
         const client = new S3Client({ region: "us-east-1" });
 
         await writeManifestBackup(client, "bucket", PREFIX, 4, { v: 4 });
 
         assertEquals(raced, true, "sanity check: the other writer really slipped in");
-        assertEquals(store.get(`${PREFIX}.manifest.json`)?.seq, "5");
+        assertEquals(store.get(`${PREFIX}.manifest.json`)?.version, "5");
         assertEquals(s3Mock.commandCalls(HeadObjectCommand).length, 2, "re-read after the 412");
         assertExists(store.get(`${PREFIX}.manifests/4.json`));
 

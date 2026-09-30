@@ -1,11 +1,12 @@
-// Unit tests for sweep-stale-uploads. The worklist RPC's SQL (which transactions are stale,
-// the live-transaction exclusion, the referenced-version watermark) is covered by pgTAP
-// (01_tc_schema_test.sql §12); here we mock the worklist and pin down what the edge function
-// itself decides: delete only the versions newer than the referenced one, the referenced-null
-// and referenced-missing cases, the grace period and the just-before-delete re-check that keep
-// it from deleting work committed after the snapshot, the service-role gate, and reading the
-// worklist page by page (tc.list_stale_upload_keys) so a run reaches every key.
-import { assertEquals } from "@std/assert";
+// Unit tests for sweep-stale-uploads. The worklist RPC's SQL (which attempts are stale, the
+// live-attempt exclusion, the referenced-version watermark, which dead attempts may be
+// forgotten) is covered by pgTAP (01_tc_schema_test.sql §12); here we mock the worklist and
+// pin down what the edge function itself decides: delete only the versions newer than the
+// referenced one, the referenced-null and referenced-missing cases, the grace period and the
+// just-before-delete re-check that keep it from deleting work committed after the snapshot,
+// the service-role gate, reading the worklist page by page (tc.list_stale_upload_keys) so a
+// run reaches every key, and forgetting swept attempts only after a complete run.
+import { assertEquals, assertRejects } from "@std/assert";
 import { mockClient } from "aws-sdk-client-mock";
 import {
     DeleteObjectCommand,
@@ -23,6 +24,7 @@ import {
 
 setTestEnv();
 const { handler, SWEEP_PAGE_SIZE } = await import("../sweep-stale-uploads/index.ts");
+const { UPLOAD_SWEEP_GRACE_MS } = await import("../_shared/tc/uploadWindows.ts");
 
 const KEY = "tc/c1/books/i1/index.htm";
 
@@ -52,6 +54,9 @@ const pageOf = (rows: WorklistRow[], requestBody: Record<string, unknown> | unde
         .slice(0, limit);
 };
 
+// What the fake forget_swept_attempts reports.
+const FORGOTTEN = 2;
+
 // The worklist, plus the per-key re-check the sweep makes right before deleting. By default
 // the re-check reports the key unchanged (still stale, same referenced version as the row).
 const worklistFetch = (
@@ -75,6 +80,7 @@ const worklistFetch = (
                     referencedVersionId: rows[0].referenced_version_id,
                 },
             },
+            { when: "rpc/forget_swept_attempts", status: 200, body: FORGOTTEN },
         ],
         calls,
     );
@@ -131,6 +137,7 @@ Deno.test(
             versionsDeleted: 2,
             referencedMissing: 0,
             keysChanged: 0,
+            attemptsForgotten: FORGOTTEN,
         });
         // Only the two newer-than-committed uploads; NOT the committed version or older history.
         assertEquals(deletedVersionIds(s3), ["garbage2", "garbage1"]);
@@ -189,6 +196,7 @@ Deno.test(
             versionsDeleted: 0,
             referencedMissing: 1,
             keysChanged: 0,
+            attemptsForgotten: FORGOTTEN,
         });
         assertEquals(s3.commandCalls(DeleteObjectCommand).length, 0);
         s3.restore();
@@ -229,6 +237,7 @@ Deno.test(
             versionsDeleted: 0,
             referencedMissing: 0,
             keysChanged: 1,
+            attemptsForgotten: FORGOTTEN,
         });
         assertEquals(s3.commandCalls(DeleteObjectCommand).length, 0);
         const recheck = calls.find((c) =>
@@ -389,6 +398,7 @@ Deno.test(
             versionsDeleted: 1,
             referencedMissing: 0,
             keysChanged: 0,
+            attemptsForgotten: FORGOTTEN,
         });
         assertEquals(deletedVersionIds(s3), ["garbage"]);
         const pageCalls = calls.filter((c) => c.url.includes("rpc/list_stale_upload_keys"));
@@ -404,6 +414,47 @@ Deno.test(
             s3.commandCalls(ListObjectVersionsCommand).length,
             rows.length,
             "every key, on every page, is looked at exactly once",
+        );
+        // Swept attempts are forgotten once, after the last page, with this run's cutoff.
+        const forgetCalls = calls.filter((c) => c.url.includes("rpc/forget_swept_attempts"));
+        assertEquals(forgetCalls.length, 1);
+        assertEquals(calls[calls.length - 1], forgetCalls[0], "forgetting comes last");
+        const cutoff = Date.parse(String(forgetCalls[0].body?.p_cutoff));
+        const expected = Date.now() - UPLOAD_SWEEP_GRACE_MS;
+        assertEquals(
+            Math.abs(cutoff - expected) < 60 * 1000,
+            true,
+            `p_cutoff ${forgetCalls[0].body?.p_cutoff} should be about now minus the grace period`,
+        );
+        s3.restore();
+    },
+);
+
+Deno.test(
+    "sweep: a run that fails partway forgets no attempts",
+    async () => {
+        const s3 = mockClient(S3Client);
+        s3.on(ListObjectVersionsCommand).rejects(new Error("simulated S3 outage"));
+        const calls: RecordedCall[] = [];
+
+        await assertRejects(
+            () =>
+                withMockFetch(
+                    worklistFetch(manyKeys(3), undefined, calls),
+                    () => callHandler(handler, mockRequest({}, serviceRoleToken), {}),
+                ),
+            Error,
+            "simulated S3 outage",
+        );
+        assertEquals(
+            calls.filter((c) => c.url.includes("rpc/list_stale_upload_keys")).length,
+            1,
+            "sanity check: the worklist was read",
+        );
+        assertEquals(
+            calls.some((c) => c.url.includes("rpc/forget_swept_attempts")),
+            false,
+            "forget_swept_attempts must not run after a failed run",
         );
         s3.restore();
     },

@@ -116,7 +116,7 @@ if (-not $SkipDatabase) {
     } else {
         $verb = if ($Execute) { "deleted" } else { "would delete" }
         Write-Host "Database: '$($result.name)' - $verb these rows:"
-        $result.rows.PSObject.Properties | ForEach-Object { Write-Host ("  {0,-30} {1}" -f $_.Name, $_.Value) }
+        $result.rows.PSObject.Properties | ForEach-Object { Write-Host ("  {0,-34} {1}" -f $_.Name, $_.Value) }
     }
 }
 

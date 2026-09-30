@@ -1,8 +1,8 @@
 // POST /functions/v1/collection-files-finish — CONTRACTS.md §collection-files-start/finish
-// Req: { transactionId } -> bumps the group version atomically.
-// 409 VersionConflict ⇒ client pulls first (repo-wins rule); 409 MissingOrBadUploads
+// Req: { transactionId } -> bumps the collection files' version atomically. Admin only.
+// 409 VersionConflict ⇒ client receives first (repo-wins rule); 409 MissingOrBadUploads
 // { paths[], stalePaths? } (stalePaths: uploads older than the commit window, uploadWindows.ts).
-// 409 TransactionChanged: a concurrent collection-files-start resume rewrote the transaction.
+// 409 transaction_aborted: a newer collection-files-start replaced this attempt.
 import { requireField, serveJsonPost } from "../_shared/tc/handler.ts";
 import { HttpError, jsonResponse } from "../_shared/tc/errors.ts";
 import {
@@ -19,13 +19,11 @@ import {
 import { collectionFilesPrefix } from "../_shared/tc/paths.ts";
 import { s3Env } from "../_shared/tc/env.ts";
 
-interface CollectionFileTransactionRow {
+interface CollectionFileAttemptRow {
     id: string;
     collection_id: string;
-    group_key: string;
     changed_paths: string[];
     proposed_files: { path: string; sha256: string; size: number }[];
-    revision: number;
 }
 
 interface CollectionFilesFinishResult {
@@ -44,16 +42,16 @@ export const handler = async (
     // See checkin-finish: identity from the caller's own JWT, before any S3 work.
     const caller = await callerIdentity(req);
 
-    const tx = await selectTcRow<CollectionFileTransactionRow>(
+    const tx = await selectTcRow<CollectionFileAttemptRow>(
         req,
-        "collection_file_transactions",
-        `id=eq.${transactionId}&select=id,collection_id,group_key,changed_paths,proposed_files,revision`,
+        "collection_file_checkin_attempts",
+        `id=eq.${transactionId}&select=id,collection_id,changed_paths,proposed_files`,
     );
     if (!tx) {
         throw new HttpError(404, { error: "transaction_not_found" });
     }
 
-    const prefix = collectionFilesPrefix(tx.collection_id, tx.group_key);
+    const prefix = collectionFilesPrefix(tx.collection_id);
     const { bucket } = s3Env();
     const client = adminS3Client();
 
@@ -73,12 +71,7 @@ export const handler = async (
         {
             p_transaction_id: transactionId,
             p_user_id: caller.userId,
-            p_user_email: caller.email,
-            p_user_name: caller.name,
             p_captured: captured,
-            // See checkin-finish: refused (409 TransactionChanged) if a resume changed the
-            // proposal we just verified.
-            p_expected_revision: tx.revision,
         },
     ).catch((e) => {
         throw withStalePaths(e, stalePaths);

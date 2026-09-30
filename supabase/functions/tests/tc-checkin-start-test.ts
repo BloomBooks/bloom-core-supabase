@@ -1,8 +1,7 @@
 // Unit tests for checkin-start's handler: PostgREST RPC calls are faked via a fetch
 // stub (see _shared/tc/test_support.ts); the MinIO/STS AssumeRole call is faked via
-// aws-sdk-client-mock. The live-integration spike (task's Progress log) already
-// exercises the real stack end-to-end; these tests pin down the handler's own request
-// validation, RPC-argument wiring, and error passthrough cheaply and hermetically.
+// aws-sdk-client-mock. These pin down the handler's own request validation, RPC-argument
+// wiring, credential scoping and error passthrough cheaply and hermetically.
 import { assertEquals, assertRejects } from "@std/assert";
 import { AssumeRoleCommand } from "@aws-sdk/client-sts";
 import {
@@ -20,16 +19,15 @@ const { handler } = await import("../checkin-start/index.ts");
 
 const VALID_BODY = {
     collectionId: "11111111-1111-1111-1111-111111111111",
-    bookId: null,
-    bookInstanceId: "22222222-2222-2222-2222-222222222222",
+    instanceId: "22222222-2222-2222-2222-222222222222",
     proposedName: "My Book",
     checksum: "abc123",
     clientVersion: "1.0.0",
-    files: [{ path: "book.htm", sha256: "deadbeef", size: 42 }],
+    files: [{ path: "index.htm", sha256: "deadbeef", size: 42 }],
 };
 
 Deno.test(
-    "checkin-start: happy path returns transactionId, changedPaths and scoped s3 creds",
+    "checkin-start: happy path returns transactionId, changedPaths and creds scoped to the book's instance id",
     async () => {
         const stsMock = stubAssumeRole();
         const calls: RecordedCall[] = [];
@@ -39,12 +37,10 @@ Deno.test(
                 status: 200,
                 body: {
                     transactionId: "tx-1",
-                    bookId: "book-1",
-                    changedPaths: ["book.htm"],
+                    changedPaths: ["index.htm"],
                 },
             },
         ], calls);
-        assertEquals(VALID_BODY.bookId, null, "test data sanity check: a new book");
 
         const res = await withMockFetch(fetchStub, () =>
             callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
@@ -53,12 +49,11 @@ Deno.test(
         assertEquals(res.status, 200);
         const json = await res.json();
         assertEquals(json.transactionId, "tx-1");
-        assertEquals(json.changedPaths, ["book.htm"]);
+        assertEquals(json.changedPaths, ["index.htm"]);
         assertEquals(json.s3.bucket, "bloom-teams-test");
-        // CONTRACTS.md: creds scoped to tc/{cid}/books/{instance_id}/*. For a new book that is
-        // the request's bookInstanceId (the RPC only creates or resumes a row with that
-        // instance id), so no books read is needed; an existing book's instance id is read
-        // from its row (see the mismatch test below).
+        // CONTRACTS.md: creds scoped to tc/{cid}/books/{instanceId}/*. The RPC checks or
+        // creates exactly the book named by (collectionId, instanceId), so no other read
+        // is needed.
         assertEquals(
             calls.map((c) => new URL(c.url).pathname),
             ["/rest/v1/rpc/checkin_start_tx"],
@@ -68,11 +63,7 @@ Deno.test(
             "tc/11111111-1111-1111-1111-111111111111/books/22222222-2222-2222-2222-222222222222/",
         );
         assertEquals(json.s3.credentials.sessionToken, "T");
-        // bookId is internal-only — CONTRACTS.md's 200 response never exposes it (that's
-        // what makes an uncommitted new book invisible until the client re-learns its id
-        // via get_collection_state/checkout_book).
-        assertEquals("bookId" in json, false);
-        // v1.10: check-in never issues a checkout GUID.
+        // Check-in never issues a checkout GUID.
         assertEquals("checkoutGuid" in json, false);
 
         stsMock.restore();
@@ -80,48 +71,88 @@ Deno.test(
 );
 
 Deno.test(
-    "checkin-start: s3 prefix comes from the DB-canonical instance_id, not the caller-supplied bookInstanceId",
+    "checkin-start: passes the book, name, base version, manifest and GUID to checkin_start_tx",
     async () => {
         const stsMock = stubAssumeRole();
-        // The caller claims an instance id belonging to some OTHER book; the books row for the
-        // book actually being checked in has a different (canonical) instance id. The issued
-        // credentials must be scoped to the canonical one.
-        const fetchStub = routedFetchStub([
-            {
-                when: "rpc/checkin_start_tx",
-                status: 200,
-                body: {
-                    transactionId: "tx-1",
-                    bookId: "book-1",
-                    changedPaths: ["book.htm"],
+        const calls: RecordedCall[] = [];
+        const fetchStub = routedFetchStub(
+            [
+                {
+                    when: "rpc/checkin_start_tx",
+                    status: 200,
+                    // A stray field in the RPC's answer must not be passed on: the response
+                    // carries only the contract's fields.
+                    body: {
+                        transactionId: "tx-1",
+                        changedPaths: ["index.htm"],
+                        checkoutGuid: "0b7c5d4e-1f2a-4b3c-8d9e-0a1b2c3d4e5f",
+                    },
                 },
-            },
-            {
-                when: "rest/v1/books",
-                status: 200,
-                body: [{ instance_id: "99999999-9999-9999-9999-999999999999" }],
-            },
-        ]);
-        const bodyWithForeignInstanceId = {
+            ],
+            calls,
+        );
+        const body = {
             ...VALID_BODY,
-            bookId: "book-1",
-            bookInstanceId: "22222222-2222-2222-2222-222222222222",
+            baseVersion: 7,
+            checkoutGuid: "3f2c9a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6",
         };
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(
-                handler,
-                mockRequest(bodyWithForeignInstanceId),
-                bodyWithForeignInstanceId,
-            ),
+            callHandler(handler, mockRequest(body), body),
         );
 
         assertEquals(res.status, 200);
+        const rpcCall = calls.find((c) => c.url.includes("rpc/checkin_start_tx"));
+        if (!rpcCall) {
+            throw new Error("checkin_start_tx was never called");
+        }
+        assertEquals(rpcCall.body, {
+            p_collection_id: VALID_BODY.collectionId,
+            p_instance_id: VALID_BODY.instanceId,
+            p_proposed_name: "My Book",
+            p_base_version: 7,
+            p_checksum: "abc123",
+            p_client_version: "1.0.0",
+            p_files: VALID_BODY.files,
+            p_checkout_guid: "3f2c9a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6",
+        });
         const json = await res.json();
-        assertEquals(
-            json.s3.prefix,
-            "tc/11111111-1111-1111-1111-111111111111/books/99999999-9999-9999-9999-999999999999/",
+        assertEquals(json.transactionId, "tx-1", "sanity check: a real 200 body");
+        assertEquals(Object.keys(json).sort(), ["changedPaths", "s3", "transactionId"]);
+
+        stsMock.restore();
+    },
+);
+
+Deno.test(
+    "checkin-start: no checkoutGuid or baseVersion in the body -> both null",
+    async () => {
+        const stsMock = stubAssumeRole();
+        const calls: RecordedCall[] = [];
+        const fetchStub = routedFetchStub(
+            [
+                {
+                    when: "rpc/checkin_start_tx",
+                    status: 200,
+                    body: { transactionId: "tx-1", changedPaths: [] },
+                },
+            ],
+            calls,
         );
+        assertEquals("checkoutGuid" in VALID_BODY, false, "test data sanity check");
+        assertEquals("baseVersion" in VALID_BODY, false, "test data sanity check");
+
+        const res = await withMockFetch(fetchStub, () =>
+            callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
+        );
+
+        assertEquals(res.status, 200);
+        const rpcCall = calls.find((c) => c.url.includes("rpc/checkin_start_tx"));
+        if (!rpcCall) {
+            throw new Error("checkin_start_tx was never called");
+        }
+        assertEquals(rpcCall.body?.p_checkout_guid, null);
+        assertEquals(rpcCall.body?.p_base_version, null);
 
         stsMock.restore();
     },
@@ -133,19 +164,21 @@ Deno.test(
         const stsMock = stubAssumeRole();
         const fetchStub = routedFetchStub([]); // must not be called
 
-        const { checksum: _omit, ...bodyMissingChecksum } = VALID_BODY;
-        const res = await withMockFetch(fetchStub, () =>
-            callHandler(
-                handler,
-                mockRequest(bodyMissingChecksum),
-                bodyMissingChecksum,
-            ),
-        );
+        for (const field of ["instanceId", "checksum"] as const) {
+            const { [field]: _omit, ...bodyMissingField } = VALID_BODY;
+            const res = await withMockFetch(fetchStub, () =>
+                callHandler(
+                    handler,
+                    mockRequest(bodyMissingField),
+                    bodyMissingField,
+                ),
+            );
 
-        assertEquals(res.status, 400);
-        const json = await res.json();
-        assertEquals(json.error, "invalid_request");
-        assertEquals(json.field, "checksum");
+            assertEquals(res.status, 400);
+            const json = await res.json();
+            assertEquals(json.error, "invalid_request");
+            assertEquals(json.field, field);
+        }
         assertEquals(
             stsMock.commandCalls(AssumeRoleCommand).length,
             0,
@@ -169,7 +202,7 @@ Deno.test(
                 body: {
                     message: JSON.stringify({
                         error: "LockHeldByOther",
-                        holder: { userId: "u2" },
+                        holder: { userId: "u2", name: "User Two" },
                     }),
                 },
             },
@@ -182,7 +215,7 @@ Deno.test(
         assertEquals(res.status, 409);
         const json = await res.json();
         assertEquals(json.error, "LockHeldByOther");
-        assertEquals(json.holder.userId, "u2");
+        assertEquals(json.holder, { userId: "u2", name: "User Two" });
         // Credentials are obtained before the RPC (see the ordering tests below), but a
         // refused start must never hand them out.
         assertEquals("s3" in json, false, "must not return S3 creds when the RPC failed");
@@ -192,126 +225,31 @@ Deno.test(
 );
 
 Deno.test(
-    "checkin-start: forwards checkoutGuid as p_checkout_guid and never returns a checkoutGuid",
+    "checkin-start: RPC 409 CheckoutElsewhere and 404 book_not_found pass through as flat error envelopes, with no S3 creds",
     async () => {
         const stsMock = stubAssumeRole();
-        const calls: RecordedCall[] = [];
-        const fetchStub = routedFetchStub(
-            [
+        for (const [status, error] of [[409, "CheckoutElsewhere"], [404, "book_not_found"]] as const) {
+            const fetchStub = routedFetchStub([
                 {
                     when: "rpc/checkin_start_tx",
-                    status: 200,
-                    // A stray checkoutGuid (v1.9's RPC returned one) must not be passed on:
-                    // the response carries only the contract's fields.
-                    body: {
-                        transactionId: "tx-1",
-                        bookId: "book-1",
-                        changedPaths: ["book.htm"],
-                        checkoutGuid: "0b7c5d4e-1f2a-4b3c-8d9e-0a1b2c3d4e5f",
-                    },
+                    status,
+                    body: { message: JSON.stringify({ error }) },
                 },
-                {
-                    when: "rest/v1/books",
-                    status: 200,
-                    body: [{ instance_id: "22222222-2222-2222-2222-222222222222" }],
-                },
-            ],
-            calls,
-        );
-        const bodyWithGuid = {
-            ...VALID_BODY,
-            bookId: "book-1",
-            checkoutGuid: "3f2c9a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6",
-        };
+            ]);
 
-        const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(bodyWithGuid), bodyWithGuid),
-        );
+            const res = await withMockFetch(fetchStub, () =>
+                callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
+            );
 
-        assertEquals(res.status, 200);
-        const rpcCall = calls.find((c) => c.url.includes("rpc/checkin_start_tx"));
-        if (!rpcCall) {
-            throw new Error("checkin_start_tx was never called");
+            assertEquals(res.status, status);
+            // Exactly the error envelope: no S3 creds are handed out.
+            assertEquals(await res.json(), { error });
         }
-        assertEquals(
-            rpcCall.body?.p_checkout_guid,
-            "3f2c9a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6",
-        );
-        const json = await res.json();
-        assertEquals(json.transactionId, "tx-1", "sanity check: a real 200 body");
-        assertEquals("checkoutGuid" in json, false);
 
         stsMock.restore();
     },
 );
 
-Deno.test(
-    "checkin-start: no checkoutGuid in the body -> p_checkout_guid is null",
-    async () => {
-        const stsMock = stubAssumeRole();
-        const calls: RecordedCall[] = [];
-        const fetchStub = routedFetchStub(
-            [
-                {
-                    when: "rpc/checkin_start_tx",
-                    status: 200,
-                    body: {
-                        transactionId: "tx-1",
-                        bookId: "book-1",
-                        changedPaths: [],
-                    },
-                },
-                {
-                    when: "rest/v1/books",
-                    status: 200,
-                    body: [{ instance_id: "22222222-2222-2222-2222-222222222222" }],
-                },
-            ],
-            calls,
-        );
-        assertEquals("checkoutGuid" in VALID_BODY, false, "test data sanity check");
-
-        const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
-        );
-
-        assertEquals(res.status, 200);
-        const rpcCall = calls.find((c) => c.url.includes("rpc/checkin_start_tx"));
-        if (!rpcCall) {
-            throw new Error("checkin_start_tx was never called");
-        }
-        assertEquals(rpcCall.body?.p_checkout_guid, null);
-
-        stsMock.restore();
-    },
-);
-
-Deno.test(
-    "checkin-start: RPC 409 CheckoutElsewhere passes through as a flat error envelope, with no S3 creds",
-    async () => {
-        const stsMock = stubAssumeRole();
-        const fetchStub = routedFetchStub([
-            {
-                when: "rpc/checkin_start_tx",
-                status: 409,
-                body: {
-                    message: JSON.stringify({ error: "CheckoutElsewhere" }),
-                },
-            },
-        ]);
-
-        const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
-        );
-
-        assertEquals(res.status, 409);
-        const json = await res.json();
-        // Exactly the error envelope: no S3 creds are handed out.
-        assertEquals(json, { error: "CheckoutElsewhere" });
-
-        stsMock.restore();
-    },
-);
 Deno.test("checkin-start: RPC 426 ClientOutOfDate passes through", async () => {
     const stsMock = stubAssumeRole();
     const fetchStub = routedFetchStub([
@@ -343,7 +281,6 @@ Deno.test(
     "checkin-start: missing Authorization header -> 401 (defensive; platform normally rejects first)",
     async () => {
         const stsMock = stubAssumeRole();
-        const fetchStub = routedFetchStub([]);
 
         const reqNoAuth = new Request("http://localhost/test", {
             method: "POST",
@@ -357,8 +294,8 @@ Deno.test(
     },
 );
 
-// checkin_start_tx can commit a new checkout GUID that only this response carries back, so
-// everything that can fail (the books read, STS) must happen before it; see the handler.
+// Everything that can fail (STS) must happen before checkin_start_tx commits an attempt the
+// client might never hear of; see the handler.
 Deno.test(
     "checkin-start: an STS failure happens before checkin_start_tx, so nothing is committed",
     async () => {
@@ -368,52 +305,39 @@ Deno.test(
         const fetchStub = routedFetchStub(
             [
                 {
-                    when: "rest/v1/books",
-                    status: 200,
-                    body: [{ instance_id: "99999999-9999-9999-9999-999999999999" }],
-                },
-                {
                     when: "rpc/checkin_start_tx",
                     status: 200,
-                    body: {
-                        transactionId: "tx-1",
-                        bookId: "book-1",
-                        changedPaths: [],
-                    },
+                    body: { transactionId: "tx-1", changedPaths: [] },
                 },
             ],
             calls,
         );
 
-        for (const body of [VALID_BODY, { ...VALID_BODY, bookId: "book-1" }]) {
-            calls.length = 0;
-            const before = stsMock.commandCalls(AssumeRoleCommand).length;
-            await assertRejects(
-                () =>
-                    withMockFetch(fetchStub, () =>
-                        callHandler(handler, mockRequest(body), body),
-                    ),
-                Error,
-                "simulated STS outage",
-            );
-            assertEquals(
-                stsMock.commandCalls(AssumeRoleCommand).length,
-                before + 1,
-                "sanity check: STS was really asked (and failed)",
-            );
-            assertEquals(
-                calls.some((c) => c.url.includes("rpc/checkin_start_tx")),
-                false,
-                `checkin_start_tx must not run once STS has failed (bookId ${body.bookId})`,
-            );
-        }
+        await assertRejects(
+            () =>
+                withMockFetch(fetchStub, () =>
+                    callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
+                ),
+            Error,
+            "simulated STS outage",
+        );
+        assertEquals(
+            stsMock.commandCalls(AssumeRoleCommand).length,
+            1,
+            "sanity check: STS was really asked (and failed)",
+        );
+        assertEquals(
+            calls.some((c) => c.url.includes("rpc/checkin_start_tx")),
+            false,
+            "checkin_start_tx must not run once STS has failed",
+        );
 
         stsMock.restore();
     },
 );
 
 Deno.test(
-    "checkin-start: an existing book's instance id is read, and credentials issued, before checkin_start_tx",
+    "checkin-start: credentials are issued before checkin_start_tx",
     async () => {
         const stsMock = stubAssumeRole();
         const calls: RecordedCall[] = [];
@@ -434,65 +358,21 @@ Deno.test(
         const fetchStub = routedFetchStub(
             [
                 {
-                    when: "rest/v1/books",
-                    status: 200,
-                    body: [{ instance_id: "99999999-9999-9999-9999-999999999999" }],
-                },
-                {
                     when: "rpc/checkin_start_tx",
                     status: 200,
-                    body: {
-                        transactionId: "tx-1",
-                        bookId: "book-1",
-                        changedPaths: ["book.htm"],
-                    },
+                    body: { transactionId: "tx-1", changedPaths: ["index.htm"] },
                 },
             ],
             calls,
         );
-        const body = { ...VALID_BODY, bookId: "book-1" };
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(body), body),
+            callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
         );
 
         assertEquals(res.status, 200);
-        assertEquals(
-            calls.map((c) => new URL(c.url).pathname),
-            ["/rest/v1/books", "/rest/v1/rpc/checkin_start_tx"],
-            "the books read must come before the RPC",
-        );
         assertEquals(rpcCallsAtEachStsCall, [0], "STS must be called once, before the RPC");
-        const json = await res.json();
-        assertEquals(json.changedPaths, ["book.htm"]);
-        assertEquals(
-            json.s3.prefix,
-            "tc/11111111-1111-1111-1111-111111111111/books/99999999-9999-9999-9999-999999999999/",
-        );
-
-        stsMock.restore();
-    },
-);
-
-Deno.test(
-    "checkin-start: an existing book the caller cannot see -> 404, without calling checkin_start_tx",
-    async () => {
-        const stsMock = stubAssumeRole();
-        const calls: RecordedCall[] = [];
-        const fetchStub = routedFetchStub(
-            [{ when: "rest/v1/books", status: 200, body: [] }],
-            calls,
-        );
-        const body = { ...VALID_BODY, bookId: "book-1" };
-
-        const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(body), body),
-        );
-
-        assertEquals(res.status, 404);
-        assertEquals((await res.json()).error, "book_not_found");
-        assertEquals(calls.length, 1, "only the books read may happen");
-        assertEquals(stsMock.commandCalls(AssumeRoleCommand).length, 0);
+        assertEquals((await res.json()).changedPaths, ["index.htm"]);
 
         stsMock.restore();
     },

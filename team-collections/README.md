@@ -8,8 +8,8 @@ local stack (Supabase + MinIO) for developing against it. The design is describe
 carries the project records (`Design/CloudTeamCollections/`); comments here that mention
 "task NN", `src/...`, or `IMPLEMENTATION.md` refer to that repo.
 
-The docs describe the **planned** data model and API, CONTRACTS v2.0; the schema and edge
-functions here still implement v1.12. `docs/DESIGN.md` section 9 lists the work between them.
+The schema and edge functions here implement the data model and API of CONTRACTS v2.0. The
+desktop client still speaks v1.12; `docs/DESIGN.md` section 9 lists its work.
 
 ## Where each part lives
 
@@ -26,6 +26,7 @@ functions here still implement v1.12. `docs/DESIGN.md` section 9 lists the work 
 | Local stack: MinIO compose, function secrets, smoke test, S3 parity check | `team-collections/dev/` (start with its README) |
 | AWS bucket/IAM provisioning for hosted environments | `team-collections/aws/provision-aws.ps1` |
 | Support tool: delete a collection's rows and S3 objects (e.g. a failed migration) | `team-collections/support/delete-collection.ps1` (see `docs/GOING-LIVE.md`, "Deleting a failed migration") |
+| Support tool: move a person to a new login (a new Firebase account after an email change) | `team-collections/support/move-user-to-login.ps1` (see `docs/GOING-LIVE.md`, "Moving a user to a new login") |
 | Firebase custom-claim reference code (deployed from BloomLibrary infra) | `team-collections/firebase/` |
 | Design overview, API contracts, schema overview, go-live runbook | `team-collections/docs/` (`DESIGN.md`, `CONTRACTS.md`, `SCHEMA.md`, `GOING-LIVE.md`) |
 

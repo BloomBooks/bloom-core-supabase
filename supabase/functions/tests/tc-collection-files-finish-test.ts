@@ -1,5 +1,5 @@
 // Unit tests for collection-files-finish's handler — same shape as checkin-finish but
-// scoped to a collection_file_transactions row instead of a book.
+// scoped to a collection_file_checkin_attempts row instead of a book.
 import { assertEquals } from "@std/assert";
 import { mockClient } from "aws-sdk-client-mock";
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -21,20 +21,19 @@ const { hexToBase64 } = await import("../_shared/tc/s3.ts");
 const TX_ROW = {
     id: "tx-1",
     collection_id: "col-1",
-    group_key: "allowed-words",
-    changed_paths: ["allowed.txt"],
+
+    changed_paths: ["Allowed Words/allowed.txt"],
     proposed_files: [
         {
-            path: "allowed.txt",
+            path: "Allowed Words/allowed.txt",
             sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             size: 0,
         },
     ],
-    revision: 2,
 };
 
 Deno.test(
-    "collection-files-finish: happy path verifies checksum under collectionFiles/{groupKey}/ and returns version",
+    "collection-files-finish: happy path verifies checksum under collectionFiles/ and returns version",
     async () => {
         const s3Mock = mockClient(S3Client);
         s3Mock.on(HeadObjectCommand).resolves({
@@ -47,7 +46,7 @@ Deno.test(
         const fetchStub = routedFetchStub([
             { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             {
-                when: "collection_file_transactions",
+                when: "collection_file_checkin_attempts",
                 status: 200,
                 body: [TX_ROW],
             },
@@ -83,27 +82,17 @@ Deno.test(
         assertEquals(identityCall.authorization, "Bearer callers-own-jwt");
         assertEquals(finishCall.apikey, TEST_SERVICE_ROLE_KEY);
         assertEquals(finishCall.authorization, `Bearer ${TEST_SERVICE_ROLE_KEY}`);
-        assertEquals(finishCall.body?.p_user_id, TEST_CALLER.userId);
-        // The revision read with the verified proposal is passed on (see checkin-finish).
-        const txRead = calls.find((c) => c.url.includes("collection_file_transactions"));
-        if (!txRead) {
-            throw new Error("the transaction row was never read");
-        }
-        assertEquals(
-            new URL(txRead.url).searchParams.get("select")?.split(",").includes("revision"),
-            true,
-            "the transaction read must fetch the revision with the proposal",
-        );
-        assertEquals(finishCall.body?.p_expected_revision, 2);
-        assertEquals(finishCall.body?.p_captured, [
-            { path: "allowed.txt", s3VersionId: "v-1" },
-        ]);
+        assertEquals(finishCall.body, {
+            p_transaction_id: "tx-1",
+            p_user_id: TEST_CALLER.userId,
+            p_captured: [{ path: "Allowed Words/allowed.txt", s3VersionId: "v-1" }],
+        });
 
         const headCalls = s3Mock.commandCalls(HeadObjectCommand);
         assertEquals(headCalls.length, 1);
         assertEquals(
             headCalls[0].args[0].input.Key,
-            "tc/col-1/collectionFiles/allowed-words/allowed.txt",
+            "tc/col-1/collectionFiles/Allowed Words/allowed.txt",
         );
 
         s3Mock.restore();
@@ -122,14 +111,14 @@ Deno.test(
         const calls: RecordedCall[] = [];
         const fetchStub = routedFetchStub([
             { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
-            { when: "collection_file_transactions", status: 200, body: [TX_ROW] },
+            { when: "collection_file_checkin_attempts", status: 200, body: [TX_ROW] },
             {
                 when: "rpc/collection_files_finish_tx",
                 status: 409,
                 body: {
                     message: JSON.stringify({
                         error: "MissingOrBadUploads",
-                        paths: ["allowed.txt"],
+                        paths: ["Allowed Words/allowed.txt"],
                     }),
                 },
             },
@@ -148,8 +137,8 @@ Deno.test(
         assertEquals(res.status, 409);
         assertEquals(await res.json(), {
             error: "MissingOrBadUploads",
-            paths: ["allowed.txt"],
-            stalePaths: ["allowed.txt"],
+            paths: ["Allowed Words/allowed.txt"],
+            stalePaths: ["Allowed Words/allowed.txt"],
         });
 
         s3Mock.restore();
@@ -169,7 +158,7 @@ Deno.test(
         const fetchStub = routedFetchStub([
             { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
             {
-                when: "collection_file_transactions",
+                when: "collection_file_checkin_attempts",
                 status: 200,
                 body: [TX_ROW],
             },
@@ -206,7 +195,7 @@ Deno.test(
         const s3Mock = mockClient(S3Client);
         const fetchStub = routedFetchStub([
             { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
-            { when: "collection_file_transactions", status: 200, body: [] },
+            { when: "collection_file_checkin_attempts", status: 200, body: [] },
         ]);
 
         const res = await withMockFetch(fetchStub, () =>

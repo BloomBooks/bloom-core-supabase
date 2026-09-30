@@ -1,5 +1,5 @@
 // Unit tests for checkin-finish's handler. PostgREST calls (both the selectTcRow reads
-// of checkin_transactions/books and the checkin_finish_tx RPC) are faked via a fetch
+// of checkin_attempts/books and the checkin_finish_tx RPC) are faked via a fetch
 // stub; the S3 HeadObject checksum verification is faked via aws-sdk-client-mock. The
 // live-integration spike already exercises the real MinIO checksum round-trip; these
 // tests pin down the handler's own wiring: which paths get verified, what gets sent to
@@ -39,8 +39,6 @@ const TX_ROW = {
         },
     ],
     status: "open",
-    // Resumed a few times by checkin-start; finish must pass this exact value on.
-    revision: 3,
 };
 const BOOK_ROW = { instance_id: "instance-1" };
 
@@ -54,7 +52,7 @@ const routesFor = (
     routedFetchStub([
         { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
         {
-            when: "checkin_transactions",
+            when: "checkin_attempts",
             status: txRow ? 200 : 200,
             body: txRow ? [txRow] : [],
         },
@@ -71,7 +69,7 @@ const routesFor = (
     ], calls);
 
 Deno.test(
-    "checkin-finish: happy path verifies checksum, captures version-id, returns versionId+seq",
+    "checkin-finish: happy path verifies checksum, captures version-id, returns the version",
     async () => {
         const s3Mock = mockClient(S3Client);
         s3Mock.on(HeadObjectCommand).resolves({
@@ -80,10 +78,7 @@ Deno.test(
             VersionId: "v-42",
         });
 
-        const fetchStub = routesFor(TX_ROW, BOOK_ROW, 200, {
-            versionId: "ver-1",
-            seq: 3,
-        });
+        const fetchStub = routesFor(TX_ROW, BOOK_ROW, 200, { version: 3 });
 
         const res = await withMockFetch(fetchStub, () =>
             callHandler(handler, mockRequest({ transactionId: "tx-1" }), {
@@ -93,8 +88,7 @@ Deno.test(
 
         assertEquals(res.status, 200);
         const json = await res.json();
-        assertEquals(json.versionId, "ver-1");
-        assertEquals(json.seq, 3);
+        assertEquals(json, { version: 3 });
 
         // The HeadObject must have been issued against the right key (prefix + path).
         const headCalls = s3Mock.commandCalls(HeadObjectCommand);
@@ -127,7 +121,7 @@ Deno.test(
                     new Response(JSON.stringify(TEST_CALLER), { status: 200 }),
                 );
             }
-            if (url.includes("checkin_transactions")) {
+            if (url.includes("checkin_attempts")) {
                 return Promise.resolve(
                     new Response(JSON.stringify([TX_ROW]), { status: 200 }),
                 );
@@ -242,7 +236,7 @@ Deno.test(
             VersionId: "v-recent",
         });
         const calls: RecordedCall[] = [];
-        const fetchStub = routesFor(TX_ROW, BOOK_ROW, 200, { versionId: "ver-1", seq: 3 }, calls);
+        const fetchStub = routesFor(TX_ROW, BOOK_ROW, 200, { version: 3 }, calls);
 
         const res = await withMockFetch(fetchStub, () =>
             callHandler(handler, mockRequest({ transactionId: "tx-1" }), {
@@ -264,7 +258,7 @@ Deno.test(
         const s3Mock = mockClient(S3Client);
         const fetchStub = routedFetchStub([
             { when: "rpc/current_caller", status: 200, body: TEST_CALLER },
-            { when: "checkin_transactions", status: 200, body: [] }, // selectTcRow finds nothing
+            { when: "checkin_attempts", status: 200, body: [] }, // selectTcRow finds nothing
         ]);
 
         const res = await withMockFetch(fetchStub, () =>
@@ -296,7 +290,7 @@ Deno.test(
             TX_ROW,
             BOOK_ROW,
             200,
-            { versionId: "ver-1", seq: 3 },
+            { version: 3 },
             calls,
         );
 
@@ -331,24 +325,13 @@ Deno.test(
         assertEquals(finishCall.apikey, TEST_SERVICE_ROLE_KEY);
         assertEquals(finishCall.authorization, `Bearer ${TEST_SERVICE_ROLE_KEY}`);
         // ...and is told who the caller is by the identity call, not by the request body.
-        assertEquals(finishCall.body?.p_user_id, TEST_CALLER.userId);
-        assertEquals(finishCall.body?.p_user_email, TEST_CALLER.email);
-        assertEquals(finishCall.body?.p_user_name, TEST_CALLER.name);
-        assertEquals(finishCall.body?.p_captured, [
-            { path: "book.htm", s3VersionId: "v-42" },
-        ]);
-        // The revision read with the proposal just verified goes to the RPC, which refuses
-        // (TransactionChanged) if a concurrent checkin-start resume has changed it since.
-        const txRead = calls.find((c) => c.url.includes("checkin_transactions"));
-        if (!txRead) {
-            throw new Error("the transaction row was never read");
-        }
-        assertEquals(
-            new URL(txRead.url).searchParams.get("select")?.split(",").includes("revision"),
-            true,
-            "the transaction read must fetch the revision with the proposal",
-        );
-        assertEquals(finishCall.body?.p_expected_revision, 3);
+        assertEquals(finishCall.body, {
+            p_transaction_id: "tx-1",
+            p_user_id: TEST_CALLER.userId,
+            p_comment: null,
+            p_keep_checked_out: false,
+            p_captured: [{ path: "book.htm", s3VersionId: "v-42" }],
+        });
 
         s3Mock.restore();
     },
@@ -397,8 +380,7 @@ Deno.test(
             .rejects(new Error("simulated backup-write outage"));
 
         const fetchStub = routesFor(TX_ROW, BOOK_ROW, 200, {
-            versionId: "ver-9",
-            seq: 9,
+            version: 9,
             manifest: [{ path: "book.htm" }],
         });
 
@@ -412,13 +394,13 @@ Deno.test(
         // unaffected (writeManifestBackup is documented best-effort/never-throws).
         assertEquals(res.status, 200);
         const json = await res.json();
-        assertEquals(json.versionId, "ver-9");
+        assertEquals(json.version, 9);
         assertEquals(
             "manifest" in json,
             false,
             "the internal `manifest` field must never leak to the client",
         );
-        // The backup is written under the committed seq first (see writeManifestBackup).
+        // The backup is written under the committed version first (see writeManifestBackup).
         assertEquals(
             s3Mock.commandCalls(PutObjectCommand)[0]?.args[0].input.Key,
             "tc/col-1/books/instance-1/.manifests/9.json",
@@ -429,7 +411,7 @@ Deno.test(
 );
 
 Deno.test(
-    "checkin-finish: RPC 409 TransactionChanged (a concurrent resume) passes through, with no manifest backup",
+    "checkin-finish: RPC 409 transaction_aborted (a newer start replaced the attempt) passes through, with no manifest backup",
     async () => {
         const s3Mock = mockClient(S3Client);
         s3Mock.on(HeadObjectCommand).resolves({
@@ -439,7 +421,7 @@ Deno.test(
         });
 
         const fetchStub = routesFor(TX_ROW, BOOK_ROW, 409, {
-            message: JSON.stringify({ error: "TransactionChanged" }),
+            message: JSON.stringify({ error: "transaction_aborted" }),
         });
 
         const res = await withMockFetch(fetchStub, () =>
@@ -449,7 +431,7 @@ Deno.test(
         );
 
         assertEquals(res.status, 409);
-        assertEquals(await res.json(), { error: "TransactionChanged" });
+        assertEquals(await res.json(), { error: "transaction_aborted" });
         assertEquals(s3Mock.commandCalls(PutObjectCommand).length, 0);
 
         s3Mock.restore();

@@ -2449,7 +2449,7 @@ $$;
 
 COMMENT ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) IS 'Support tool, SERVICE-ROLE only: permanently deletes a collection and every tc row that belongs to it (members, books, book_files, both attempts tables, collection files, palette entries, history events), e.g. a cloud collection whose initial upload failed. core.users rows are kept. Returns {collectionId, name, found, deleted, rows: {<table>: count}}; p_dry_run = true only counts. An unknown id returns found = false, so a re-run is harmless. Does NOT touch S3: team-collections/support/delete-collection.ps1 calls this and then deletes the tc/{collectionId}/ prefix. See GOING-LIVE.md "Deleting a failed migration".';
 
-CREATE OR REPLACE FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean DEFAULT false) RETURNS jsonb
+CREATE OR REPLACE FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean DEFAULT false) RETURNS jsonb
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
 DECLARE
@@ -2457,27 +2457,29 @@ DECLARE
     v_user  core.users%ROWTYPE;
     v_other uuid;
 BEGIN
-    IF p_user_id IS NULL OR p_authentication_id IS NULL OR btrim(p_authentication_id) = ''
+    IF tc._normalize_email(p_current_email) IS NULL OR tc._normalize_email(p_current_email) = ''
+       OR p_authentication_id IS NULL OR btrim(p_authentication_id) = ''
        OR v_email IS NULL OR v_email = '' THEN
-        RAISE EXCEPTION 'support_move_user_to_login: user id, authentication id and email are required'
+        RAISE EXCEPTION 'support_move_user_to_login: current email, authentication id and email are required'
             USING ERRCODE = '22023';
     END IF;
 
-    SELECT * INTO v_user FROM core.users WHERE id = p_user_id FOR UPDATE;
+    SELECT * INTO v_user FROM core.users WHERE email = tc._normalize_email(p_current_email) FOR UPDATE;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'user_not_found: %', p_user_id USING ERRCODE = 'P0002';
+        RAISE EXCEPTION 'user_not_found: no user has the email %', tc._normalize_email(p_current_email)
+            USING ERRCODE = 'P0002';
     END IF;
 
     -- Moving onto a login or an email that another row already has would be a merge of two
     -- users, which is a different job.
     SELECT u.id INTO v_other FROM core.users u
-    WHERE u.authentication_id = p_authentication_id AND u.id <> p_user_id;
+    WHERE u.authentication_id = p_authentication_id AND u.id <> v_user.id;
     IF FOUND THEN
         RAISE EXCEPTION 'login_has_user: that login already has user %; moving would be a merge', v_other
             USING ERRCODE = 'P0001';
     END IF;
     SELECT u.id INTO v_other FROM core.users u
-    WHERE u.email = v_email AND u.id <> p_user_id;
+    WHERE u.email = v_email AND u.id <> v_user.id;
     IF FOUND THEN
         RAISE EXCEPTION 'email_has_user: % already belongs to user %; moving would be a merge', v_email, v_other
             USING ERRCODE = 'P0001';
@@ -2487,11 +2489,11 @@ BEGIN
         UPDATE core.users
         SET    authentication_id = p_authentication_id,
                email             = v_email
-        WHERE  id = p_user_id;
+        WHERE  id = v_user.id;
     END IF;
 
     RETURN jsonb_build_object(
-        'userId',                 p_user_id,
+        'userId',                 v_user.id,
         'moved',                  NOT p_dry_run,
         'oldAuthenticationId',    v_user.authentication_id,
         'oldEmail',               v_user.email,
@@ -2501,7 +2503,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean) IS 'Support tool, SERVICE-ROLE only: moves a person''s user row to a new login (a new Firebase account after an email change) by setting core.users.authentication_id and email, so their memberships, checkouts and history follow them. Refuses (P0001 login_has_user / email_has_user) if another row already has that login or email, which would make it a merge; unknown user P0002; missing arguments 22023. p_dry_run = true only checks. Returns {userId, moved, oldAuthenticationId, oldEmail, authenticationId, email}. Run by team-collections/support/move-user-to-login.ps1.';
+COMMENT ON FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean) IS 'Support tool, SERVICE-ROLE only: moves the person whose core.users.email is p_current_email to a new login (a new Firebase account after an email change) by setting core.users.authentication_id and email, so their memberships, checkouts and history follow them. Refuses (P0001 login_has_user / email_has_user) if another row already has that login or email, which would make it a merge; no user with p_current_email P0002; missing arguments 22023. p_dry_run = true only checks. Returns {userId, moved, oldAuthenticationId, oldEmail, authenticationId, email}. Run by team-collections/support/move-user-to-login.ps1.';
 
 CREATE OR REPLACE FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
@@ -3149,8 +3151,8 @@ GRANT ALL ON FUNCTION tc.reap_expired_checkin_attempts() TO authenticated;
 -- Deletes a whole collection's rows: the Bloom team's support tool, never a client's.
 REVOKE ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
 GRANT ALL ON FUNCTION tc.support_delete_collection(p_collection_id uuid, p_dry_run boolean) TO service_role;
-REVOKE ALL ON FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
-GRANT ALL ON FUNCTION tc.support_move_user_to_login(p_user_id uuid, p_authentication_id text, p_email text, p_dry_run boolean) TO service_role;
+REVOKE ALL ON FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean) FROM PUBLIC, anon, authenticated;
+GRANT ALL ON FUNCTION tc.support_move_user_to_login(p_current_email text, p_authentication_id text, p_email text, p_dry_run boolean) TO service_role;
 REVOKE ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) FROM PUBLIC;
 GRANT ALL ON FUNCTION tc.support_set_admin(p_collection_id uuid, p_email text) TO service_role;
 

@@ -1,5 +1,5 @@
-// Unit tests for collection-files-start's handler: groupKey validation, the
-// optimistic-version RPC call, and scoped S3 credential issuance.
+// Unit tests for collection-files-start's handler: the optimistic-version RPC call, and
+// scoped S3 credential issuance.
 import { assertEquals, assertRejects } from "@std/assert";
 import { AssumeRoleCommand } from "@aws-sdk/client-sts";
 import {
@@ -17,22 +17,22 @@ const { handler } = await import("../collection-files-start/index.ts");
 
 const VALID_BODY = {
     collectionId: "col-1",
-    groupKey: "allowed-words",
     expectedVersion: 0,
-    files: [{ path: "allowed.txt", sha256: "abc", size: 3 }],
+    files: [{ path: "Allowed Words/allowed.txt", sha256: "abc", size: 3 }],
 };
 
 Deno.test(
-    "collection-files-start: happy path scopes creds under collectionFiles/{groupKey}/",
+    "collection-files-start: happy path scopes creds under collectionFiles/ and passes the version and files",
     async () => {
         const stsMock = stubAssumeRole();
+        const calls: RecordedCall[] = [];
         const fetchStub = routedFetchStub([
             {
                 when: "rpc/collection_files_start_tx",
                 status: 200,
-                body: { transactionId: "tx-1", changedPaths: ["allowed.txt"] },
+                body: { transactionId: "tx-1", changedPaths: ["Allowed Words/allowed.txt"] },
             },
-        ]);
+        ], calls);
 
         const res = await withMockFetch(fetchStub, () =>
             callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
@@ -41,26 +41,36 @@ Deno.test(
         assertEquals(res.status, 200);
         const json = await res.json();
         assertEquals(json.transactionId, "tx-1");
-        assertEquals(json.s3.prefix, "tc/col-1/collectionFiles/allowed-words/");
+        assertEquals(json.changedPaths, ["Allowed Words/allowed.txt"]);
+        assertEquals(json.s3.prefix, "tc/col-1/collectionFiles/");
+        assertEquals(calls[0]?.body, {
+            p_collection_id: "col-1",
+            p_expected_version: 0,
+            p_files: VALID_BODY.files,
+        });
 
         stsMock.restore();
     },
 );
 
 Deno.test(
-    "collection-files-start: invalid groupKey -> 400 before any RPC/S3 call",
+    "collection-files-start: RPC 403 admin_required passes through, with no S3 creds",
     async () => {
         const stsMock = stubAssumeRole();
-        const fetchStub = routedFetchStub([]);
-        const badBody = { ...VALID_BODY, groupKey: "not-a-real-group" };
+        const fetchStub = routedFetchStub([
+            {
+                when: "rpc/collection_files_start_tx",
+                status: 403,
+                body: { message: JSON.stringify({ error: "admin_required" }) },
+            },
+        ]);
 
         const res = await withMockFetch(fetchStub, () =>
-            callHandler(handler, mockRequest(badBody), badBody),
+            callHandler(handler, mockRequest(VALID_BODY), VALID_BODY),
         );
 
-        assertEquals(res.status, 400);
-        assertEquals((await res.json()).field, "groupKey");
-        assertEquals(stsMock.commandCalls(AssumeRoleCommand).length, 0);
+        assertEquals(res.status, 403);
+        assertEquals(await res.json(), { error: "admin_required" });
 
         stsMock.restore();
     },
@@ -100,7 +110,7 @@ Deno.test(
 );
 
 Deno.test(
-    "collection-files-start: an STS failure happens before collection_files_start_tx, so no transaction is opened",
+    "collection-files-start: an STS failure happens before collection_files_start_tx, so no attempt is opened",
     async () => {
         const stsMock = stubAssumeRole();
         stsMock.on(AssumeRoleCommand).rejects(new Error("simulated STS outage"));
@@ -110,7 +120,7 @@ Deno.test(
                 {
                     when: "rpc/collection_files_start_tx",
                     status: 200,
-                    body: { transactionId: "tx-1", changedPaths: ["allowed.txt"] },
+                    body: { transactionId: "tx-1", changedPaths: ["Allowed Words/allowed.txt"] },
                 },
             ],
             calls,

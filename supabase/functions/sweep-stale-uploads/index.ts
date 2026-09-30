@@ -7,7 +7,7 @@
 // whose commit failed demotes the still-referenced committed version to "noncurrent" (so the
 // lifecycle would eventually delete the version we still need) while the garbage upload sits
 // as "current" (which the lifecycle never touches). For each file touched by a dead
-// (aborted/expired) transaction -- and NOT one a live transaction is currently uploading -- we
+// (aborted/expired) check-in attempt -- and NOT one a live attempt is currently uploading -- we
 // delete every S3 version newer than the one the current manifest references, which restores
 // that referenced version to "current" and removes the garbage.
 //
@@ -27,8 +27,10 @@
 //     references the version the candidates were chosen against.
 //
 // The worklist is read a page at a time (tc.list_stale_upload_keys, keyset-paged by S3 key),
-// all pages per run: dead transaction rows stay behind after their garbage is deleted, so the
-// same keys keep coming back, and a single capped read would never get past them.
+// all pages per run: dead attempt rows stay behind until a run has deleted their garbage, so
+// the same keys keep coming back, and a single capped read would never get past them. At the
+// end of a complete run, tc.forget_swept_attempts deletes the dead attempts all of whose
+// uploads were older than this run's cutoff, so they drop out of later worklists.
 import { HttpError, jsonResponse } from "../_shared/tc/errors.ts";
 import { serveJsonPost } from "../_shared/tc/handler.ts";
 import { callTcRpc } from "../_shared/tc/rpc.ts";
@@ -113,11 +115,17 @@ export const handler = async (
         afterKey = page[page.length - 1].s3_key;
     }
 
+    // Only after every page: a run that stopped early (an error thrown above) forgets nothing.
+    const attemptsForgotten = await callTcRpc<number>(req, "forget_swept_attempts", {
+        p_cutoff: new Date(cutoff).toISOString(),
+    });
+
     return jsonResponse(200, {
         keysProcessed,
         versionsDeleted,
         referencedMissing,
         keysChanged,
+        attemptsForgotten,
     });
 };
 

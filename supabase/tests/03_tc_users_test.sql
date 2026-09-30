@@ -8,7 +8,7 @@
 
 BEGIN;
 
-SELECT plan(32);
+SELECT plan(33);
 
 CREATE SCHEMA IF NOT EXISTS tests;
 
@@ -259,35 +259,32 @@ SELECT ok(
 
 SELECT ok(
     NOT has_function_privilege('authenticated',
-        'tc.support_move_user_to_login(uuid, text, text, boolean)', 'EXECUTE'),
+        'tc.support_move_user_to_login(text, text, text, boolean)', 'EXECUTE'),
     '7a: authenticated cannot execute support_move_user_to_login'
 );
 
 SELECT set_config('tests.ben_id', tests.uid('user-ben')::text, true);
 
 SELECT ok(
-    (tc.support_move_user_to_login(current_setting('tests.ben_id')::uuid, 'user-ben-2', 'Ben@New-Login.org', true)
+    (tc.support_move_user_to_login('Ben.Newest@example.com', 'user-ben-2', 'Ben@New-Login.org', true)
         ->> 'moved') = 'false'
     AND tests.uid('user-ben-2') IS NULL,
     '7b: a dry run changes nothing'
 );
 
 SELECT throws_like(
-    format($$SELECT tc.support_move_user_to_login(%L, 'user-ann', 'ben2@example.com')$$,
-        current_setting('tests.ben_id')),
+    $$SELECT tc.support_move_user_to_login('ben.newest@example.com', 'user-ann', 'ben2@example.com')$$,
     'login_has_user%',
     '7c: moving onto a login that already has a row is refused (a merge)'
 );
 SELECT throws_like(
-    format($$SELECT tc.support_move_user_to_login(%L, 'user-ben-2', 'ann@example.com')$$,
-        current_setting('tests.ben_id')),
+    $$SELECT tc.support_move_user_to_login('ben.newest@example.com', 'user-ben-2', 'ann@example.com')$$,
     'email_has_user%',
     '7d: moving onto an email another row has is refused (a merge)'
 );
 
 SELECT lives_ok(
-    format($$SELECT tc.support_move_user_to_login(%L, 'user-ben-2', 'Ben@New-Login.org')$$,
-        current_setting('tests.ben_id')),
+    $$SELECT tc.support_move_user_to_login('ben.newest@example.com', 'user-ben-2', 'Ben@New-Login.org')$$,
     '7e: the move succeeds'
 );
 
@@ -304,6 +301,11 @@ SELECT tests.set_jwt('user-ben', 'ben.new@example.com');
 SELECT ok(
     tc.current_user_id() IS NULL,
     '7g: the old login no longer finds the row'
+);
+SELECT throws_ok(
+    $$SELECT tc.support_move_user_to_login('nobody@example.com', 'user-x', 'x@example.com')$$,
+    'P0002', NULL,
+    '7h: an email no user has is refused'
 );
 
 SELECT * FROM finish();

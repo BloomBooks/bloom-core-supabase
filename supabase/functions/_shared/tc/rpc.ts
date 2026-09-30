@@ -56,11 +56,9 @@ export const callTcServiceRpc = <T = unknown>(
     return postTcRpc<T>(fnName, args, key, `Bearer ${key}`);
 };
 
-/** The caller's identity as the database sees it (tc.current_caller). */
+/** The caller's identity as the database sees it (tc.current_caller): their core.users id. */
 export interface CallerIdentity {
     userId: string;
-    email: string | null;
-    name: string | null;
 }
 
 /** Establishes who the caller is by asking PostgREST, with the caller's own JWT, to run
@@ -101,7 +99,7 @@ const postTcRpc = async <T>(
 
 /** Plain PostgREST read (GET /rest/v1/<table>?...) under RLS with the caller's own
  * JWT — used where a full RPC round-trip isn't needed (e.g. checkin-finish reading
- * back its own open transaction row to learn which paths to verify against S3). */
+ * back its own check-in attempt row to learn which paths to verify against S3). */
 export const selectTcRow = async <T = Record<string, unknown>>(
     req: Request,
     table: string,

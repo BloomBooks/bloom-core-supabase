@@ -1,8 +1,7 @@
 # Cloud Team Collections — database schema (`tc` and `core`)
 
-> **Status:** this is the **planned** schema of CONTRACTS v2.0, described in `DESIGN.md`. The
-> declarative schema in `supabase/schemas/` still implements CONTRACTS v1.12; the work to bring it
-> here is listed in `DESIGN.md`, section 9. Paths under `src/` refer to the BloomDesktop repo, where
+> **Status:** the schema of CONTRACTS v2.0, described in `DESIGN.md` and implemented by the
+> declarative schema in `supabase/schemas/`. Paths under `src/` refer to the BloomDesktop repo, where
 > the desktop client lives.
 
 Entity-relationship diagram of the Supabase Postgres `tc` schema, and the `core.users` table it
@@ -167,9 +166,10 @@ erDiagram
 - **The two `*_checkin_attempts` tables** hold in-flight and recently ended two-phase sends (start,
   upload to S3, finish). A start resumes an open attempt only if its proposal is identical, and
   otherwise aborts it and opens a new one, so a finish can only commit the proposal of the start
-  that returned its id. The reaper marks an open attempt `expired` after 48 hours, deletes a finished
-  attempt once its expiry has passed, and deletes an aborted or expired attempt once the
-  orphaned-upload sweep has deleted its uploads (those attempts are the sweep's worklist). Start
+  that returned its id. The reaper marks an open attempt `expired` after 48 hours and deletes a
+  finished attempt once its expiry has passed; aborted and expired attempts are the orphaned-upload
+  sweep's worklist, and the sweep deletes each once a complete run has deleted its uploads
+  (`tc.forget_swept_attempts`). At most one attempt per person and book (or collection) is open. Start
   stores the proposed manifest with every path NFC-normalized, so the keys the client uploads to and
   the paths committed at finish are spelled the same way.
 - **Checkout GUID.** The client checking a book out makes a random GUID, keeps it in the book

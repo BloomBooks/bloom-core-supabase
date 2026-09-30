@@ -35,11 +35,10 @@ export const stubAssumeRole = () => {
 /** The fake service-role key setTestEnv installs, so tests can assert which calls use it. */
 export const TEST_SERVICE_ROLE_KEY = "test-service-role-key";
 
-/** What a fake tc.current_caller RPC returns in tests (see rpc.ts callerIdentity). */
+/** What a fake tc.current_caller RPC returns in tests (see rpc.ts callerIdentity): the
+ * caller's core.users id. */
 export const TEST_CALLER = {
-    userId: "user-1",
-    email: "user1@example.com",
-    name: "User One",
+    userId: "0a0a0a0a-0000-4000-8000-000000000001",
 };
 
 /** Sets every env var `_shared/tc/env.ts` reads, with dev-mode-friendly defaults. Call

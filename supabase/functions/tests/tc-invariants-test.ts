@@ -43,7 +43,7 @@ Deno.test(
 
         assert(
             schemaHours.length >= 2,
-            "expected the expires_at DEFAULT on both checkin_transactions and collection_file_transactions",
+            "expected the expires_at DEFAULT on both checkin_attempts and collection_file_checkin_attempts",
         );
         assert(
             resumeHours.length >= 2,
@@ -139,7 +139,7 @@ Deno.test(
         );
         assert(
             txHoursMatch,
-            "could not find the checkin_transactions expires_at default in supabase/schemas/tc/03_tables.sql",
+            "could not find the checkin_attempts expires_at default in supabase/schemas/tc/03_tables.sql",
         );
         const txHours = Number(txHoursMatch[1]);
 

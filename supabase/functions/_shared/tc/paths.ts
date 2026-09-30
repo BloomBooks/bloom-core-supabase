@@ -16,17 +16,15 @@ export const collectionPrefix = (collectionId: string): string =>
 export const bookPrefix = (collectionId: string, instanceId: string): string =>
     `${collectionPrefix(collectionId)}books/${instanceId}/`;
 
-/** Prefix for one collection-files group ('other' | 'allowed-words' | 'sample-texts'). */
-export const collectionFilesPrefix = (
-    collectionId: string,
-    groupKey: string,
-): string => `${collectionPrefix(collectionId)}collectionFiles/${groupKey}/`;
+/** Prefix for the collection's one set of collection files; the paths under it are
+ * relative to the collection folder (e.g. `Allowed Words/list.txt`). */
+export const collectionFilesPrefix = (collectionId: string): string =>
+    `${collectionPrefix(collectionId)}collectionFiles/`;
 
-/** Reads back a book row (under RLS, with the caller's own JWT) to learn its
- * DB-canonical instance_id, and returns that book's S3 prefix. Throws 404 if the row
- * is missing or invisible to the caller. Both checkin-start and checkin-finish must
- * scope S3 operations by the DB-canonical instance id, never a caller-supplied one —
- * see the security note at checkin-start's call site (Greptile P1, PR #8048). */
+/** Reads back a book row (under RLS, with the caller's own JWT) by its internal id to
+ * learn its instance_id, and returns that book's S3 prefix. Throws 404 if the row is
+ * missing or invisible to the caller. checkin-finish uses it for the book of the attempt
+ * it finishes, which the attempt row names only by the internal id. */
 export const resolveBookPrefix = async (
     req: Request,
     collectionId: string,

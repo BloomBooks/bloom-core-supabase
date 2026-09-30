@@ -1,9 +1,10 @@
 # Cloud Team Collections — API contracts
 
-> **Status:** **contract version 2.0, planned.** It describes the API of the design in `DESIGN.md`.
-> The SQL and edge functions on this branch still implement version 1.12; the work to bring them to
-> 2.0 is listed in `DESIGN.md`, section 9. Paths under `src/` refer to the BloomDesktop repo, where
-> the desktop client lives. Change this file only together with the version number above.
+> **Status:** **contract version 2.0.** It describes the API of the design in `DESIGN.md`, which the
+> SQL and edge functions on this branch implement. The desktop client (BloomDesktop #8052) still
+> speaks version 1.12; its work is listed in `DESIGN.md`, section 9. Paths under `src/` refer to the
+> BloomDesktop repo, where the desktop client lives. Change this file only together with the version
+> number above.
 
 ## Link file
 
@@ -130,8 +131,8 @@ book, increased by one at each commit; NULL means a first check-in is still in p
 
 | RPC | Args → Result |
 |-----|----------------|
-| `claim_memberships(name text)` | Bloom calls it at every sign-in. Creates the caller's `core.users` row if there is none and the token's verified email has an invitation, or claims the **unclaimed user** with that email (see "Carried-over checkouts" below); refreshes `users.email` from the token and sets `users.name` to `name` (the first and last name from Bloom's Registration dialog); fills `user_id` on every member row inviting that email. Returns `{ userId }` (NULL if the caller has no user row) |
-| `create_collection(id uuid, name text, initial_upload boolean = false)` | creates the collection with the caller as its sole claimed admin, creating the caller's user row if needed. `initial_upload: true` creates it with its initial upload in progress (see "Starting a cloud collection" below); this is the only way the flag is ever set |
+| `claim_memberships(name text)` | Bloom calls it at every sign-in. Needs a verified email (else SQLSTATE 28000 `email_not_verified`). Creates the caller's `core.users` row if there is none and the token's email has an invitation, or claims the **unclaimed user** with that email (see "Carried-over checkouts" below); refreshes `users.email` from the token (unless another user row has that email) and sets `users.name` to `name` (the first and last name from Bloom's Registration dialog; a blank `name` keeps the old one); fills `user_id` on every invitation to that email, except in a collection the person has already joined. Returns `{ userId }` (NULL if the caller has no user row). An email another login's row has: P0001 `email_in_use: ...` (a support task) |
+| `create_collection(id uuid, name text, initial_upload boolean = false)` | creates the collection with the caller as its sole claimed admin, creating (or claiming) the caller's user row if needed, which needs a verified email as for `claim_memberships`. `initial_upload: true` creates it with its initial upload in progress (see "Starting a cloud collection" below); this is the only way the flag is ever set |
 | `my_collections()` | collections where the caller's email is approved (claimed or not), leaving out those whose initial upload is in progress (for everyone, the uploading admin too) |
 | `finish_initial_upload(collection_id)` | admin (else SQLSTATE 42501 `admin_required`; unknown id P0002 `collection_not_found`). Clears the initial-upload flag for good; already clear = no-op success, so retry freely. Emits no event |
 | `get_collection_state(collection_id, since_event_id?)` | full or delta snapshot: book rows (`instanceId`, name, current version and checksum, the lock holder's user id, name and email, machine and time, `checkoutGuidHash`, tombstone), the collection files' version, `max_event_id` (safe as a cursor, as for `get_changes`) and `initial_upload_in_progress`. Also sets the caller's `last_seen_at` in this collection (at most once per 10 minutes) |
@@ -234,8 +235,8 @@ files: [{path, sha256, size}], checkoutGuid? }`
   send-only lock (an unfinished check-in that took it while free) `checkoutGuid` must be absent. If
   the book is free, start takes a send-only lock (no GUID; finish, abort and expiry release it) and
   emits a CheckOut event (type 0, as `checkout_book` does); if someone else holds it, 409
-  `LockHeldByOther` (+`holder`). If `baseVersion` is sent and the book has moved on, 409
-  `BaseVersionSuperseded`.
+  `LockHeldByOther` with `holder: {userId, name, email, machine, lockedAt}`. If `baseVersion` is
+  sent and the book has moved on, 409 `BaseVersionSuperseded` (`currentVersion`).
 - The S3 credentials are obtained before the lock is taken; a refused start returns none.
 - Every `files[].path` is NFC-normalized before anything else, and validated: it must be a
   non-empty relative path (no leading `/`, no empty, `.` or `..` segment), with a `sha256` string
@@ -303,10 +304,12 @@ releases an existing book's send-only lock (no GUID) that the aborted check-in t
 reaped.
 
 #### Keeping the attempts tables small
-The reaper runs at every `checkin-start` and `collection-files-start`. It marks an open attempt
-`expired` once its 48 hours are up, deletes a finished attempt once its expiry has passed (a
-repeated finish only ever comes from the same Bloom session, which keeps the attempt id in memory),
-and deletes an aborted or expired attempt once the orphaned-upload sweep has deleted its uploads.
+The reaper (`tc.reap_expired_checkin_attempts`) runs at every `checkin-start` and
+`collection-files-start`. It marks an open attempt `expired` once its 48 hours are up, and deletes a
+finished attempt once its expiry has passed (a repeated finish only ever comes from the same Bloom
+session, which keeps the attempt id in memory). Aborted and expired attempts are the orphaned-upload
+sweep's worklist; at the end of each complete run the sweep deletes those whose uploads were all old
+enough for it to have deleted (`tc.forget_swept_attempts`, below).
 
 #### Orphaned uploads (`sweep-stale-uploads`, ops only)
 Not called by the client: a service-role job (see GOING-LIVE.md "Orphaned-upload sweep") that
@@ -314,7 +317,12 @@ deletes S3 versions uploaded by check-in attempts and collection-file sends that
 Its worklist is the aborted and expired attempts; it reads it a page at a time
 (`tc.list_stale_upload_keys(after_key, limit)`, keyset-paged by S3 key, every page per run), deletes
 only versions older than `UPLOAD_SWEEP_GRACE_MS` (48 h), and re-checks each key just before
-deleting. Because the finish functions never commit an upload older than `UPLOAD_COMMIT_WINDOW_MS`
+deleting. After the last page it calls `tc.forget_swept_attempts(cutoff)` with the run's cutoff
+(now minus the grace), which deletes each dead attempt whose uploads are all older than that: every
+upload of an attempt uses credentials from its latest start, which set its expiry to that start +
+48 h and last 1 h, so none is newer than `expires_at - 47 h` (the function allows one more hour for
+clock differences). A run that fails partway forgets nothing. Because the finish functions never
+commit an upload older than `UPLOAD_COMMIT_WINDOW_MS`
 (24 h; see `checkin-finish`), no version the sweep may delete can be committed while it runs; both
 constants are in `supabase/functions/_shared/tc/uploadWindows.ts`, and a test keeps the commit
 window plus a safety margin below the grace.
