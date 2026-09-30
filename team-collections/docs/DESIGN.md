@@ -962,6 +962,15 @@ them yet.
   seen on the server; keeping a name chosen with Rename in `meta.json`; sending the name the book
   should have; mapping `index.htm`; comparing books by manifest keys.
 - Treating `transaction_aborted` on a superseded finish as superseded; one collection-file set.
+- Moving a book between collections with Bloom's **Move into &lt;collection name&gt;** command.
+  Moving out of a cloud collection goes through the abstraction's delete, which is `delete_book`
+  and needs the checkout: `CollectionModel` deletes the book from the source collection before it
+  clears the book's local-only files (the `.checkout` record included), so the GUID is still there to
+  present. A book moved into a cloud collection arrives as a new local book and goes up as a first
+  check-in. Not yet handled: a book moved back into a cloud collection it was moved out of has a
+  tombstone there with the same instance id, and a first check-in of a deleted book's instance id is
+  refused (`book_not_found`). Either that check-in revives the tombstone, as `undelete_book` would,
+  or the client gives the book a new instance id; to be decided.
 
 **Wiring and deployment**
 
