@@ -397,3 +397,65 @@ Deno.test({
     }
   },
 });
+
+// SECURITY: path segments must not be able to walk out of the book's folder.
+// encodeUnicode decodes each segment once more, so a client-sent "%252e%252e"
+// arrives here as "%2e%2e" and becomes "..", which the URL parser resolves.
+Deno.test({
+  name: "BookData - getContentUrl refuses paths that leave the book's folder",
+  fn: async () => {
+    const originalMethod = BloomParseServer.prototype.getBookByDatabaseId;
+    BloomParseServer.prototype.getBookByDatabaseId = () =>
+      createMockBook(
+        "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/"
+      );
+    try {
+      for (const pathSegments of [
+        ["..", ".."], // the top of the bucket
+        ["%2e%2e", "%2e%2e"], // the same after the handler's first decode
+        ["..", "..", "other@example.com", "other-guid", "file.pdf"], // another uploader
+        ["x", "%2e%2e", "%2e%2e", "%2e%2e"],
+        [".."], // the folder's parent
+        ["."], // the folder itself
+      ]) {
+        const result = await BookData.getContentUrl({
+          bucket: "upload",
+          bookid: "validBookId",
+          pathSegments,
+        });
+        assertEquals(result, null, `should refuse ${JSON.stringify(pathSegments)}`);
+      }
+    } finally {
+      BloomParseServer.prototype.getBookByDatabaseId = originalMethod;
+    }
+  },
+});
+
+Deno.test({
+  name: "BookData - getContentUrl still allows dots inside a book's own folder",
+  fn: async () => {
+    const originalMethod = BloomParseServer.prototype.getBookByDatabaseId;
+    BloomParseServer.prototype.getBookByDatabaseId = () =>
+      createMockBook(
+        "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/"
+      );
+    try {
+      // ".." that stays inside the folder, and names that merely contain dots
+      for (const [pathSegments, expectedEnd] of [
+        [["audio", "..", "test.pdf"], "/Book+Title/audio/../test.pdf"],
+        [["my..book.pdf"], "/Book+Title/my..book.pdf"],
+        [["...", "x.mp3"], "/Book+Title/.../x.mp3"],
+      ] as [string[], string][]) {
+        const result = await BookData.getContentUrl({
+          bucket: "upload",
+          bookid: "validBookId",
+          pathSegments,
+        });
+        assertExists(result, `should allow ${JSON.stringify(pathSegments)}`);
+        assert(result!.endsWith(expectedEnd), `${result} should end ${expectedEnd}`);
+      }
+    } finally {
+      BloomParseServer.prototype.getBookByDatabaseId = originalMethod;
+    }
+  },
+});

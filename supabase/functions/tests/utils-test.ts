@@ -8,6 +8,7 @@ import {
   getNumberFromQuery,
   getBooleanFromQueryAsOneOrZero,
   isAllowedCorsOrigin,
+  secretsMatch,
 } from "../_shared/utils.ts";
 
 // Test setDefaultEnvironment and getEnvironment
@@ -194,5 +195,26 @@ Deno.test({
     assertEquals(getBooleanFromQueryAsOneOrZero(params, "deleted"), 0);
     assertEquals(getNumberFromQuery(params, "missing"), undefined);
     assertEquals(getBooleanFromQueryAsOneOrZero(params, "missing"), undefined);
+  },
+});
+
+Deno.test({
+  name: "secretsMatch - matches only the exact expected secret",
+  fn: async () => {
+    assertEquals(await secretsMatch("s3cret", "s3cret"), true);
+    assertEquals(await secretsMatch("s3cret", "s3cre"), false);
+    assertEquals(await secretsMatch("s3cre", "s3cret"), false);
+    assertEquals(await secretsMatch("S3CRET", "s3cret"), false);
+  },
+});
+
+Deno.test({
+  name: "secretsMatch - a missing or empty value never matches",
+  fn: async () => {
+    assertEquals(await secretsMatch(null, "s3cret"), false);
+    assertEquals(await secretsMatch("", "s3cret"), false);
+    assertEquals(await secretsMatch("s3cret", undefined), false);
+    assertEquals(await secretsMatch("", ""), false);
+    assertEquals(await secretsMatch(null, undefined), false);
   },
 });

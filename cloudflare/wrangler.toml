@@ -17,6 +17,10 @@ routes = [
 [vars]
 # Hostname of the PRODUCTION Supabase project's edge-functions endpoint.
 SUPABASE_FUNCTIONS_HOST = "sekpsuviwfhzzznzrdgx.supabase.co"
+# BLOOM_WORKER_SECRET is deliberately NOT here: it is an encrypted worker
+# secret (`npx wrangler secret put BLOOM_WORKER_SECRET`, plus `--env staging`
+# for staging), the same value on staging and production, matching the
+# Supabase projects' BLOOM_WORKER_SECRET. See README.md, "The worker secret".
 # ORIGIN_HOST deliberately NOT set in production: non-migrated paths fall
 # through to the zone's existing origin config for api.bloomlibrary.org
 # (the Azure Functions app), exactly as today.

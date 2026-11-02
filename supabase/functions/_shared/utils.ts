@@ -125,3 +125,29 @@ export function checkForRequiredEnvVars(envVars: string[]): void {
     throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
   }
 }
+
+// Compares a secret a caller supplied against the expected one in constant
+// time, so response timing can't reveal how much of a guess was right. Both
+// are hashed first so the comparison doesn't depend on their lengths either.
+// A missing or empty value never matches.
+export async function secretsMatch(
+  provided: string | null,
+  expected: string | undefined
+): Promise<boolean> {
+  if (!provided || !expected) {
+    return false;
+  }
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all(
+    [provided, expected].map(async (value) =>
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", encoder.encode(value))
+      )
+    )
+  );
+  let difference = 0;
+  for (let i = 0; i < a.length; i++) {
+    difference |= a[i] ^ b[i];
+  }
+  return difference === 0;
+}
