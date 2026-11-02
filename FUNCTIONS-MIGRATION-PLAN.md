@@ -6,7 +6,8 @@ Node/TypeScript) to this repo (Supabase Edge Functions, Deno/TypeScript).
 
 Status as of July 2026: **`fs` is migrated** (this repo's first function) and serving production
 traffic through the proxying Cloudflare Worker (Phase 0.5, deployed 2026-07-10). Everything
-else still runs on Azure.
+else still runs on Azure. Since October 2026 the `fs` function only redirects to S3 and the
+worker carries the file bytes, to stay within the Supabase egress quota (see Phase 0).
 
 ---
 
@@ -145,6 +146,20 @@ to `api-spec.yml` when built.
 ### Phase 0 — `fs` ✅ done
 Serving production. Remaining follow-ups: document the Cloudflare rule (Appendix A), and confirm
 Azure `fs` traffic has actually dropped to zero before deleting the Azure function.
+
+**Egress fix (October 2026):** we exceeded the Supabase egress quota because Edge Function
+response bytes count as uncached Supabase egress, and `fs` streamed every file (thumbnails,
+`.bloompub`, PDFs, audio) from S3 through the function. Now the function only does the Parse
+lookup and answers with a 302 to the S3 URL; the worker follows that redirect server-side and
+streams the file from S3 to the client, so Cloudflare (no egress fees) carries the bytes and
+clients still see only `api.bloomlibrary.org`. The response shaping (header whitelist,
+304/404 mapping, `x-amz-*` stripping, thumbnail caching) moved into the worker with it. The
+function only answers requests carrying the worker's `BLOOM_WORKER_SECRET` header, since its
+302 reveals S3 addresses (which can contain uploader emails). The worker, its secret and the
+function must be deployed together, worker first — see
+[`cloudflare/README.md`](cloudflare/README.md#fs-the-worker-carries-the-file-bodies).
+**For later phases:** a function that returns large bodies should hand the bytes to the worker
+the same way rather than stream them itself.
 
 ### Phase 0.5 — Replace the 302 redirects with a proxying Worker ✅ done
 Stand up the Cloudflare Worker described in §2a in two stages: first replace the **staging**
@@ -484,7 +499,7 @@ replaced the 302 Redirect Rules (Phase 0.5).
 
 | Hostname / path | Mechanism | Destination | Notes |
 | --- | --- | --- | --- |
-| `api.bloomlibrary.org/v1/*` | Worker `bloom-api-router` — server-side **proxy** | `fs` → `sekpsuviwfhzzznzrdgx.supabase.co` (prod Supabase); everything else falls through to the zone origin (Azure) | path rewritten `/v1/<fn>` → `/functions/v1/<fn>` in [`cloudflare/worker.js`](cloudflare/worker.js) |
+| `api.bloomlibrary.org/v1/*` | Worker `bloom-api-router` — server-side **proxy** | `fs` → `sekpsuviwfhzzznzrdgx.supabase.co` (prod Supabase); everything else falls through to the zone origin (Azure) | path rewritten `/v1/<fn>` → `/functions/v1/<fn>` in [`cloudflare/worker.js`](cloudflare/worker.js); for `fs` the worker follows the function's 302 and streams the file from S3 itself |
 | `staging-api.bloomlibrary.org/v1/*` | Worker `bloom-api-router-staging` — **proxy** | `fs` → `mwatyhkxsprxgnkcbalq.supabase.co` (staging Supabase); everything else → Azure via `ORIGIN_HOST` | same script as production |
 | *(disabled)* Redirect Rules `supabase edge functions` / `... - staging` | **302** on `/v1/fs/*` | prod / staging Supabase | disabled 2026-07-10; kept in the dashboard for instant rollback |
 | `api.bloomlibrary.org/*` (rest) | proxied DNS record | `bloom-functions.azurewebsites.net` (Azure Functions app) | Azure `Request-Context` header visible in responses; the Worker's fall-through relies on this record |

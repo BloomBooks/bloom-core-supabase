@@ -41,8 +41,9 @@ export default class BookData {
     if (!bookInfo || !bookInfo.baseUrl) {
       return null;
     }
-    let url = BloomParseServer.getS3LinkBase(bookInfo.baseUrl, s3Bucket);
-    
+    const bookFolder = BloomParseServer.getS3LinkBase(bookInfo.baseUrl, s3Bucket);
+    let url = bookFolder;
+
     // Append all path segments
     const pathSegments = params.pathSegments;
     for (const segment of pathSegments) {
@@ -50,8 +51,23 @@ export default class BookData {
         url = url + "/" + encodeUnicode(segment);
       }
     }
-    
-    return url;
+
+    return isInsideFolder(url, bookFolder) ? url : null;
+  }
+}
+
+// SECURITY: a segment can still be ".." once encodeUnicode has decoded it a
+// second time (a client sends "%252e%252e"), and the URL parser then resolves
+// it, walking out of the book's folder to other files in the bucket. So only
+// accept a URL that, once resolved, names something strictly inside the
+// book's folder.
+function isInsideFolder(url: string, folder: string): boolean {
+  try {
+    const folderHref = new URL(folder + "/").href;
+    const href = new URL(url).href;
+    return href.startsWith(folderHref) && href.length > folderHref.length;
+  } catch {
+    return false; // not a URL at all
   }
 }
 

@@ -19,9 +19,10 @@ pnpm dev
 pnpm test
 ```
 
-Test the fs function:
+Test the fs function (it answers with a 302 to S3; `-L` follows it; it needs the worker secret
+from your `.env.local`):
 ```bash
-curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
+curl -L -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
 ```
 
 ## 📋 Prerequisites
@@ -52,7 +53,7 @@ supabase/functions/
 ├── _shared/              # Shared utilities
 │   ├── BloomParseServer.ts
 │   └── utils.ts
-├── fs/                   # S3 proxy function (streams book files)
+├── fs/                   # resolves book files to S3 (302; the Cloudflare worker streams them)
 │   ├── index.ts
 │   ├── BookData.ts
 │   └── README.md
@@ -71,20 +72,20 @@ pnpm run deploy    # Deploy to production ("run" needed: deploy is a pnpm built-
 
 ## 🗃️ fs Function
 
-Streams book files from S3 without exposing bucket details.
+Serves book files from S3 without exposing bucket details. The function looks up the book and
+answers with a 302 to the S3 file; the Cloudflare worker in [`cloudflare/`](cloudflare/README.md)
+follows that redirect server-side and streams the file to the client, so the bytes don't count
+as Supabase egress.
 
 **URL**: `/functions/v1/fs/{bucket}/{bookid}/{path...}`
 
 **Example**:
 ```bash
-# Get thumbnail
-curl "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
+# Thumbnail: expect a 302 to s3.amazonaws.com
+curl -I -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
 
-# Download book (streams, no buffering)
-curl "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
-
-# Range request
-curl -H "Range: bytes=0-1023" "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
+# Download book (follow the redirect)
+curl -L -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
 ```
 
 See [`supabase/functions/fs/README.md`](supabase/functions/fs/README.md) for details.

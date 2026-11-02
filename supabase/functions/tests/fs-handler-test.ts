@@ -4,8 +4,9 @@ import { handleFsRequest } from "../fs/handler.ts";
 import BloomParseServer, { Book } from "../_shared/BloomParseServer.ts";
 
 // ---------------------------------------------------------------------------
-// Test helpers: stub the Parse lookup and global fetch (the S3 request) so no
-// network is touched. Every test restores the originals.
+// Test helpers: stub the Parse lookup, and replace global fetch with one that
+// fails the test, since the handler must redirect to S3, never fetch from it
+// (that is what costs Supabase egress). Every test restores the originals.
 // ---------------------------------------------------------------------------
 
 const mockBook = (baseUrl: string): Book =>
@@ -33,40 +34,47 @@ const kDefaultBaseUrl =
   "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/";
 
 // Runs `fn` with getBookByDatabaseId returning a book for "validBookId" (and
-// undefined otherwise) and with global fetch replaced by `s3Response`.
-// Captures what the handler sent to "S3" for assertions.
+// undefined otherwise).
 async function withStubs(
-  s3Response: (() => Response) | null,
-  fn: (captured: { url?: string; init?: RequestInit }) => Promise<void>,
+  fn: () => Promise<void>,
   baseUrl: string = kDefaultBaseUrl
 ) {
   const originalGetBook = BloomParseServer.prototype.getBookByDatabaseId;
   const originalFetch = globalThis.fetch;
-  const captured: { url?: string; init?: RequestInit } = {};
 
   BloomParseServer.prototype.getBookByDatabaseId = (
     objectId: string
   ): Promise<Book | undefined> =>
     Promise.resolve(objectId === "validBookId" ? mockBook(baseUrl) : undefined);
 
-  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
-    captured.url = input.toString();
-    captured.init = init;
-    if (!s3Response) {
-      throw new Error("Test made an unexpected network request: " + input);
-    }
-    return Promise.resolve(s3Response());
+  globalThis.fetch = ((input: string | URL | Request) => {
+    throw new Error("Test made an unexpected network request: " + input);
   }) as typeof fetch;
 
   try {
-    await fn(captured);
+    await fn();
   } finally {
     BloomParseServer.prototype.getBookByDatabaseId = originalGetBook;
     globalThis.fetch = originalFetch;
   }
 }
 
-const request = (path: string, init?: RequestInit) =>
+// fs only answers the routing worker, which proves itself with this secret
+// (see the "worker secret" tests below). Requests carry it unless a test says
+// otherwise.
+const kWorkerSecret = "test-worker-secret";
+Deno.env.set("BLOOM_WORKER_SECRET", kWorkerSecret);
+
+const request = (path: string, init?: RequestInit) => {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("x-bloom-worker-secret")) {
+    headers.set("x-bloom-worker-secret", kWorkerSecret);
+  }
+  return new Request(`http://localhost:54321${path}`, { ...init, headers });
+};
+
+// A request as a direct caller of the Supabase URL would send it: no secret.
+const directRequest = (path: string, init?: RequestInit) =>
   new Request(`http://localhost:54321${path}`, init);
 
 // ---------------------------------------------------------------------------
@@ -76,7 +84,7 @@ const request = (path: string, init?: RequestInit) =>
 Deno.test({
   name: "fs handler - 400 when 'fs' segment is missing",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       const response = await handleFsRequest(request("/v1/other/a/b/c"));
       assertEquals(response.status, 400);
     });
@@ -86,7 +94,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - 400 when fewer than 3 segments follow 'fs'",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       const response = await handleFsRequest(
         request("/v1/fs/upload/validBookId")
       );
@@ -98,7 +106,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - 400 for unknown bucket",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       const response = await handleFsRequest(
         request("/v1/fs/bogus-bucket/validBookId/test.pdf")
       );
@@ -110,7 +118,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - 404 for a book that does not exist",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       const response = await handleFsRequest(
         request("/v1/fs/upload/noSuchBookId/test.pdf")
       );
@@ -126,7 +134,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - 400 (not 500) for malformed percent-encoding",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       // A lone "%" makes decodeURIComponent throw URIError; the handler must
       // report a client error rather than crashing to a 500.
       const response = await handleFsRequest(
@@ -140,7 +148,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - 405 for non-GET/HEAD methods",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       for (const method of ["POST", "PUT", "DELETE"]) {
         const response = await handleFsRequest(
           request("/v1/fs/upload/validBookId/test.pdf", { method })
@@ -156,112 +164,72 @@ Deno.test({
 });
 
 // ---------------------------------------------------------------------------
-// Proxying behavior
+// Redirect to S3 (the routing worker follows it; see cloudflare/worker.js)
 // ---------------------------------------------------------------------------
 
 Deno.test({
-  name: "fs handler - proxies a 200 from S3 with its body and headers",
+  name: "fs handler - 302s to the file's S3 URL with no body",
+  fn: async () => {
+    await withStubs(async () => {
+      const response = await handleFsRequest(
+        request("/v1/fs/upload/validBookId/test.pdf")
+      );
+      assertEquals(response.status, 302);
+      assertEquals(
+        response.headers.get("location"),
+        "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/test.pdf"
+      );
+      assertEquals(response.body, null);
+    });
+  },
+});
+
+Deno.test({
+  name: "fs handler - 302s HEAD requests too",
+  fn: async () => {
+    await withStubs(async () => {
+      const response = await handleFsRequest(
+        request("/v1/fs/upload/validBookId/test.pdf", { method: "HEAD" })
+      );
+      assertEquals(response.status, 302);
+      assert(response.headers.get("location")!.endsWith("/test.pdf"));
+    });
+  },
+});
+
+Deno.test({
+  name: "fs handler - percent-encodes non-ASCII from the Parse baseUrl in Location",
   fn: async () => {
     await withStubs(
-      () =>
-        new Response("file-bytes", {
-          status: 200,
-          headers: { "content-type": "application/pdf", etag: '"abc"' },
-        }),
-      async (captured) => {
+      async () => {
         const response = await handleFsRequest(
           request("/v1/fs/upload/validBookId/test.pdf")
         );
-        assertEquals(response.status, 200);
-        assertEquals(await response.text(), "file-bytes");
-        assertEquals(response.headers.get("content-type"), "application/pdf");
-        assertEquals(response.headers.get("etag"), '"abc"');
-        assert(
-          captured.url!.includes("test.pdf"),
-          "should have requested the file from S3"
-        );
-      }
-    );
-  },
-});
-
-Deno.test({
-  name: "fs handler - passes 304 Not Modified through (not 404)",
-  fn: async () => {
-    await withStubs(
-      () => new Response(null, { status: 304, headers: { etag: '"abc"' } }),
-      async () => {
-        const response = await handleFsRequest(
-          request("/v1/fs/upload/validBookId/test.pdf", {
-            headers: { "if-none-match": '"abc"' },
-          })
-        );
+        assertEquals(response.status, 302);
+        // Raw Thai would make the Location header throw; "+" stays as is.
         assertEquals(
-          response.status,
-          304,
-          "Conditional-request revalidation must surface 304, not 404"
+          response.headers.get("location"),
+          "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/%E0%B8%AB%E0%B8%99%E0%B8%B1%E0%B8%87+Book/test.pdf"
         );
-      }
+      },
+      "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/หนัง+Book/"
     );
   },
 });
 
 Deno.test({
-  name: "fs handler - maps S3 failure statuses to 404",
+  name: "fs handler - redirects harvest paths into the harvest bucket",
   fn: async () => {
-    for (const s3Status of [403, 404]) {
-      await withStubs(
-        () => new Response("denied", { status: s3Status }),
-        async () => {
-          const response = await handleFsRequest(
-            request("/v1/fs/upload/validBookId/test.pdf")
-          );
-          assertEquals(response.status, 404);
-        }
+    await withStubs(async () => {
+      const response = await handleFsRequest(
+        request("/v1/fs/harvest/validBookId/thumbnails/thumbnail-256.png")
       );
-    }
-  },
-});
-
-Deno.test({
-  name: "fs handler - forwards whitelisted headers to S3 and drops others",
-  fn: async () => {
-    await withStubs(
-      () => new Response("ok", { status: 200 }),
-      async (captured) => {
-        await handleFsRequest(
-          request("/v1/fs/upload/validBookId/test.pdf", {
-            headers: {
-              range: "bytes=0-99",
-              "if-none-match": '"abc"',
-              authorization: "Bearer secret",
-              "x-amz-date": "20260710T000000Z",
-            },
-          })
-        );
-        const sent = new Headers(captured.init?.headers);
-        assertEquals(sent.get("range"), "bytes=0-99");
-        assertEquals(sent.get("if-none-match"), '"abc"');
-        assertEquals(sent.get("authorization"), null);
-        assertEquals(sent.get("x-amz-date"), null);
-      }
-    );
-  },
-});
-
-Deno.test({
-  name: "fs handler - forwards HEAD to S3 as HEAD",
-  fn: async () => {
-    await withStubs(
-      () => new Response(null, { status: 200 }),
-      async (captured) => {
-        const response = await handleFsRequest(
-          request("/v1/fs/upload/validBookId/test.pdf", { method: "HEAD" })
-        );
-        assertEquals(response.status, 200);
-        assertEquals(captured.init?.method, "HEAD");
-      }
-    );
+      assertEquals(response.status, 302);
+      assertEquals(
+        response.headers.get("location"),
+        "https://s3.amazonaws.com/bloomharvest/user@example.com/book-guid/thumbnails/thumbnail-256.png"
+      );
+    });
   },
 });
 
@@ -272,7 +240,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - answers OPTIONS preflight with CORS headers",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       const response = await handleFsRequest(
         request("/v1/fs/upload/validBookId/test.pdf", {
           method: "OPTIONS",
@@ -293,10 +261,9 @@ Deno.test({
 });
 
 Deno.test({
-  name: "fs handler - echoes allowed origins on success responses",
+  name: "fs handler - echoes allowed origins on redirect responses",
   fn: async () => {
     await withStubs(
-      () => new Response("ok", { status: 200 }),
       async () => {
         const response = await handleFsRequest(
           request("/v1/fs/upload/validBookId/test.pdf", {
@@ -326,7 +293,6 @@ Deno.test({
       "http://bloomlibrary.org", // https only
     ]) {
       await withStubs(
-        () => new Response("ok", { status: 200 }),
         async () => {
           const response = await handleFsRequest(
             request("/v1/fs/upload/validBookId/test.pdf", {
@@ -347,7 +313,7 @@ Deno.test({
 Deno.test({
   name: "fs handler - error responses carry CORS headers too",
   fn: async () => {
-    await withStubs(null, async () => {
+    await withStubs(async () => {
       // 404 (book not found) and 405 both need CORS headers, or the browser
       // hides the real status from the calling page.
       const notFound = await handleFsRequest(
@@ -401,102 +367,93 @@ Deno.test({
 });
 
 // ---------------------------------------------------------------------------
-// S3 header hygiene
+// Worker secret: only the routing worker may get redirects (they reveal S3
+// addresses, which can contain uploader emails)
 // ---------------------------------------------------------------------------
 
 Deno.test({
-  name: "fs handler - strips x-amz-* headers from S3 responses",
+  name: "fs handler - 401 without the worker secret, with CORS headers",
   fn: async () => {
-    await withStubs(
-      () =>
-        new Response("ok", {
-          status: 200,
-          headers: {
-            etag: '"abc"',
-            "x-amz-request-id": "REQUESTID123",
-            "x-amz-id-2": "OPAQUEID456",
-          },
-        }),
-      async () => {
+    await withStubs(async () => {
+      const response = await handleFsRequest(
+        directRequest("/v1/fs/upload/validBookId/test.pdf", {
+          headers: { origin: "https://bloomlibrary.org" },
+        })
+      );
+      assertEquals(response.status, 401);
+      assertEquals(response.headers.get("location"), null);
+      assertEquals(
+        response.headers.get("access-control-allow-origin"),
+        "https://bloomlibrary.org"
+      );
+    });
+  },
+});
+
+Deno.test({
+  name: "fs handler - 401 with a wrong worker secret",
+  fn: async () => {
+    await withStubs(async () => {
+      for (const secret of ["wrong", kWorkerSecret + "x", ""]) {
+        const response = await handleFsRequest(
+          request("/v1/fs/upload/validBookId/test.pdf", {
+            headers: { "x-bloom-worker-secret": secret },
+          })
+        );
+        assertEquals(response.status, 401, `secret "${secret}"`);
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "fs handler - refuses everyone when the secret isn't configured",
+  fn: async () => {
+    Deno.env.delete("BLOOM_WORKER_SECRET");
+    try {
+      await withStubs(async () => {
         const response = await handleFsRequest(
           request("/v1/fs/upload/validBookId/test.pdf")
         );
-        assertEquals(response.headers.get("etag"), '"abc"');
-        assertEquals(response.headers.get("x-amz-request-id"), null);
-        assertEquals(response.headers.get("x-amz-id-2"), null);
-      }
-    );
+        assertEquals(response.status, 401);
+      });
+    } finally {
+      Deno.env.set("BLOOM_WORKER_SECRET", kWorkerSecret);
+    }
+  },
+});
+
+Deno.test({
+  name: "fs handler - answers OPTIONS preflights without the worker secret",
+  fn: async () => {
+    await withStubs(async () => {
+      const response = await handleFsRequest(
+        directRequest("/v1/fs/upload/validBookId/test.pdf", {
+          method: "OPTIONS",
+          headers: { origin: "https://bloomlibrary.org" },
+        })
+      );
+      assertEquals(response.status, 204);
+    });
   },
 });
 
 // ---------------------------------------------------------------------------
-// Harvest thumbnail caching rule
+// Path traversal: a double-encoded ".." must not redirect outside the book
 // ---------------------------------------------------------------------------
 
 Deno.test({
-  name: "fs handler - harvest thumbnails get a valid one-year Cache-Control",
+  name: "fs handler - 404, not a redirect, for double-encoded .. segments",
   fn: async () => {
-    await withStubs(
-      () =>
-        new Response("png-bytes", {
-          status: 200,
-          headers: { "cache-control": "no-cache" },
-        }),
-      async () => {
-        const response = await handleFsRequest(
-          request("/v1/fs/harvest/validBookId/thumbnails/thumbnail-256.png")
-        );
-        assertEquals(response.status, 200);
-        // "max-age=31536000" is HTTP syntax; "max-age:31536000" (a former bug)
-        // is an invalid directive that browsers ignore.
-        assertEquals(
-          response.headers.get("cache-control"),
-          "max-age=31536000"
-        );
+    await withStubs(async () => {
+      for (const path of [
+        "/v1/fs/upload/validBookId/%252e%252e/%252e%252e/", // the top of the bucket
+        "/v1/fs/upload/validBookId/x/%252e%252e/%252e%252e/%252e%252e/other/file.pdf",
+      ]) {
+        const response = await handleFsRequest(request(path));
+        assertEquals(response.status, 404, path);
+        assertEquals(response.headers.get("location"), null, path);
       }
-    );
-  },
-});
-
-Deno.test({
-  name: "fs handler - dev-harvest thumbnails get the same caching rule",
-  fn: async () => {
-    await withStubs(
-      () =>
-        new Response("png-bytes", {
-          status: 200,
-          headers: { "cache-control": "no-cache" },
-        }),
-      async () => {
-        const response = await handleFsRequest(
-          request("/v1/fs/dev-harvest/validBookId/thumbnails/thumbnail-256.png")
-        );
-        assertEquals(
-          response.headers.get("cache-control"),
-          "max-age=31536000"
-        );
-      },
-      // dev-harvest resolves against the sandbox bucket
-      "https://s3.amazonaws.com/BloomLibraryBooks-Sandbox/user@example.com/book-guid/Book+Title/"
-    );
-  },
-});
-
-Deno.test({
-  name: "fs handler - non-thumbnail harvest files keep S3's Cache-Control",
-  fn: async () => {
-    await withStubs(
-      () =>
-        new Response("bytes", {
-          status: 200,
-          headers: { "cache-control": "no-cache" },
-        }),
-      async () => {
-        const response = await handleFsRequest(
-          request("/v1/fs/harvest/validBookId/book.bloomd")
-        );
-        assertEquals(response.headers.get("cache-control"), "no-cache");
-      }
-    );
+    });
   },
 });
