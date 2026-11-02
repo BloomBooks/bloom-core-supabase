@@ -50,6 +50,22 @@ export function getBooleanFromQueryAsOneOrZero(
   }
 }
 
+// Query-string values always arrive as strings, so a param typed as a boolean
+// (e.g. opds `epub`, `minimalnavlinks`) needs its text interpreted: the literal
+// strings "false", "0", "no", and "" mean false; any other present value means
+// true. Without this, `epub=false` would be a truthy non-empty string and turn
+// the option ON. Returns undefined when the param is absent so callers can leave
+// it unset rather than injecting a default.
+export function parseBooleanQueryParam(
+  value: string | null | undefined
+): boolean | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  const v = value.trim().toLowerCase();
+  return !(v === "" || v === "false" || v === "0" || v === "no");
+}
+
 // Browsers on https://bloomlibrary.org or any https subdomain of it may call
 // our APIs. (The Azure Functions host CORS config enumerated the subdomains
 // individually; since they are all ours and new ones appear over time, we
