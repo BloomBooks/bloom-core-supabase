@@ -330,6 +330,20 @@ deno_version = 2
 BLOOM_PARSE_APP_ID_PROD = "env(BLOOM_PARSE_APP_ID_PROD)"
 BLOOM_PARSE_APP_ID_DEV = "env(BLOOM_PARSE_APP_ID_DEV)"
 BLOOM_PARSE_APP_ID_UNIT_TEST = "env(BLOOM_PARSE_APP_ID_UNIT_TEST)"
+# fs function: shared with the Cloudflare routing worker, which sends it in
+# x-bloom-worker-secret; fs refuses requests without it
+BLOOM_WORKER_SECRET = "env(BLOOM_WORKER_SECRET)"
+# subscriptionInfo function (Google Sheets service account)
+BLOOM_GOOGLE_SERVICE_ACCOUNT_EMAIL = "env(BLOOM_GOOGLE_SERVICE_ACCOUNT_EMAIL)"
+BLOOM_GOOGLE_SERVICE_PRIVATE_KEY = "env(BLOOM_GOOGLE_SERVICE_PRIVATE_KEY)"
+BLOOM_SUBSCRIPTION_SPREADSHEET_ID = "env(BLOOM_SUBSCRIPTION_SPREADSHEET_ID)"
+# contentfulToCrowdin function (values from Azure; names standardized — mapping in MIGRATION-PLAN.md)
+BLOOM_CONTENTFUL_READ_ONLY_TOKEN = "env(BLOOM_CONTENTFUL_READ_ONLY_TOKEN)"
+BLOOM_CROWDIN_API_TOKEN = "env(BLOOM_CROWDIN_API_TOKEN)"
+# Opt-in to real Crowdin uploads; set to "true" only on production (leave unset
+# locally and on staging, where the function stays a dry run).
+BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD = "env(BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD)"
+BLOOM_CRON_SECRET = "env(BLOOM_CRON_SECRET)"
 
 [analytics]
 enabled = true
@@ -352,4 +366,14 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 # The fs function doesn't require a JWT token for access
 [functions.fs]
+verify_jwt = false
+
+[functions.social]
+verify_jwt = false
+
+[functions.subscriptionInfo]
+verify_jwt = false
+
+# Not a public API: requires the x-bloom-cron-secret header (see the function).
+[functions.contentfulToCrowdin]
 verify_jwt = false

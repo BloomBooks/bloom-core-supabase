@@ -87,9 +87,67 @@ export function getCorsHeaders(request: Request): Record<string, string> {
   return headers;
 }
 
+// Hostnames we are willing to present as our own public URL (see getPublicUrl).
+function isAllowedPublicHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "bloomlibrary.org" || host.endsWith(".bloomlibrary.org");
+}
+
+// Recovers the original public URL a client used, for links we generate (og:url, OPDS links,
+// etc.). Requests reach the function bearing the internal Supabase URL because the routing
+// worker rewrites the host; the worker passes the real public URL alongside, which we prefer
+// here so those links don't leak the *.supabase.co project URL. Details inline below.
+export function getPublicUrl(request: Request): URL {
+  // The routing worker forwards the original public request URL in this custom
+  // header. A non-standard name is used (not X-Forwarded-*) because Supabase's
+  // edge strips proxy-managed forwarding headers before the function sees them
+  // (verified on staging; see FUNCTIONS-MIGRATION-PLAN.md). Only bloomlibrary.org
+  // hosts are honored, so a caller that sets the header itself cannot spoof an
+  // arbitrary domain into the URLs we generate; if it is absent or untrusted we
+  // fall back to the request's own URL.
+  const publicUrl = request.headers.get("x-bloom-public-url");
+  if (publicUrl) {
+    try {
+      const parsed = new URL(publicUrl);
+      if (isAllowedPublicHost(parsed.hostname)) {
+        return parsed;
+      }
+    } catch {
+      // malformed header; fall through to the request URL
+    }
+  }
+  return new URL(request.url);
+}
+
 export function checkForRequiredEnvVars(envVars: string[]): void {
   const missing = envVars.filter((envVar) => !Deno.env.get(envVar));
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
   }
+}
+
+// Compares a secret a caller supplied against the expected one in constant
+// time, so response timing can't reveal how much of a guess was right. Both
+// are hashed first so the comparison doesn't depend on their lengths either.
+// A missing or empty value never matches.
+export async function secretsMatch(
+  provided: string | null,
+  expected: string | undefined
+): Promise<boolean> {
+  if (!provided || !expected) {
+    return false;
+  }
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all(
+    [provided, expected].map(async (value) =>
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", encoder.encode(value))
+      )
+    )
+  );
+  let difference = 0;
+  for (let i = 0; i < a.length; i++) {
+    difference |= a[i] ^ b[i];
+  }
+  return difference === 0;
 }

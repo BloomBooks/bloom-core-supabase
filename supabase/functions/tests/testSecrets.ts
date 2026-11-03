@@ -1,10 +1,10 @@
 // Helper for tests that need real credentials (the live tests ported from Azure).
 //
-// Default behavior (`yarn test`): a test whose secrets are absent FAILS with a
+// Default behavior (`pnpm test`): a test whose secrets are absent FAILS with a
 // message naming the missing ones, so misconfiguration is loud.
 //
-// With `--secrets-optional` (passed after `--` by `yarn test:secrets-optional`
-// and `yarn test:ci`): such tests are skipped instead, so the suite can run
+// With `--secrets-optional` (passed after `--` by `pnpm test:secrets-optional`
+// and `pnpm test:ci`): such tests are skipped instead, so the suite can run
 // with whatever credentials the environment happens to have.
 
 const secretsOptional = Deno.args.includes("--secrets-optional");
@@ -36,7 +36,7 @@ export function testRequiringSecrets(options: {
       throw new Error(
         `Missing secrets required by this test: ${missing.join(", ")}.\n` +
           `Add them to .env.local (see .env.example for the full list), ` +
-          `or run "yarn test:secrets-optional" to skip tests that need secrets.`
+          `or run "pnpm test:secrets-optional" to skip tests that need secrets.`
       );
     });
   }

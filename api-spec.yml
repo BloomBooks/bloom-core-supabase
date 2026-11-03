@@ -1,0 +1,740 @@
+openapi: 3.0.3
+info:
+  title: BloomLibrary API
+  version: "1.0"
+servers:
+  - url: https://api.bloomlibrary.org/v1
+  - url: https://staging-api.bloomlibrary.org/v1
+    description: staging (points at the staging Supabase project)
+components:
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    HeaderAuthToken:
+      name: Authentication-Token
+      in: header
+      required: true
+      schema:
+        type: string
+    Lang:
+      description: comma-separated list of BCP 47 language tags
+      name: lang
+      in: query
+      required: false
+      schema:
+        type: string
+    Uploader:
+      description: comma-separated list of email addresses
+      name: uploader
+      in: query
+      required: false
+      schema:
+        type: string
+    Environment:
+      description: which backing data environment to use (defaults to prod)
+      name: env
+      in: query
+      required: false
+      schema:
+        type: string
+        enum:
+          - dev
+          - prod
+          - unit-test
+    Limit:
+      name: limit
+      in: query
+      description: Number of items to retrieve (unlimited if omitted)
+      required: false
+      schema:
+        type: integer
+        minimum: 0 # set to 0, for example, if you only want the count
+    Offset:
+      name: offset
+      in: query
+      description: Number of items to skip
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+    Count:
+      name: count
+      in: query
+      description: If true, the result will also contain the count of items
+      required: false
+      schema:
+        type: boolean
+    Expand:
+      name: expand
+      in: query
+      description: A comma-separated list of fields for which to include the full record
+      required: false
+      schema:
+        type: string
+
+  schemas:
+    Book:
+      type: object
+      properties:
+        id:
+          type: string
+        languages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Language"
+        titles:
+          type: array
+          items:
+            type: object
+            properties:
+              lang:
+                type: string
+              title:
+                type: string
+            required: [lang, title]
+        uploader:
+          type: object
+          properties:
+            email:
+              type: string
+            id:
+              type: string
+          required: [email]
+
+        # editor uses these, but we don't necessarily want them as part of the public shape
+        instanceId:
+          type: string
+          format: uuid
+        titleFromUpload:
+          type: string
+        baseUrl:
+          type: string
+          format: uri
+        updatedAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        draft:
+          type: boolean
+          nullable: true
+        harvestState:
+          type: string
+        brandingProjectName:
+          type: string
+        inCirculation:
+          type: boolean
+          nullable: true
+        phashOfFirstContentImage:
+          type: string
+        bookLineage:
+          type: string
+        lastUploaded:
+          type: string
+          format: date-time
+        tags:
+          type: array
+          items:
+            type: string
+        summary:
+          type: string
+          nullable: true
+        features:
+          type: array
+          items:
+            type: string
+        # links:
+        #   type: string
+        #   format: uri
+      required: [id]
+      example:
+        id: 123
+        languages: [{ "tag": "en" }, { "tag": "fr" }]
+        titles:
+          - lang: en
+            title: Moon & Cap
+          - lang: fr
+            title: La lune et le Cap
+        uploader:
+          email: bob@example.com
+        # links: https://api.bloomlibrary.org/books/123/links
+
+    Language:
+      type: object
+      properties:
+        id:
+          description: Unique ID for the language record. Unfortunately, tag is not unique.
+          type: string
+        tag:
+          description: BCP 47 language tag
+          type: string
+        name:
+          type: string
+        englishName:
+          type: string
+        usageCount:
+          type: integer
+      required: [tag]
+
+    LongRunningOperationCommonResult:
+      type: object
+      properties:
+        id: # the operation ID; used to query for status
+          type: string
+        status:
+          type: string
+          enum:
+            - Succeeded
+            - Running
+            - Failed
+            - NotStarted
+    LongRunningOperationSucceededResult:
+      allOf:
+        - $ref: "#/components/schemas/LongRunningOperationCommonResult"
+        - type: object
+          properties:
+            result:
+              oneOf:
+                - $ref: "#/components/schemas/UploadStartResult"
+                - $ref: "#/components/schemas/UploadFinishResult"
+    LongRunningOperationFailedResult:
+      allOf:
+        - $ref: "#/components/schemas/LongRunningOperationCommonResult"
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code:
+                  type: string
+                message:
+                  type: string
+    LongRunningOperationOtherResult:
+      $ref: "#/components/schemas/LongRunningOperationCommonResult"
+
+    UploadStartResult:
+      type: object
+      properties:
+        transactionId:
+          type: string
+        credentials:
+          type: object
+          properties:
+            AccessKeyId:
+              type: string
+            SecretAccessKey:
+              type: string
+            SessionToken:
+              type: string
+        url:
+          type: string
+          format: uri
+        filesToUpload:
+          type: array
+          items:
+            type: string
+    UploadFinishResult:
+      type: object
+
+    SubscriptionResult:
+      type: object
+      properties:
+        code:
+          type: string
+          description: The subscription code
+        replacementCode:
+          type: string
+          description: A replacement code if applicable
+        tier:
+          type: string
+          description: The subscription tier
+        brandingLabel:
+          type: string
+          description: Label for branding purposes
+        showMessage:
+          type: string
+          description: Message to display to the user
+      required: [code, replacementCode, tier, brandingLabel, showMessage]
+
+  responses:
+    BookArray:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              results:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Book"
+              count:
+                type: integer
+    AcceptedWithOperationLocation:
+      description: Accepted
+      headers:
+        Operation-Location:
+          description: URL to check the status of the operation
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/LongRunningOperationCommonResult"
+
+paths:
+  /books:
+    get: # 5.7 editor uses to get book count in language: /books?lang=xyz&limit=0&count=true
+      description: returns an array of books with metadata (and links?)
+      parameters:
+        - $ref: "#/components/parameters/Lang"
+        - $ref: "#/components/parameters/Uploader"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Count"
+        - $ref: "#/components/parameters/Expand"
+        - $ref: "#/components/parameters/Environment"
+      responses:
+        200:
+          $ref: "#/components/responses/BookArray"
+
+    # When we get a POST rather than a GET,
+    #  it indicates we must look in the body for
+    #  which books to return.
+    #  Reasoning: the url has a length limit which we avoid by using the body.
+    # Currently, we need this for bookInstanceIds.
+    post: # 5.7 editor uses to get blorg badge statuses
+      description: returns an array of books with metadata
+      parameters:
+        - $ref: "#/components/parameters/Lang"
+        - $ref: "#/components/parameters/Uploader"
+        - $ref: "#/components/parameters/Environment"
+      requestBody:
+        description: array of book instance IDs
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                instanceIds:
+                  description: A book "instance ID" is a guid found in meta.json; it was designed to be unique but we couldn't keep people from copying using file explorer, so it is not actually unique. It serves as a unique identifier for a book in a particular collection within the editor. In contrast, the "book ID" is the database ID and it is unique.
+                  type: array
+                  items:
+                    type: string
+      responses:
+        200:
+          $ref: "#/components/responses/BookArray"
+  /books/{id}: # needed by 5.7 editor conflict dialog and SP App team
+    get:
+      description: Get metadata for a specific book
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - $ref: "#/components/parameters/Expand"
+        - $ref: "#/components/parameters/Environment"
+
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Book"
+        404:
+          description: Not Found - no book with that ID
+    delete: # needed for next round of blorg changes
+      description: Delete a book
+      parameters:
+        - $ref: "#/components/parameters/HeaderAuthToken"
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        204:
+          description: No Content
+
+  # Gets its own endpoint because it is expensive.
+  #  i.e. we don't want to just return it with each book record.
+  # Some day, we may have a /books:permissions for collection-level permissions.
+  #  But in Feb 2024, I could not figure out how to define the route in functions.json
+  #   to achieve that along with handling /books /books/{id}.
+  #   To do this, we may have to define a new function with /books{collection-action}.
+  /books/{id}:permissions: # needed for next round of changes
+    get:
+      description: returns whether the user may edit the book
+      parameters:
+        - $ref: "#/components/parameters/HeaderAuthToken"
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reupload:
+                    type: boolean
+                  delete:
+                    type: boolean
+                  editSurfaceMetadata:
+                    type: boolean
+                  editAllMetadata:
+                    type: boolean
+                  becomeUploader:
+                    type: boolean
+
+  /books/{id}:upload-start: # 5.7 editor uses
+    post:
+      description: Initiate upload or reupload of a book. id is "new" if creating a new book. Otherwise, it is the existing book ID.
+      parameters:
+        - $ref: "#/components/parameters/HeaderAuthToken"
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                files:
+                  description: Array of relative file paths and their corresponding hashes
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      path:
+                        type: string
+                      hash:
+                        type: string
+                name:
+                  description: Any file-system-safe name. Bloom editor uses the folder name. This may become part of the S3 key (and currently does).
+                  type: string
+                clientName:
+                  description: Name of the client. For Bloom editor, this includes the channel. This may be used to disallow certain channels from uploading, etc.
+                  type: string
+                clientVersion:
+                  description: Version of the client. This may be used to disallow certain versions from uploading, etc.
+                  type: string
+              required:
+                - files
+                - clientName
+                - clientVersion
+      responses:
+        202:
+          $ref: "#/components/responses/AcceptedWithOperationLocation"
+
+  /books/{id}:upload-finish: # 5.7 editor uses
+    post:
+      description: Finalize uploading a book
+      parameters:
+        - $ref: "#/components/parameters/HeaderAuthToken"
+        - $ref: "#/components/parameters/PathId"
+      requestBody:
+        description: The transaction ID
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                transactionId:
+                  type: string
+                metadata:
+                  type: object
+                becomeUploader:
+                  description: If true, the book record will be updated to show that the user is now the uploader.
+                  type: boolean
+              required:
+                - transactionId
+                - metadata
+      responses:
+        202:
+          $ref: "#/components/responses/AcceptedWithOperationLocation"
+
+  # status is used for long-running operations to check their progress.
+  #  When the job is complete, it returns status:Succeeded and the actual result.
+  /status/{operation-id}: # 5.7 editor uses
+    get:
+      description: returns the status (and result if complete) of a long-running operation
+      parameters:
+        - name: operation-id
+          in: path
+          description: The operation ID
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: OK
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/LongRunningOperationSucceededResult"
+                  - $ref: "#/components/schemas/LongRunningOperationFailedResult"
+                  - $ref: "#/components/schemas/LongRunningOperationOtherResult"
+                discriminator:
+                  propertyName: status
+                  mapping:
+                    Succeeded: "#/components/schemas/LongRunningOperationSucceededResult"
+                    Failed: "#/components/schemas/LongRunningOperationFailedResult"
+                    Running: "#/components/schemas/LongRunningOperationOtherResult"
+                    NotStarted: "#/components/schemas/LongRunningOperationOtherResult"
+
+  /subscriptionInfo/{code}:
+    get:
+      description: Get subscription information for a given code
+      parameters:
+        - name: code
+          in: path
+          description: The subscription code to look up
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResult"
+        404:
+          description: Not Found - No subscription found for the given code
+
+  # ---------------------------------------------------------------------------
+  # The endpoints below predate this spec (they were undocumented in the Azure
+  # repo) and were added when the API migrated to Supabase Edge Functions.
+
+  # Note: {filePath} may contain slashes (e.g. thumbnails/thumbnail-256.png);
+  # OpenAPI has no syntax for multi-segment path parameters.
+  /fs/{bucket}/{id}/{filePath}:
+    get:
+      description:
+        Streams a file belonging to a book (thumbnail, epub, bloompub, pdf, ...)
+        without exposing where it is stored. Supports Range and conditional
+        request headers. Responses for harvest thumbnails are served with a
+        one-year Cache-Control.
+      parameters:
+        - name: bucket
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [upload, dev-upload, harvest, dev-harvest]
+        - $ref: "#/components/parameters/PathId"
+        - name: filePath
+          in: path
+          description: path of the file within the book folder; may contain slashes
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: OK - the file contents
+          content:
+            "*/*":
+              schema:
+                type: string
+                format: binary
+        206:
+          description: Partial Content (Range request)
+        400:
+          description: Bad Request - unknown bucket, unknown book, or too few path segments
+        404:
+          description: Not Found - the file does not exist
+
+  /opds:
+    get:
+      description:
+        Returns an OPDS 1.2 catalog (Atom XML) of Bloom Library books, navigable
+        by language. Without lang/tag/organizeby parameters, returns the root
+        navigation document.
+      parameters:
+        - name: key
+          in: query
+          description:
+            "API account key of the form email:accountId. Currently optional
+            (anonymous access is deprecated and will be removed)."
+          required: false
+          schema:
+            type: string
+        - name: lang
+          in: query
+          description: BCP 47 language tag; list only books in this language
+          required: false
+          schema:
+            type: string
+        - name: tag
+          in: query
+          description: list only books with this tag (e.g. list:SEL)
+          required: false
+          schema:
+            type: string
+        - name: epub
+          in: query
+          description: if true, only include books with a downloadable ePUB
+          required: false
+          schema:
+            type: boolean
+        - name: organizeby
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [language]
+        - name: minimalnavlinks
+          in: query
+          description: if true, omit self/start/up links and the language facet list
+          required: false
+          schema:
+            type: boolean
+        - name: src
+          in: query
+          description: which backing data environment to use (defaults to prod)
+          required: false
+          schema:
+            type: string
+            enum: [dev, prod]
+      responses:
+        200:
+          description: OK
+          content:
+            application/xml: {}
+        401:
+          description: Unauthorized - missing/empty key
+        403:
+          description: Forbidden - key did not match an API account
+        503:
+          description: Service Unavailable - could not validate the key
+
+  /social:
+    get:
+      description:
+        Returns an HTML page with OpenGraph metadata so social media sites show
+        a proper preview when sharing a Bloom Library link; the page redirects
+        real visitors to the link. Parameters may also be sent as a POST JSON
+        body with the same names.
+      parameters:
+        - name: link
+          in: query
+          description: the bloomlibrary.org URL to share (other domains are rejected)
+          required: true
+          schema:
+            type: string
+            format: uri
+        - name: title
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: img
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uri
+        - name: width
+          in: query
+          description: og:image:width (default 256)
+          required: false
+          schema:
+            type: integer
+        - name: height
+          in: query
+          description: og:image:height (default 256)
+          required: false
+          schema:
+            type: integer
+        - name: description
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: OK
+          content:
+            text/html: {}
+        400:
+          description: Bad Request - missing link or title
+        403:
+          description: Forbidden - link is not on bloomlibrary.org
+
+  /stats/{category}/{rowType}:
+    post:
+      description:
+        Returns reading/usage statistics from the analytics database. The set of
+        books can be scoped either by the filter's own fields or by an embedded
+        Parse query (parseDBQuery) whose results are used to select books.
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [reading]
+        - name: rowType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [book, per-book, per-day, overview, locations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: object
+                  properties:
+                    parseDBQuery:
+                      description:
+                        A Parse REST query (url, method, options with
+                        headers/params/data) whose resulting book IDs scope the
+                        statistics.
+                      type: object
+                    branding:
+                      type: string
+                    country:
+                      type: string
+                    fromDate:
+                      description: YYYY-MM-DD
+                      type: string
+                    toDate:
+                      description: YYYY-MM-DD
+                      type: string
+                    bookId:
+                      description: used by rowType "book"
+                      type: string
+                    bookInstanceId:
+                      description: used by rowType "book"
+                      type: string
+              required: [filter]
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: array
+                    items:
+                      type: object
+        400:
+          description:
+            Bad Request - missing filter, invalid dates, or unknown
+            category/rowType (also returned for internal errors, matching
+            longstanding behavior)

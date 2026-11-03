@@ -1,0 +1,49 @@
+# Endpoints we intend to implement but have NOT — nothing in this file is served.
+# The contract for the live API is api-spec.yml; when an endpoint here gets
+# implemented, move its definition there.
+openapi: 3.0.3
+info:
+  title: BloomLibrary API (planned endpoints)
+  version: "1.0"
+servers:
+  - url: https://api.bloomlibrary.org/v1
+components:
+  parameters:
+    PathTag:
+      name: tag
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    # Same shape as Language in api-spec.yml.
+    Language:
+      type: object
+      properties:
+        id:
+          description: Unique ID for the language record. Unfortunately, tag is not unique.
+          type: string
+        tag:
+          description: BCP 47 language tag
+          type: string
+        name:
+          type: string
+        englishName:
+          type: string
+        usageCount:
+          type: integer
+      required: [tag]
+paths:
+  # not needed yet (since we have the expanded form from /books)
+  /languages/{tag}:
+    get:
+      description: returns the language name
+      parameters:
+        - $ref: "#/components/parameters/PathTag"
+      responses:
+        200:
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Language"

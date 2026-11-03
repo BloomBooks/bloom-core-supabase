@@ -1,8 +1,10 @@
 import BookData, { ContentUrlParams, isValidBucket } from "./BookData.ts";
-import { getCorsHeaders } from "../_shared/utils.ts";
+import { getCorsHeaders, secretsMatch } from "../_shared/utils.ts";
 
-// Handles a request for a file in a book on S3 without the caller knowing
-// [it is on s3, who the uploader is, etc].
+// Resolves a request for a file in a book to its S3 URL without the caller
+// knowing [it is on s3, who the uploader is, etc], and answers with a 302 to
+// that URL. Normally the caller is the routing worker, which follows the
+// redirect itself; see the comment at the end of handleFsRequest.
 // Example use: https://api.bloomlibrary.org/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png
 //
 // Exported separately from index.ts (which just wires this to Deno.serve) so
@@ -30,6 +32,23 @@ export async function handleFsRequest(req: Request): Promise<Response> {
         ...((init.headers as Record<string, string>) ?? {}),
       },
     });
+
+  // Only the routing worker may use fs: our 302s reveal S3 addresses, which
+  // can contain uploader emails, and the worker is what keeps them from
+  // clients. It proves itself with the BLOOM_WORKER_SECRET it shares with us
+  // (see cloudflare/worker.js). If the secret isn't configured, nobody gets in.
+  // OPTIONS is answered above without it: a preflight reveals nothing.
+  if (
+    !(await secretsMatch(
+      req.headers.get("x-bloom-worker-secret"),
+      Deno.env.get("BLOOM_WORKER_SECRET")
+    ))
+  ) {
+    return respond("Unauthorized", {
+      status: 401,
+      statusText: "Unauthorized",
+    });
+  }
 
   // We only serve file content; anything else is likely a client mistake and
   // must not silently proxy to S3 as a read.
@@ -114,100 +133,33 @@ export async function handleFsRequest(req: Request): Promise<Response> {
     });
   }
 
+  // Redirect to S3 rather than proxying the file. Edge Function response
+  // bytes count as uncached Supabase egress, and proxying every thumbnail,
+  // .bloompub, PDF and audio file blew through our egress quota. The routing
+  // worker (cloudflare/worker.js) follows this redirect server-side, fetches
+  // the file from S3 itself and streams it to the client on
+  // api.bloomlibrary.org, so Cloudflare (no egress fees) carries the bytes and
+  // clients never see S3. The worker also does the response shaping (header
+  // whitelist, 304/404 mapping, x-amz-* stripping, thumbnail caching) that
+  // used to live here. It copies our CORS headers from this response, so
+  // getCorsHeaders stays the single source of truth for them.
+  //
+  // The start of urlArtifact is the book's raw baseUrl from Parse, which can
+  // hold unencoded non-ASCII (e.g. a title). fetch() used to percent-encode
+  // that for us; a header value can't carry it, so let the URL parser apply
+  // the same encoding fetch did. Existing %xx escapes and "+" are kept.
+  let location: string;
   try {
-    // Forward relevant headers from the original request to S3.
-    //
-    // SECURITY: We use a whitelist approach rather than blindly forwarding all headers because:
-    // 1. **Prevent Header Injection**: Malicious clients could send headers that affect S3 behavior
-    //    in unintended ways (e.g., x-amz-* headers for S3-specific operations)
-    // 2. **Avoid Auth Leakage**: Authorization/authentication headers from the client should NOT
-    //    be forwarded to S3 (S3 uses its own auth via signed URLs)
-    // 3. **Prevent SSRF Attacks**: Headers like Host, X-Forwarded-For could be exploited
-    // 4. **Minimize Attack Surface**: Only forward headers necessary for legitimate functionality
-    //
-    // COMPLETENESS: This whitelist includes standard HTTP headers for:
-    // - Content negotiation: accept-encoding
-    // - Conditional requests: if-none-match, if-modified-since, if-match, if-unmodified-since
-    // - Range requests: range
-    //
-    // If you need to add more headers, consider:
-    // - Is it a standard HTTP header (RFC 7231-7235)?
-    // - Does S3 support it for CloudFront/direct access?
-    // - Could it be exploited for security issues?
-    // - Common additions might include: accept, accept-language (for content negotiation)
-    const forwardHeaders = new Headers();
-    const headersToForward = [
-      "range",              // For partial content/streaming (RFC 7233)
-      "if-none-match",      // For ETag-based conditional requests (RFC 7232)
-      "if-modified-since",  // For time-based conditional requests (RFC 7232)
-      "if-match",           // For ETag-based preconditions (RFC 7232)
-      "if-unmodified-since", // For time-based preconditions (RFC 7232)
-      "accept-encoding",    // For content encoding negotiation (RFC 7231)
-    ];
-
-    // Note: Headers.get() handles case-insensitivity.
-    headersToForward.forEach((headerName) => {
-      const value = req.headers.get(headerName);
-      if (value) {
-        forwardHeaders.set(headerName, value);
-      }
-    });
-
-    // Proxy the request to S3 with forwarded headers, preserving GET vs HEAD.
-    const response = await fetch(urlArtifact, {
-      method: req.method,
-      headers: forwardHeaders,
-    });
-
-    // 304 Not Modified is a *success* for the conditional requests whose
-    // headers we forward above; it must reach the client, not become a 404.
-    if (!response.ok && response.status !== 304) {
-      return respond("File not found", { status: 404 });
-    }
-
-    // Return content as a blob with headers from S3
-    const headers = new Headers();
-
-    // Copy headers from S3 response, except S3 internals (request ids etc.)
-    // that would leak infrastructure details the URL format exists to hide.
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase().startsWith("x-amz-")) {
-        return;
-      }
-      headers.set(key, value);
-    });
-
-    // Special caching rule for harvest thumbnails
-    // see https://docs.google.com/document/d/1Vub0SeQL6BQqyGoQBN6-cfi6AIRbcBHeV87KjnzZXDU/edit
-    const bucket = params.bucket.toLowerCase();
-    if (
-      (bucket === "harvest" || bucket === "dev-harvest") &&
-      params.pathSegments.length > 0 &&
-      params.pathSegments[0].toLowerCase() === "thumbnails"
-    ) {
-      headers.delete("cache-control"); //we don't know which casing s3 uses, so remove the other one
-      headers.set("Cache-Control", "max-age=31536000");
-    }
-
-    // CORS headers go on the success path too. Vary is appended rather than
-    // set so an existing Vary from S3 (e.g. Accept-Encoding) is preserved.
-    Object.entries(corsHeaders).forEach(([key, value]) => {
-      if (key.toLowerCase() === "vary" && headers.has("vary")) {
-        headers.append(key, value);
-      } else {
-        headers.set(key, value);
-      }
-    });
-
-    return new Response(response.body, {
-      status: response.status,
-      headers: headers,
-    });
+    location = new URL(urlArtifact).href;
   } catch (error) {
-    console.error("Error in fs function:", error);
+    console.error("Error in fs function: bad S3 URL", urlArtifact, error);
     return respond("Internal Server Error", {
       status: 500,
       statusText: "Internal Server Error",
     });
   }
+  return respond(null, {
+    status: 302,
+    headers: { Location: location },
+  });
 }

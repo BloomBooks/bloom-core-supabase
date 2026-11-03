@@ -6,29 +6,45 @@ Supabase Core Functionality for Bloom
 
 ```bash
 # Install dependencies
-yarn
+pnpm install
 
 # Configure environment
 cp .env.example .env.local
 # Edit .env.local with your Parse Server credentials
 
 # Start local development (requires Docker)
-yarn dev
+pnpm dev
 
 # Run tests
-yarn test
+pnpm test
 ```
 
-Test the fs function:
+Test the fs function (it answers with a 302 to S3; `-L` follows it; it needs the worker secret
+from your `.env.local`):
 ```bash
-curl "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
+curl -L -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://127.0.0.1:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o test.bloompub
 ```
 
 ## 📋 Prerequisites
 
-- [Volta](https://volta.sh/) (manages Node.js v22.20.0 and Yarn v1.22.22)
+- [pnpm](https://pnpm.io/) v11+ (pins its own version via `packageManager` and downloads
+  Node.js v24.18.0 via `devEngines.runtime` in `package.json` — no Volta or manual Node install needed)
+- [Deno](https://deno.com/) v2.9+ (runs and tests the edge functions)
 - [Docker Desktop](https://docs.docker.com/desktop/) (local development only)
 - [Supabase account](https://supabase.com/)
+
+### Dependency policy
+
+Both package resolvers enforce a **7-day cooldown**: a version published less than 7 days
+ago will not be installed (mitigates compromised-package supply-chain attacks).
+
+- npm side (dev tooling): `minimumReleaseAge` in [`pnpm-workspace.yaml`](pnpm-workspace.yaml)
+- Deno side (edge function imports): `minimumDependencyAge` in [`deno.json`](deno.json)
+
+Dependencies are pinned to exact versions (`savePrefix: ""` for pnpm; exact versions in the
+`deno.json` import map), and CI installs with frozen lockfiles. To update deps, run
+`pnpm update` / `deno outdated --update` — both respect the cooldown — and commit the
+lockfile changes.
 
 ## 📁 Project Structure
 
@@ -37,7 +53,7 @@ supabase/functions/
 ├── _shared/              # Shared utilities
 │   ├── BloomParseServer.ts
 │   └── utils.ts
-├── fs/                   # S3 proxy function (streams book files)
+├── fs/                   # resolves book files to S3 (302; the Cloudflare worker streams them)
 │   ├── index.ts
 │   ├── BookData.ts
 │   └── README.md
@@ -47,29 +63,29 @@ supabase/functions/
 ## 🔧 Scripts
 
 ```bash
-yarn dev           # Start Supabase
-yarn dev:debug     # Start with debugger
-yarn test          # Run tests
-yarn test:watch    # Run tests in watch mode
-yarn deploy        # Deploy to production
+pnpm dev           # Start Supabase
+pnpm dev:debug     # Start with debugger
+pnpm test          # Run tests
+pnpm test:watch    # Run tests in watch mode
+pnpm run deploy    # Deploy to production ("run" needed: deploy is a pnpm built-in)
 ```
 
 ## 🗃️ fs Function
 
-Streams book files from S3 without exposing bucket details.
+Serves book files from S3 without exposing bucket details. The function looks up the book and
+answers with a 302 to the S3 file; the Cloudflare worker in [`cloudflare/`](cloudflare/README.md)
+follows that redirect server-side and streams the file to the client, so the bytes don't count
+as Supabase egress.
 
 **URL**: `/functions/v1/fs/{bucket}/{bookid}/{path...}`
 
 **Example**:
 ```bash
-# Get thumbnail
-curl "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
+# Thumbnail: expect a 302 to s3.amazonaws.com
+curl -I -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://localhost:54321/functions/v1/fs/dev-harvest/ZWI7FUQnDd/thumbnails/thumbnail-256.png"
 
-# Download book (streams, no buffering)
-curl "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
-
-# Range request
-curl -H "Range: bytes=0-1023" "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
+# Download book (follow the redirect)
+curl -L -H "x-bloom-worker-secret: $BLOOM_WORKER_SECRET" "http://localhost:54321/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub" -o book.bloompub
 ```
 
 See [`supabase/functions/fs/README.md`](supabase/functions/fs/README.md) for details.

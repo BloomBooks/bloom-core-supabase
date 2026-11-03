@@ -6,7 +6,8 @@ Node/TypeScript) to this repo (Supabase Edge Functions, Deno/TypeScript).
 
 Status as of July 2026: **`fs` is migrated** (this repo's first function) and serving production
 traffic through the proxying Cloudflare Worker (Phase 0.5, deployed 2026-07-10). Everything
-else still runs on Azure.
+else still runs on Azure. Since October 2026 the `fs` function only redirects to S3 and the
+worker carries the file bytes, to stay within the Supabase egress quota (see Phase 0).
 
 ---
 
@@ -33,7 +34,7 @@ All clients call `https://api.bloomlibrary.org/v1/<function>`. Known consumers:
 | `opds` | HTTP GET | No | ParseServer (incl. `catalog-service` login) | API-account `key` param |
 | `stats` | HTTP GET/POST | No (temp table only) | Postgres analytics DB (read-only user), ParseServer | none |
 | `contentfulToCrowdin` | Timer (22:30 daily) | Yes (writes to Crowdin) | Contentful (read), Crowdin (write) | tokens |
-| `dailyTimer` | Timer (10:40 daily) | Yes (refreshes PG materialized views) | Postgres (admin user) | n/a |
+| `dailyTimer` ✅ migrated | Timer (10:40 daily) | Yes (refreshes PG materialized views) | Postgres (admin user) | n/a |
 | `bookCleanup` | Timer (12:40 daily) | **Yes — deletes** S3 files and Parse records | ParseServer (`book-cleanup` login), S3 | password |
 | `status` | HTTP GET | No | Azure Durable Functions state | none |
 | `books` | HTTP GET/POST/DELETE | **Yes** (Parse + S3 writes) | ParseServer, S3/STS, Contentful, Durable Functions | Parse session token |
@@ -134,9 +135,31 @@ Risk here combines: implementation complexity, blast radius if it breaks, whethe
 data, and how easily it rolls back (all HTTP functions roll back instantly via the Cloudflare
 rule; timers roll back by re-enabling the Azure timer).
 
+**The API contract.** [`api-spec.yml`](api-spec.yml) — the OpenAPI spec for the public API at
+`https://api.bloomlibrary.org/v1`, ported from the Azure repo — is landed **first**, ahead of
+every phase below, as the reference each migration must preserve. The phases move each endpoint's
+*implementation* from Azure to Supabase; the contract they honor does not change. Everything in
+`api-spec.yml` is live; planned-but-unimplemented endpoints (currently only `/languages/{tag}`,
+never implemented in either repo) live in [`api-spec-next.yml`](api-spec-next.yml) and graduate
+to `api-spec.yml` when built.
+
 ### Phase 0 — `fs` ✅ done
 Serving production. Remaining follow-ups: document the Cloudflare rule (Appendix A), and confirm
 Azure `fs` traffic has actually dropped to zero before deleting the Azure function.
+
+**Egress fix (October 2026):** we exceeded the Supabase egress quota because Edge Function
+response bytes count as uncached Supabase egress, and `fs` streamed every file (thumbnails,
+`.bloompub`, PDFs, audio) from S3 through the function. Now the function only does the Parse
+lookup and answers with a 302 to the S3 URL; the worker follows that redirect server-side and
+streams the file from S3 to the client, so Cloudflare (no egress fees) carries the bytes and
+clients still see only `api.bloomlibrary.org`. The response shaping (header whitelist,
+304/404 mapping, `x-amz-*` stripping, thumbnail caching) moved into the worker with it. The
+function only answers requests carrying the worker's `BLOOM_WORKER_SECRET` header, since its
+302 reveals S3 addresses (which can contain uploader emails). The worker, its secret and the
+function must be deployed together, worker first — see
+[`cloudflare/README.md`](cloudflare/README.md#fs-the-worker-carries-the-file-bodies).
+**For later phases:** a function that returns large bodies should hand the bytes to the worker
+the same way rather than stream them itself.
 
 ### Phase 0.5 — Replace the 302 redirects with a proxying Worker ✅ done
 Stand up the Cloudflare Worker described in §2a in two stages: first replace the **staging**
@@ -157,6 +180,63 @@ state, verification curls, and the per-function extension process.
 - Watch-outs: preserve exact OpenGraph output (test with Facebook's sharing debugger);
   `social.bloomlibrary.org` needs its own Cloudflare rule in addition to
   `api.bloomlibrary.org/v1/social`.
+- Status: **implemented** (`supabase/functions/social/`) and merged to `develop`. Two changes
+  from the Azure version: parameters are HTML-escaped (the Azure version interpolated them raw —
+  an injection vector), and the public `og:url` is reconstructed from a custom header the worker
+  sends (see the `og:url` finding below). No special cutover ordering is needed.
+
+#### The `og:url` / host-rewrite problem (verified on staging 2026-07-17)
+When the worker proxies a migrated function it must rewrite the request host to
+`<ref>.supabase.co` — you cannot reach Supabase under the `bloomlibrary.org` host. So the
+function sees its own URL as the Supabase one and can't build a public `og:url` from `req.url`.
+The code tries to carry the original host across in an `X-Forwarded-Host` header the worker
+sets — **but that header does not survive.** `X-Forwarded-*` are proxy-managed headers, and the
+Cloudflare/gateway layer in front of the Supabase runtime strips or overwrites them before the
+Deno function sees them. Verified on staging: a `curl` that set `X-Forwarded-Host` **by hand,
+directly at `*.supabase.co` (bypassing the worker entirely), still didn't reach the function** —
+so the loss is at the Supabase edge, not in our worker. Result: `og:url` silently falls back to
+the `*.supabase.co` URL — exactly the leak §2a-5 warns about.
+
+**Current production behavior (verified 2026-07-17).** Production is unaffected today because it
+is still on Azure. Both public entry points — `api.bloomlibrary.org/v1/social` and
+`social.bloomlibrary.org/v1/social` — hit the *same* Azure function (identical `Request-Context`
+appId) and differ in exactly one way: each **mirrors its own host into `og:url`** (`api.…` →
+`https://api.bloomlibrary.org/v1/social?...`, `social.…` →
+`https://social.bloomlibrary.org/v1/social?...`). Azure gets this for free because the request
+reaches it already bearing the public host. Preserving that per-host mirror is the target
+behavior for the migrated version.
+
+Second, latent bug found the same way: `getPublicUrl` strips a `/functions/v1/` path prefix, but
+the function's actual `req.url` path is `/social` (no such prefix), so even a surviving header
+would rebuild `/social`, not the `/v1/social` Azure emits.
+
+**Resolution (implemented): carry the public URL in a custom header.** `X-Forwarded-*` is
+stripped, but a *non-proxy-managed* header rides through the Supabase edge untouched. Verified on
+staging 2026-07-17: with `X-Bloom-Public-Url` set to a `social.bloomlibrary.org` URL, `og:url`
+came back as that public URL with **no `*.supabase.co`** — both when routed through the existing
+worker (which copies client headers) and when sent directly to the Supabase function. So:
+- **Function side:** `getPublicUrl` reads a full public URL from `X-Bloom-Public-Url`, validated
+  against the `bloomlibrary.org` allowlist, and otherwise falls back to `req.url`. Carrying the
+  *full* URL also disposes of the `/functions/v1/` vs `/v1/social` path bug above, since the worker
+  sends the already-correct public path. (The dead `X-Forwarded-Host` path has been removed.)
+- **Worker side (deployed to staging 2026-07-17; production deploy pending):** the routing worker
+  sets `X-Bloom-Public-Url` to the original public request URL (host + `/v1/…` + query) in place of
+  `X-Forwarded-Host`.
+
+This supersedes the earlier idea of a DNS/custom-domain switch: **no Supabase custom domain is
+needed, and `social` need not be cut over last** — it works correctly through the worker like any
+other migrated function, on both `api.bloomlibrary.org` and `social.bloomlibrary.org` (each
+mirrors its own host, since the worker forwards whichever public URL the request arrived on).
+
+**End-to-end verified on staging (2026-07-17).** With the worker change deployed, a plain request
+through `staging-api.bloomlibrary.org/v1/social` (no client-set header) returned
+`og:url = https://staging-api.bloomlibrary.org/v1/social?...` with no `*.supabase.co` and the
+redirect intact — the worker injects the header on its own and the function honors it, matching
+Azure's current per-host behavior.
+
+Remaining step: deploy the same `cloudflare/worker.js` to **production** at cutover time. Until
+then, production stays on Azure; and on staging, any not-yet-wired host simply falls back to
+`req.url` (no regression).
 
 ### Phase 2 — `subscriptions` (read-only, one simple dependency)
 - Route `/v1/subscriptionInfo/{code}`; reads one named range from a Google Sheet.
@@ -166,6 +246,9 @@ state, verification curls, and the per-function extension process.
   specifiers, or swap for a plain JWT + fetch call to the Sheets REST API.
 - Consumed by Bloom Desktop for subscription/branding codes, so verify against a released
   Desktop build before cutover.
+- Status: **implemented** (`supabase/functions/subscriptionInfo/` — named for its URL segment,
+  not the Azure folder name `subscriptions`). Uses a hand-rolled service-account JWT +
+  Sheets REST call instead of the googleapis npm package.
 
 ### Phase 3 — `contentfulToCrowdin` (first timer; not user-facing)
 - Daily one-way sync: Contentful → three l10n JSON files → Crowdin. No Bloom data touched;
@@ -178,6 +261,57 @@ state, verification curls, and the per-function extension process.
   Pick one and reuse it for the other timers.
 - Run both Azure and Supabase versions in parallel for a few days (Crowdin uploads are
   idempotent) before disabling the Azure timer.
+- Status: **implemented** (`supabase/functions/contentfulToCrowdin/`). Scheduling mechanism
+  chosen: **GitHub Actions cron** (`.github/workflows/cron-contentful-to-crowdin.yml`, daily
+  22:30 UTC, same as Azure). The function is gated by an `x-bloom-cron-secret` header matching
+  the `BLOOM_CRON_SECRET` secret.
+- **Cutover config.** Real Crowdin writes are opt-in (see "Differences from the Azure
+  implementation" below): set `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD=true` on the
+  **production** Supabase project only, and first do a dry run against staging to confirm the
+  logged high / low / church counts look sane.
+- **Scheduled target is temporarily staging.** The scheduled cron is meant to hit
+  **production**, but for now it falls back to staging because the function only exists on the
+  staging project. Once `contentfulToCrowdin` is deployed to production, switch the scheduled
+  branch of `TARGET_ENV` in `.github/workflows/cron-contentful-to-crowdin.yml` from `'staging'`
+  back to `'production'` (this is also flagged in a comment there). Manual `workflow_dispatch`
+  runs are unaffected — they still choose the deployment.
+
+#### Differences from the Azure implementation
+
+Same inputs and outputs — the same Contentful space, the same three Crowdin files/ids, and the
+same daily 22:30 UTC schedule — but the port changed several things:
+
+- **Trigger.** Azure used a built-in timer trigger. Supabase Edge Functions have none, so a
+  GitHub Actions `schedule:` workflow (`cron-contentful-to-crowdin.yml`) POSTs to the deployed
+  function. The function runs with `verify_jwt = false` and authenticates the caller itself via an
+  `x-bloom-cron-secret` header (matching `BLOOM_CRON_SECRET`); the Azure timer needed no HTTP auth.
+- **Contentful access.** Azure used the `contentful` npm SDK (`client.getEntries`). We call the
+  Contentful Content Delivery REST API directly (`cdn.contentful.com/.../entries`) since we only
+  need flat fields. The query is identical (`content_type`, `fields.localization[ne]=No`,
+  `limit=1000`), so the server-side filtering behavior is the same.
+- **Crowdin upload — now awaited.** Azure used the Crowdin SDK and did **not** await the upload
+  promises (fire-and-forget), so a failed upload could pass silently. We call the Crowdin REST v2
+  API directly (the same two calls the SDK made — `storages` POST, then `files/{id}` PUT), `await`
+  both via `Promise.all`, check each response, and fail the run (throw → HTTP 500 → the workflow
+  job fails) on any error.
+- **When it writes — inverted to opt-in.** Azure ran for real unless it detected a local
+  environment (`if (!runEvenIfLocal && isLocalEnvironment()) return;`) — i.e. "run unless local",
+  which meant Azure *staging* also wrote to the real Crowdin and had to be disabled by hand in the
+  portal. We inverted this: uploads happen only when
+  `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD=true` (production). Local and staging default to a dry
+  run that reads Contentful and logs the counts but writes nothing — no manual disabling, and local
+  dev can't write by accident.
+- **Empty-file guard — new.** Azure had only the upper-bound `>= 1000` guard and uploaded each file
+  unconditionally, so a filter matching zero entries would blank a Crowdin file (this never fired
+  because production always has entries in every bucket). We added a lower-bound guard
+  (`assertNoEmptyFiles`) that throws before uploading if any of the three files would be empty. It
+  is all-or-nothing — any empty bucket aborts the whole run — and runs in dry runs too. (A future
+  refinement could make it per-file.)
+- **Not ported yet.** Azure's `common/contentful.ts` also holds the editor-collection permission
+  helpers used by the `books` function; those are deliberately left for the `books` migration.
+- **Naming / config.** Env var names were standardized (`BLOOM_CONTENTFUL_READ_ONLY_TOKEN`,
+  `BLOOM_CROWDIN_API_TOKEN`, `BLOOM_CRON_SECRET`, `BLOOM_CONTENTFUL_TO_CROWDIN_ENABLE_UPLOAD`) and
+  supplied through the Supabase edge-runtime secrets (`config.toml`) instead of Azure app settings.
 
 ### Phase 4 — `opds` (read-only, but external contract)
 - ParseServer-only dependency, and `_shared/BloomParseServer.ts` already has the
@@ -200,7 +334,7 @@ state, verification curls, and the per-function extension process.
   guard — fix that (parameterized queries) during the port rather than copying it.
 - Consumed by blorg's book-stats UI; low write risk, moderate visibility.
 
-### Phase 6 — `dailyTimer` (small, but first *writing* function)
+### Phase 6 — `dailyTimer` (small, but first *writing* function) ✅ done
 - One job: call `common.refresh_materialized_views()` in the analytics Postgres as the admin
   user. **Chosen approach: schedule it inside the analytics Postgres itself with pg_cron** and
   skip porting the function entirely — it's a DB-to-itself operation; the Azure function is just
@@ -229,6 +363,18 @@ state, verification curls, and the per-function extension process.
   to App Insights, which nobody is alerted on either.
 - Risk: needs the server-parameter change (restart) on the analytics DB. Failure mode is stale
   stats (detectable, recoverable), not data loss.
+- Status: **LIVE (2026-07-22).** The DB side is done — pg_cron is enabled and the
+  `refresh-materialized-views` job (a `CALL` to the `refresh_materialized_views()` **procedure**)
+  is scheduled and has fired successfully. Because pg_cron enforces RLS (`username = current_user`),
+  the read-only user can't see the admin-owned job's rows directly and a plain view doesn't help;
+  run history is exposed through an admin-owned **SECURITY DEFINER function**
+  `common.mv_refresh_status()`. The watchdog
+  (`.github/workflows/cron-analytics-freshness-watchdog.yml`) — a pure-`psql` GitHub Actions cron
+  (daily, ~2h after the refresh) that asserts the latest run succeeded within 25h and fails
+  (→ GitHub failure email) on staleness/failure/never-fired — reads that function and is **passing**
+  (green on commit `dcabbd5`; the `BLOOM_ANALYTICS_READONLY_URL` secret is set). Full ops/DBA
+  runbook: [`analytics/README.md`](analytics/README.md). The old Azure `dailyTimer` has been
+  **disabled** (Azure portal, 2026-07-22), so cutover is complete — **Phase 6 done.**
 
 ### Phase 7 — `bookCleanup` (destructive timer)
 - Deletes abandoned-upload S3 files and Parse book records older than 24h. First function that
@@ -264,6 +410,15 @@ When Azure traffic is zero (verify via Azure metrics/logs over ≥30 days, remem
 timers and long-tail OPDS clients): disable the functions app, retire the Kudu deployment, rotate
 any credentials that lived in Azure app settings, archive the repo with a pointer to this one.
 
+**What remains relevant in the Azure repo** (everything else — functions, shared code, tests,
+api-spec, host/deploy config, READMEs — has been ported here or superseded):
+1. The **secret values** in the Function App's settings (portal → Configuration → Application
+   settings; also on dev machines in `local.settings.json`) — the source when provisioning the
+   checklist in §4. Never in git.
+2. The **running app itself** until cutover completes.
+3. The unit-test Parse server (`bloom-parse-server-unittest.azurewebsites.net`) is a separate
+   Azure App Service from the `bloom-parse-server` repo — out of scope; it stays.
+
 ---
 
 ## 4. Cross-cutting concerns
@@ -294,6 +449,49 @@ any credentials that lived in Azure app settings, archive the repo with a pointe
 
 ---
 
+## 5. Cutover runbook (the order of operations from here)
+
+All code is implemented (phases 1–5, 7, 8, the worker, and the spec). What remains is
+operational, in this order:
+
+1. **Merge the branch stack** bottom-up into `develop` (`api-spec` → `phase2-subscriptions` →
+   `phase3-contentful-to-crowdin` → `phase4-opds` → `phase5-stats` → `phase7-book-cleanup` →
+   `phase8-books`; `phase1-social` is already on `develop`). Each merge auto-deploys functions
+   **and migrations** to the staging project. Before the first merge, provision the secrets
+   checklist (§4) on the staging Supabase project and the GitHub repo secrets (`BLOOM_CRON_SECRET`,
+   `BLOOM_SUPABASE_{STAGING,PRODUCTION}_DB_PASSWORD`) — the contentfulToCrowdin cron activates on
+   merge and will report failures until its secrets exist.
+2. **Ops deploys the staging worker** (Stage 1 of [`cloudflare/README.md`](cloudflare/README.md)).
+3. **Verify on `staging-api.bloomlibrary.org`**: every function's smoke tests; the OPDS
+   byte-diff against Azure output (`lang`/`tag`/`epub`/`src` matrix); a real Bloom Desktop
+   upload (upload-start → S3 sync → upload-finish → status polling); `stats` against the
+   analytics DB (confirms the firewall accepts Supabase egress); safe-mode `bookCleanup` runs
+   compared against what the Azure timer deletes.
+4. **Ops deploys the production worker** (Stage 2). ⚠️ The checked-in `cloudflare/worker.js`
+   lists **all** migrated functions, so deploying it verbatim cuts everything over at once.
+   For production, start `SUPABASE_FUNCTIONS` with just `"fs"` and extend it one function at a
+   time as each passes staging verification; each extension is an instant-rollback one-line
+   change. Extend `social` **last of all** — its production cutover is deferred to the end-state
+   DNS switch described in §3 (Phase 1), when the `bloomlibrary.org` hosts point directly at
+   Supabase and the worker is retired.
+5. **Timers**: uncomment the bookCleanup workflow schedule only after step 3's safe-mode
+   comparison and after disabling the Azure timer (never both live). Disable the Azure
+   contentfulToCrowdin timer once the GitHub cron has succeeded a few days in a row.
+6. **Phase 6** (materialized views): ✅ done (2026-07-22) — pg_cron job + the
+   `common.mv_refresh_status()` SECURITY DEFINER function + the freshness watchdog are live and the
+   Azure `dailyTimer` is disabled (see Phase 6 above). No `refresh_log` table was needed — the
+   watchdog reads pg_cron's own run history through that function.
+7. **Provision production secrets** and repeat the per-function worker extension on
+   `api.bloomlibrary.org` (step 4's list and ordering — `social` last).
+8. **Decommission** Azure per the checklist above.
+
+Note on tests: the suite includes live tests ported from Azure (Google Sheet lookups, prod-Parse
+OPDS queries, S3 bucket round-trips, the end-to-end bookCleanup scenario). They skip themselves
+unless their credentials are present in the environment — same env-var names as the functions
+(see `.env.example`) — so a bare `pnpm test:ci` run only exercises what its secrets allow.
+
+---
+
 ## Appendix A — Cloudflare routing rules
 
 Confirmed from the Cloudflare dashboard + live traffic. Updated 2026-07-10, when the Workers
@@ -301,7 +499,7 @@ replaced the 302 Redirect Rules (Phase 0.5).
 
 | Hostname / path | Mechanism | Destination | Notes |
 | --- | --- | --- | --- |
-| `api.bloomlibrary.org/v1/*` | Worker `bloom-api-router` — server-side **proxy** | `fs` → `sekpsuviwfhzzznzrdgx.supabase.co` (prod Supabase); everything else falls through to the zone origin (Azure) | path rewritten `/v1/<fn>` → `/functions/v1/<fn>` in [`cloudflare/worker.js`](cloudflare/worker.js) |
+| `api.bloomlibrary.org/v1/*` | Worker `bloom-api-router` — server-side **proxy** | `fs` → `sekpsuviwfhzzznzrdgx.supabase.co` (prod Supabase); everything else falls through to the zone origin (Azure) | path rewritten `/v1/<fn>` → `/functions/v1/<fn>` in [`cloudflare/worker.js`](cloudflare/worker.js); for `fs` the worker follows the function's 302 and streams the file from S3 itself |
 | `staging-api.bloomlibrary.org/v1/*` | Worker `bloom-api-router-staging` — **proxy** | `fs` → `mwatyhkxsprxgnkcbalq.supabase.co` (staging Supabase); everything else → Azure via `ORIGIN_HOST` | same script as production |
 | *(disabled)* Redirect Rules `supabase edge functions` / `... - staging` | **302** on `/v1/fs/*` | prod / staging Supabase | disabled 2026-07-10; kept in the dashboard for instant rollback |
 | `api.bloomlibrary.org/*` (rest) | proxied DNS record | `bloom-functions.azurewebsites.net` (Azure Functions app) | Azure `Request-Context` header visible in responses; the Worker's fall-through relies on this record |
