@@ -31,6 +31,27 @@ OPDS and BloomLibrary2 use `https://api.bloomlibrary.org/v1/fs/...`.
 **The function, the worker and the secret must be deployed together** — see
 [`cloudflare/README.md`](../../../cloudflare/README.md#fs-the-worker-carries-the-file-bodies).
 
+## Known limitation: Supabase's firewall blocks some file names
+
+Supabase runs its Edge Functions behind its own Cloudflare zone, and that zone's firewall blocks
+some request paths that look like SQL injection. The function never sees these requests. Our
+worker passes Supabase's 403 through, so the user gets Cloudflare's "Attention Required" page,
+saying "You are unable to access supabase.co", instead of the file.
+
+- **Known case:** the production book `rrkByplyCv`, "one + one = two" (a 2024 draft). Every
+  file in its folder is blocked, e.g. `/v1/fs/harvest/rrkByplyCv/epub/one%20%252B%20one%20%3D%20two.epub`.
+  The trigger is the words "one one = two"; `a + b` and `x = y` alone go through. Books with
+  `=`, `+`, `%`, `#` and other punctuation in their names otherwise download fine (checked
+  November 2026 on prod and on the dev test books).
+- **How to recognize it:** a 403 with an HTML body naming supabase.co, Cloudflare headers
+  (`CF-RAY`, a `__cf_bm` cookie for `supabase.co`) and no `sb-error-code` header. Calling the
+  Supabase URL directly gives the same 403, not the function's 401 for the missing worker
+  secret. Example Ray ID: `a5c8b8088b951dc2`.
+- **No workaround on our side:** the firewall decodes the path fully before checking it, so
+  encoding the name differently doesn't help, and the zone isn't ours, so we can't add an
+  exception. A fix would need Supabase support, or the worker finding the S3 file without
+  calling the function.
+
 ## URL Format
 
 ```
