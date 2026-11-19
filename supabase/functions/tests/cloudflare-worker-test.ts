@@ -503,3 +503,255 @@ Deno.test({
     );
   },
 });
+
+// ---------------------------------------------------------------------------
+// Caching: when fs reports the file's version (X-Bloom-File-Version), the S3
+// file is cached under it for a year. Clients may put a version in the URL,
+// either ?v={epochMs} (downloads) or {bookId}@{epochMs} (read-online); it is
+// stripped before asking fs, and only decides Cache-Control: immutable.
+// ---------------------------------------------------------------------------
+
+const kVersion = "1757995714210";
+const kFnBase = `https://${kSupabaseHost}/functions/v1/fs`;
+const kYearCache = {
+  cacheEverything: true,
+  cacheTtlByStatus: { "200-299": 31536000, "300-599": -1 },
+};
+const kImmutable = "public, max-age=31536000, immutable";
+
+// fs's answer for a file whose version it knows.
+const versionedRedirect = (version = kVersion, location = kS3Url) =>
+  redirectTo(location, { "X-Bloom-File-Version": version });
+
+// S3's file, with a Cache-Control the worker keeps only when nothing is cached.
+const kS3CacheControl = "max-age=14400";
+const okFile = () =>
+  new Response("file-bytes", {
+    status: 200,
+    headers: { "content-type": "application/pdf", "cache-control": kS3CacheControl },
+  });
+
+const cfOf = (c: Captured) => (c.s3Init as { cf?: unknown } | undefined)?.cf;
+
+Deno.test({
+  name: "worker fs caching - caches the S3 file under fs's version, for old clients too",
+  fn: async () => {
+    await withFetch(versionedRedirect(), okFile, async (c) => {
+      const response = await get("/v1/fs/upload/validBookId/test.pdf");
+      assertEquals(response.status, 200);
+      assertEquals(await response.text(), "file-bytes");
+      assertEquals(c.s3Url, `${kS3Url}?v=${kVersion}`, "the version is in the cache key");
+      assertEquals(cfOf(c), kYearCache, "cache successes for a year, never errors");
+      // This URL doesn't name a version, so browsers must check back.
+      assertEquals(response.headers.get("cache-control"), "no-cache");
+      assertEquals(response.headers.get("content-disposition"), null);
+      assertEquals(response.headers.get("x-bloom-file-version"), null);
+      assertEquals(response.headers.get("location"), null);
+    });
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - nothing is cached when fs reports no (valid) version",
+  fn: async () => {
+    for (const fnResponse of [
+      redirectTo(kS3Url),
+      versionedRedirect("abc"),
+      versionedRedirect(""),
+      versionedRedirect("1?x=1"),
+      versionedRedirect("12345678901234567"),
+    ]) {
+      for (const path of [
+        "/v1/fs/upload/validBookId/test.pdf",
+        `/v1/fs/upload/validBookId/test.pdf?v=${kVersion}`,
+      ]) {
+        await withFetch(fnResponse, okFile, async (c) => {
+          const response = await get(path);
+          assertEquals(c.s3Url, kS3Url, path);
+          assertEquals(cfOf(c), undefined, path);
+          assertEquals(response.headers.get("cache-control"), kS3CacheControl, path);
+        });
+      }
+    }
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - query form: strips v for fs; immutable when it matches",
+  fn: async () => {
+    await withFetch(versionedRedirect(), okFile, async (c) => {
+      const response = await get(`/v1/fs/upload/validBookId/test.pdf?v=${kVersion}`);
+      assertEquals(c.fnRequest!.url, `${kFnBase}/upload/validBookId/test.pdf`);
+      assertEquals(c.s3Url, `${kS3Url}?v=${kVersion}`);
+      assertEquals(response.headers.get("cache-control"), kImmutable);
+      // A version alone doesn't make a download.
+      assertEquals(response.headers.get("content-disposition"), null);
+    });
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - path form: strips @version from the book id",
+  fn: async () => {
+    for (const bookSegment of [`validBookId@${kVersion}`, `validBookId%40${kVersion}`]) {
+      await withFetch(versionedRedirect(), okFile, async (c) => {
+        const response = await get(
+          `/v1/fs/harvest/${bookSegment}/bloomdigital/audio/a.mp3`
+        );
+        assertEquals(response.status, 200);
+        assertEquals(
+          c.fnRequest!.url,
+          `${kFnBase}/harvest/validBookId/bloomdigital/audio/a.mp3`,
+          bookSegment
+        );
+        assertEquals(c.s3Url, `${kS3Url}?v=${kVersion}`);
+        assertEquals(response.headers.get("cache-control"), kImmutable);
+        assertEquals(response.headers.get("content-disposition"), null);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - a URL version that isn't fs's only loses immutable",
+  fn: async () => {
+    for (const path of [
+      "/v1/fs/upload/validBookId/test.pdf?v=1",
+      "/v1/fs/upload/validBookId@1/test.pdf",
+      `/v1/fs/upload/validBookId/test.pdf?v=0${kVersion}`,
+    ]) {
+      await withFetch(versionedRedirect(), okFile, async (c) => {
+        const response = await get(path);
+        assertEquals(c.s3Url, `${kS3Url}?v=${kVersion}`, `${path}: cached under fs's version`);
+        assertEquals(response.headers.get("cache-control"), "no-cache", path);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - path version wins over v=, other query params are kept",
+  fn: async () => {
+    await withFetch(versionedRedirect(), okFile, async (c) => {
+      const response = await get(
+        `/v1/fs/harvest/validBookId@${kVersion}/x/y.htm?v=123&lang=en`
+      );
+      assertEquals(c.fnRequest!.url, `${kFnBase}/harvest/validBookId/x/y.htm?lang=en`);
+      assertEquals(response.headers.get("cache-control"), kImmutable);
+    });
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - a URL without a valid version reaches fs unchanged",
+  fn: async () => {
+    for (const path of [
+      "/v1/fs/upload/validBookId/test.pdf",
+      "/v1/fs/upload/validBookId/test.pdf?v=abc",
+      "/v1/fs/upload/validBookId/test.pdf?download=0",
+      "/v1/fs/upload/validBookId/test.pdf?v=",
+      "/v1/fs/upload/validBookId/test.pdf?v=12345678901234567",
+      "/v1/fs/upload/validBookId@abc/test.pdf",
+      "/v1/fs/upload/validBookId@/test.pdf",
+      "/v1/fs/upload/@123/test.pdf",
+      `/v1/fs/upload/validBookId@${kVersion}`, // no file path
+    ]) {
+      await withFetch(redirectTo(kS3Url), okFile, async (c) => {
+        const response = await get(path);
+        assertEquals(
+          c.fnRequest!.url,
+          `${kFnBase}${path.slice("/v1/fs".length)}`,
+          `${path}: fs sees the URL unchanged`
+        );
+        assertEquals(response.headers.get("cache-control"), kS3CacheControl, path);
+        assertEquals(response.headers.get("content-disposition"), null, path);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - download=1 is stripped for fs, with or without a version",
+  fn: async () => {
+    for (const [path, fnPath] of [
+      ["/v1/fs/upload/validBookId/test.pdf?download=1", "/upload/validBookId/test.pdf"],
+      [`/v1/fs/upload/validBookId/test.pdf?v=${kVersion}&download=1`, "/upload/validBookId/test.pdf"],
+      ["/v1/fs/upload/validBookId/test.pdf?download=1&lang=en", "/upload/validBookId/test.pdf?lang=en"],
+    ]) {
+      await withFetch(versionedRedirect(), okFile, async (c) => {
+        const response = await get(path);
+        assertEquals(c.fnRequest!.url, `${kFnBase}${fnPath}`, path);
+        assert(
+          response.headers.get("content-disposition")?.startsWith("attachment; "),
+          path
+        );
+      });
+    }
+    // Any other value is not ours, even beside a version.
+    await withFetch(versionedRedirect(), okFile, async (c) => {
+      await get(`/v1/fs/upload/validBookId/test.pdf?v=${kVersion}&download=0`);
+      assertEquals(c.fnRequest!.url, `${kFnBase}/upload/validBookId/test.pdf?download=0`);
+    });
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - downloads are named after the S3 object",
+  fn: async () => {
+    // The last segment of the S3 URL fs resolved is the URL-encoded object
+    // name, however the public URL spelled it.
+    const folder = "https://s3.amazonaws.com/BloomLibraryBooks/validBookId/123/Book";
+    for (const [s3Name, header] of [
+      ["one%20%2B%20one.pdf", `attachment; filename="one + one.pdf"; filename*=UTF-8''one%20%2B%20one.pdf`],
+      ["100%25%20sure.bloompub", `attachment; filename="100% sure.bloompub"; filename*=UTF-8''100%25%20sure.bloompub`],
+      ["El%20Ni%C3%B1o's%20(1).pdf", `attachment; filename="El Ni_o's (1).pdf"; filename*=UTF-8''El%20Ni%C3%B1o%27s%20%281%29.pdf`],
+      ["say%20%22hi%22.pdf", `attachment; filename="say _hi_.pdf"; filename*=UTF-8''say%20%22hi%22.pdf`],
+    ]) {
+      await withFetch(versionedRedirect(kVersion, `${folder}/${s3Name}`), okFile, async () => {
+        const response = await get("/v1/fs/upload/validBookId/whatever.pdf?download=1");
+        assertEquals(response.headers.get("content-disposition"), header, s3Name);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - thumbnails keep their rule unless the URL names the version",
+  fn: async () => {
+    const path = "/v1/fs/harvest/validBookId/thumbnails/thumbnail-256.png";
+    await withFetch(versionedRedirect(), okFile, async (c) => {
+      const plain = await get(path);
+      assertEquals(plain.headers.get("cache-control"), "max-age=31536000");
+      assertEquals(cfOf(c), kYearCache);
+      const versioned = await get(`${path}?v=${kVersion}`);
+      assertEquals(versioned.headers.get("cache-control"), kImmutable);
+    });
+  },
+});
+
+Deno.test({
+  name: "worker fs caching - a cached file's Cache-Control and Age come from us, not Cloudflare",
+  fn: async () => {
+    // What a cached copy may look like: a browser TTL Cloudflare added, and
+    // its age.
+    const cachedFile = () =>
+      new Response("file-bytes", {
+        status: 200,
+        headers: { "cache-control": "public, max-age=14400", age: "31000000" },
+      });
+    await withFetch(versionedRedirect(), cachedFile, async () => {
+      const plain = await get("/v1/fs/upload/validBookId/test.pdf");
+      assertEquals(plain.headers.get("cache-control"), "no-cache");
+      assertEquals(plain.headers.get("age"), null);
+      const versioned = await get(`/v1/fs/upload/validBookId/test.pdf?v=${kVersion}`);
+      assertEquals(versioned.headers.get("cache-control"), kImmutable);
+      assertEquals(versioned.headers.get("age"), null);
+    });
+    // Not cacheable: S3's headers pass through as before.
+    await withFetch(redirectTo(kS3Url), cachedFile, async () => {
+      const response = await get("/v1/fs/upload/validBookId/test.pdf");
+      assertEquals(response.headers.get("cache-control"), "public, max-age=14400");
+      assertEquals(response.headers.get("age"), "31000000");
+    });
+  },
+});

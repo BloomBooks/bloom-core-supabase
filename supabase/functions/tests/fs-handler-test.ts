@@ -9,7 +9,7 @@ import BloomParseServer, { Book } from "../_shared/BloomParseServer.ts";
 // (that is what costs Supabase egress). Every test restores the originals.
 // ---------------------------------------------------------------------------
 
-const mockBook = (baseUrl: string): Book =>
+const mockBook = (baseUrl: string, overrides: Partial<Book> = {}): Book =>
   ({
     objectId: "validBookId",
     baseUrl,
@@ -28,16 +28,18 @@ const mockBook = (baseUrl: string): Book =>
     inCirculation: true,
     ACL: {},
     harvestState: "Done",
+    ...overrides,
   }) as Book;
 
 const kDefaultBaseUrl =
   "https://s3.amazonaws.com/BloomLibraryBooks/user@example.com/book-guid/Book+Title/";
 
 // Runs `fn` with getBookByDatabaseId returning a book for "validBookId" (and
-// undefined otherwise).
+// undefined otherwise), with `overrides` on top of mockBook.
 async function withStubs(
   fn: () => Promise<void>,
-  baseUrl: string = kDefaultBaseUrl
+  baseUrl: string = kDefaultBaseUrl,
+  overrides: Partial<Book> = {}
 ) {
   const originalGetBook = BloomParseServer.prototype.getBookByDatabaseId;
   const originalFetch = globalThis.fetch;
@@ -45,7 +47,9 @@ async function withStubs(
   BloomParseServer.prototype.getBookByDatabaseId = (
     objectId: string
   ): Promise<Book | undefined> =>
-    Promise.resolve(objectId === "validBookId" ? mockBook(baseUrl) : undefined);
+    Promise.resolve(
+      objectId === "validBookId" ? mockBook(baseUrl, overrides) : undefined
+    );
 
   globalThis.fetch = ((input: string | URL | Request) => {
     throw new Error("Test made an unexpected network request: " + input);
@@ -455,5 +459,45 @@ Deno.test({
         assertEquals(response.headers.get("location"), null, path);
       }
     });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// File version (X-Bloom-File-Version): the worker caches the file under it
+// ---------------------------------------------------------------------------
+
+const kUploaded = "2025-09-16T04:08:34.210Z"; // 1757995714210
+const kHarvested = "2025-09-17T00:00:00.000Z"; // 1758067200000
+
+Deno.test({
+  name: "fs handler - reports the file version on the redirect, which is never cacheable",
+  fn: async () => {
+    const dates = {
+      lastUploaded: { iso: kUploaded },
+      harvestStartedAt: { iso: kHarvested },
+    };
+    for (const [book, path, version] of [
+      [dates, "/v1/fs/upload/validBookId/test.pdf", "1757995714210"],
+      [dates, "/v1/fs/dev-upload/validBookId/test.pdf", "1757995714210"],
+      [dates, "/v1/fs/harvest/validBookId/a.bloompub", "1758067200000"],
+      [dates, "/v1/fs/dev-harvest/validBookId/a.bloompub", "1758067200000"],
+      // A harvest that isn't finished may still be rewriting the files.
+      [{ ...dates, harvestState: "InProgress" }, "/v1/fs/harvest/validBookId/a.bloompub", null],
+      [{ ...dates, harvestState: "Updated" }, "/v1/fs/harvest/validBookId/a.bloompub", null],
+      // ...but that says nothing about the uploaded files.
+      [{ ...dates, harvestState: "InProgress" }, "/v1/fs/upload/validBookId/test.pdf", "1757995714210"],
+      // No (usable) date: no version.
+      [{}, "/v1/fs/upload/validBookId/test.pdf", null],
+      [{ lastUploaded: { iso: "not a date" } }, "/v1/fs/upload/validBookId/test.pdf", null],
+      [{ lastUploaded: dates.lastUploaded }, "/v1/fs/harvest/validBookId/a.bloompub", null],
+    ] as [Partial<Book>, string, string | null][]) {
+      await withStubs(async () => {
+        const response = await handleFsRequest(request(path));
+        const label = `${path} ${JSON.stringify(book)}`;
+        assertEquals(response.status, 302, label);
+        assertEquals(response.headers.get("x-bloom-file-version"), version, label);
+        assertEquals(response.headers.get("cache-control"), "private, no-store", label);
+      }, kDefaultBaseUrl, book);
+    }
   },
 });

@@ -42,6 +42,79 @@ it to the client. The client never sees the redirect or S3 — it gets the file 
 Anything other than a redirect from the function (OPTIONS preflights, 400/401/404/405/500) is
 passed through unchanged.
 
+### fs files are cached under their version
+
+The function tells the worker which **version** of the file it found, in an
+`X-Bloom-File-Version` header on its 302: the time (epoch milliseconds) the book's files in that
+bucket last changed. That is `lastUploaded` for the upload buckets and `harvestStartedAt` for the
+harvest buckets, and fs sends it only when those files are final:
+
+- **Uploaded files:** each upload writes a new S3 folder, and the book record moves to it
+  (`baseUrl`) in the same write that sets `lastUploaded` (Azure `uploadFinish`), so one
+  `lastUploaded` always names one finished folder.
+- **Harvested files:** the harvester sets `harvestStartedAt` *before* it rewrites the files in the
+  same folder, and `harvestState` to `Done` after. So fs sends no version unless the state is
+  `Done`.
+
+When there is a version, the worker fetches the file from S3 through Cloudflare's normal cache
+(`cacheEverything`, one year for 2xx, never for errors) with `?v={version}` added to the S3 URL. S3
+ignores the parameter, but it is part of the cache key, so each version gets its own entry. (A
+custom `cacheKey` would be neater but needs an Enterprise plan.) Tiered Cache, Range requests,
+HEAD and conditional requests are handled by Cloudflare; on a miss, Cloudflare fetches the whole
+file even for a Range request, and files over the plan's size limit are not cached. This happens
+for **every** client, old ones included. Their responses then come with `Cache-Control: no-cache`
+(unless the thumbnail rule applies), so browsers check back with the worker rather than keep a
+Cache-Control Cloudflare made up, and without `Age`.
+
+The function is still asked on **every** request, so a new upload or harvest takes effect at once
+(the new version is a new cache entry), and so does a deleted book. The cost of a request is a
+Supabase call and a Parse query, as before; the S3 transfer is what the cache saves. The 302
+itself carries `Cache-Control: private, no-store` and is never cached: it holds the S3 address.
+
+Without a version the worker adds no caching of its own, though Cloudflare's default caching still keeps
+static file types (images, audio, PDF) for a few hours, as it always has.
+
+For this feature the function and the worker can be deployed in either order: the old worker
+ignores the header, and the new worker caches nothing until the function sends it. (The worker
+secret has its own order; see below.) Clients must not send `{bookId}@{epochMs}` URLs until the
+new worker is live: the old one passes `id@version` to fs, which answers 404.
+
+A cached file is never re-read from S3 for its version. If a file is ever fixed in place on S3,
+or a harvest state is set to `Done` by hand while the files are still changing, purge the zone's
+cache, or give the book a new date (re-upload or re-harvest) so it gets a new version.
+
+**Clients may put the version in the URL** too:
+
+- **query form**, for single files such as downloads: `/v1/fs/{bucket}/{bookId}/{path}?v={epochMs}`
+- **path form**, for read online, so the relative links inside the book carry it:
+  `/v1/fs/{bucket}/{bookId}@{epochMs}/{path}` (`@` never occurs in a Parse id)
+
+The worker strips it before calling the function. When it equals the function's version, the
+response gets `Cache-Control: public, max-age=31536000, immutable`, so browsers keep the file too;
+otherwise the request is answered like an unversioned one. A URL's version never decides what is
+cached, so a wrong one can't pin stale bytes. An `@` or `v=` that isn't 1–16 digits is left alone
+and reaches the function unchanged.
+
+**Downloads:** a download button adds `download=1` (with or without a version), which the worker
+also strips. The response then gets `Content-Disposition: attachment` with the file's real name
+(the S3 object's name, from the URL fs resolved), so the browser saves it, even a PDF that it would
+otherwise show, and titles containing `+` or `%` keep them. Browsers ignore a link's `download`
+attribute for a file on another host, so this header is what makes a download. Without
+`download=1`, S3's own headers decide: harvested files are stored as downloads, the uploaded PDF
+displays.
+
+Verification:
+
+```bash
+# fs's version: on a 302 from the function (needs the worker secret; staging project shown)
+curl -sD - -o /dev/null -H "X-Bloom-Worker-Secret: $SECRET" \
+  "https://mwatyhkxsprxgnkcbalq.supabase.co/functions/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
+# The first request for a file version: CF-Cache-Status MISS; the next: HIT. Unversioned URL.
+curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/fs/harvest/VuebFgcL0R/Ososi.bloompub"
+# path form (read online) with the matching version: 200 text/html, immutable
+curl -sD - -o /dev/null "https://staging-api.bloomlibrary.org/v1/fs/harvest/VuebFgcL0R@$V/bloomdigital/index.htm"
+```
+
 ### The worker secret: only the worker may use fs
 
 The function's 302 reveals the S3 address, and older books' S3 paths contain the uploader's
