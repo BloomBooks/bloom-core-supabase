@@ -63,6 +63,11 @@ saying "You are unable to access supabase.co", instead of the file.
 - `bookid`: The database ID of the book in Parse Server
 - `part1`, `part2`, `part3`: Optional path components within the book's directory
 
+On its 302 the function also reports the **version** of the file (`X-Bloom-File-Version`), and
+the worker caches the file under it. Public URLs may carry a version too (`?v={epochMs}`, or
+`{bookid}@{epochMs}`); the worker strips it before calling this function. See
+[`cloudflare/README.md`](../../../cloudflare/README.md#fs-files-are-cached-under-their-version).
+
 ## Examples
 
 Against the local function each of these returns a `302` with the S3 URL in `Location`

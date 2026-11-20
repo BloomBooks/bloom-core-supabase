@@ -1,7 +1,11 @@
 import { assert, assertEquals, assertExists } from "@std/assert";
 
-import BookData from "../fs/BookData.ts";
+import BookData, { ContentUrlParams } from "../fs/BookData.ts";
 import BloomParseServer, { Book } from "../_shared/BloomParseServer.ts";
+
+// The S3 URL getContent finds; these tests are about the URL, not the version.
+const getContentUrl = async (params: ContentUrlParams) =>
+  (await BookData.getContent(params))?.url ?? null;
 
 // Test helper function to create a mock book object
 const createMockBook = (
@@ -37,7 +41,7 @@ Deno.test({
       pathSegments: ["test.pdf"],
     };
 
-    const result = await BookData.getContentUrl(params);
+    const result = await getContentUrl(params);
     assertEquals(result, null, "Should return null for invalid bucket");
   },
 });
@@ -66,7 +70,7 @@ Deno.test({
         pathSegments: ["test.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(result, "Should return a URL for valid book");
       assert(
         result.includes("BloomLibraryBooks"),
@@ -107,7 +111,7 @@ Deno.test({
         pathSegments: ["test.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(result, "Should return a URL for valid book");
       assert(
         result.includes("BloomLibraryBooks-Sandbox"),
@@ -144,7 +148,7 @@ Deno.test({
         pathSegments: ["test.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(result, "Should return a URL for valid book");
       // For harvest bucket, the title part should be removed from the URL
       assert(
@@ -177,7 +181,7 @@ Deno.test({
         pathSegments: ["test.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertEquals(result, null, "Should return null for non-existent book");
     } finally {
       // Restore original method
@@ -210,7 +214,7 @@ Deno.test({
         pathSegments: ["test.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertEquals(result, null, "Should return null for book without baseUrl");
     } finally {
       // Restore original method
@@ -243,7 +247,7 @@ Deno.test({
         pathSegments: ["folder", "subfolder", "test file.pdf"],
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(
         result,
         "Should return a URL for valid book with multiple parts"
@@ -286,7 +290,7 @@ Deno.test({
         pathSegments: ["Doktor+Irwin.pdf"], // Plus signs should be handled correctly
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(result, "Should return a URL");
       // The + should be converted to space, then back to %20 encoding
       assert(
@@ -385,7 +389,7 @@ Deno.test({
         pathSegments: ["ทดสอบ.pdf"], // Thai characters that need encoding
       };
 
-      const result = await BookData.getContentUrl(params);
+      const result = await getContentUrl(params);
       assertExists(result, "Should return a URL with encoded Unicode");
       assert(
         result.includes("%"),
@@ -418,7 +422,7 @@ Deno.test({
         [".."], // the folder's parent
         ["."], // the folder itself
       ]) {
-        const result = await BookData.getContentUrl({
+        const result = await getContentUrl({
           bucket: "upload",
           bookid: "validBookId",
           pathSegments,
@@ -446,7 +450,7 @@ Deno.test({
         [["my..book.pdf"], "/Book+Title/my..book.pdf"],
         [["...", "x.mp3"], "/Book+Title/.../x.mp3"],
       ] as [string[], string][]) {
-        const result = await BookData.getContentUrl({
+        const result = await getContentUrl({
           bucket: "upload",
           bookid: "validBookId",
           pathSegments,

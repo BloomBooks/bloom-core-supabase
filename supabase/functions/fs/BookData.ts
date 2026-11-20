@@ -7,32 +7,42 @@ export interface ContentUrlParams {
   pathSegments: string[];
 }
 
-// The bucket names accepted in fs URLs, mapped to the real S3 bucket and the
-// Parse environment whose book records point into it.
+// The bucket names accepted in fs URLs, mapped to the real S3 bucket, the
+// Parse environment whose book records point into it, and whether the
+// harvester (rather than an upload) writes its files.
 const kBuckets = new Map<
   string,
-  { s3Bucket: string; environment: Environment }
+  { s3Bucket: string; environment: Environment; harvested: boolean }
 >([
-  ["upload", { s3Bucket: "BloomLibraryBooks", environment: Environment.PRODUCTION }],
-  ["dev-upload", { s3Bucket: "BloomLibraryBooks-Sandbox", environment: Environment.DEVELOPMENT }],
-  ["harvest", { s3Bucket: "bloomharvest", environment: Environment.PRODUCTION }],
-  ["dev-harvest", { s3Bucket: "bloomharvest-sandbox", environment: Environment.DEVELOPMENT }],
+  ["upload", { s3Bucket: "BloomLibraryBooks", environment: Environment.PRODUCTION, harvested: false }],
+  ["dev-upload", { s3Bucket: "BloomLibraryBooks-Sandbox", environment: Environment.DEVELOPMENT, harvested: false }],
+  ["harvest", { s3Bucket: "bloomharvest", environment: Environment.PRODUCTION, harvested: true }],
+  ["dev-harvest", { s3Bucket: "bloomharvest-sandbox", environment: Environment.DEVELOPMENT, harvested: true }],
 ]);
 
 export function isValidBucket(bucketKey: string): boolean {
   return kBuckets.has(bucketKey);
 }
 
+export interface Content {
+  // The file's S3 URL.
+  url: string;
+  // The time (epoch ms) the files in this bucket last changed, when they are
+  // final; otherwise null. See fileVersion.
+  version: number | null;
+}
+
 export default class BookData {
-  // Get the real URL for the content based on the input URL parameters.
-  public static async getContentUrl(
+  // The real URL for the content based on the input URL parameters, and the
+  // version of the files it is in.
+  public static async getContent(
     params: ContentUrlParams
-  ): Promise<string | null> {
+  ): Promise<Content | null> {
     const bucketInfo = kBuckets.get(params.bucket);
     if (!bucketInfo) {
       return null;
     }
-    const { s3Bucket, environment } = bucketInfo;
+    const { s3Bucket, environment, harvested } = bucketInfo;
 
     const parseServer = new BloomParseServer(environment);
     const bookInfo: Book | undefined = await parseServer.getBookByDatabaseId(
@@ -52,8 +62,27 @@ export default class BookData {
       }
     }
 
-    return isInsideFolder(url, bookFolder) ? url : null;
+    return isInsideFolder(url, bookFolder)
+      ? { url, version: fileVersion(bookInfo, harvested) }
+      : null;
   }
+}
+
+// The version of a book's files in a bucket: the time (epoch ms) they last
+// changed, or null if they may still be changing (or we can't tell). The
+// routing worker caches a file under this version, so it must name final
+// bytes.
+// - Uploaded files: lastUploaded. Each upload writes a new folder, and the
+//   record moves to it (baseUrl) in the same write that sets lastUploaded.
+// - Harvested files: harvestStartedAt, which the harvester sets *before*
+//   rewriting them in the same folder, so only once harvestState is Done.
+function fileVersion(book: Book, harvested: boolean): number | null {
+  if (harvested && book.harvestState !== "Done") {
+    return null;
+  }
+  const changed = harvested ? book.harvestStartedAt : book.lastUploaded;
+  const time = changed?.iso ? Date.parse(changed.iso) : NaN;
+  return Number.isFinite(time) ? time : null;
 }
 
 // SECURITY: a segment can still be ".." once encodeUnicode has decoded it a
