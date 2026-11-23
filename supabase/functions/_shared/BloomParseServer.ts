@@ -20,6 +20,10 @@ export type Book = {
   inCirculation: boolean;
   ACL: Record<string, any>;
   harvestState: string;
+  // Parse dates. Absent on records that never got that far (e.g. a book
+  // that was never harvested).
+  harvestStartedAt?: { iso: string };
+  lastUploaded?: { iso: string };
 };
 
 export default class BloomParseServer {

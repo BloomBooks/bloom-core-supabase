@@ -321,6 +321,17 @@ same daily 22:30 UTC schedule — but the port changed several things:
   Mitigate with byte-level diffing of old vs. new output across a matrix of
   `lang`/`tag`/`epub`/`src` parameters before cutover.
 - Needs `BLOOM_PARSE_CATALOG_SERVICE_PASSWORD` (+ unit-test API-account id for tests).
+- **Egress — a cutover prerequisite** (see [§4 Supabase egress and invocation budget](#supabase-egress-and-invocation-budget)).
+  OPDS is the riskiest remaining function for egress. Its responses average **~370 KB**, it
+  served 3.8 GB in 30 days (worst day 1.2 GB, a crawl on 2026-10-21), and its traffic is mostly
+  automated (headless Chrome, `curl`, crawlers). A crawler at one request per second would add
+  ~30 GB/day of Supabase egress, the same shape as the October `fs` overage. Before cutover,
+  put at least one of these in place:
+  - stop writing the API key into the feed's links, so the worker can cache **one shared copy**
+    of each feed at the edge (with the key in every link, the cache has to be per key and only
+    helps repeat fetches by the same client);
+  - edge caching of feed responses in the worker (short TTL; cache only 200s);
+  - rate limiting, and/or requiring an API account for every request.
 
 ### Phase 5 — `stats` (read-only, adds the Postgres dependency)
 - Calls stored procedures in the analytics Postgres DB (read-only user), sometimes seeding a
@@ -333,6 +344,12 @@ same daily 22:30 UTC schedule — but the port changed several things:
 - Note: `stats/events.ts` builds some SQL by string interpolation with only a crude injection
   guard — fix that (parameterized queries) during the port rather than copying it.
 - Consumed by blorg's book-stats UI; low write risk, moderate visibility.
+- **Invocations, not egress, are the budget to watch** (see
+  [§4](#supabase-egress-and-invocation-budget)). `stats` is tiny in bytes (0.6 GB in 30 days) but
+  is the busiest endpoint: ~742k requests in 30 days, about a third of them CORS preflights
+  (`OPTIONS /v1/stats/reading/book`, ~9k/day, from Bloom Player's reading events). Before cutover,
+  have the worker answer CORS preflights for migrated functions itself, so they never reach (and
+  are never billed by) Supabase.
 
 ### Phase 6 — `dailyTimer` (small, but first *writing* function) ✅ done
 - One job: call `common.refresh_materialized_views()` in the analytics Postgres as the admin
@@ -404,6 +421,15 @@ same daily 22:30 UTC schedule — but the port changed several things:
   can't be patched, so the API contract (including error shapes and `Operation-Location`
   headers) must be preserved exactly.
 - Migrate `books` GET (blorg queries) first behind its own Cloudflare rule, then uploads.
+- **Egress** (see [§4](#supabase-egress-and-invocation-budget)):
+  - `books` GET returned 1.6 GB in 30 days (avg ~10 KB, worst day 0.39 GB), but a query can ask
+    for a large result set. Cap the result size in the function, consider a short edge cache for
+    common unauthenticated queries, and include it in rate limiting.
+  - **Book files must never pass through a function.** Today Bloom Desktop uploads straight to S3
+    with STS temporary credentials, and upload-finish uses server-side S3 copies. Whatever replaces
+    the durable orchestration must keep it that way: a function that downloads book files (for
+    hash diffing, say) and re-uploads or returns them turns every upload into Supabase egress.
+    Do any byte-heavy step client-side, in S3 itself, or outside Supabase.
 
 ### Decommission
 When Azure traffic is zero (verify via Azure metrics/logs over ≥30 days, remembering monthly
@@ -446,6 +472,48 @@ api-spec, host/deploy config, READMEs — has been ported here or superseded):
   the Azure app deployed and warm until the very end.
 - **Monitoring:** decide per-phase how we'll know it broke — Supabase function logs/metrics at
   minimum; consider forwarding errors to whatever alerting the team already watches.
+
+### Supabase egress and invocation budget
+
+We exceeded the Supabase egress quota in October 2026 (see Phase 0): every byte an edge function
+returns counts as uncached egress, and `fs` streamed book files. Every phase from here moves more
+responses onto that same quota, so each one gets an egress check before cutover.
+
+**The quotas are per organization.** The staging and production projects draw on the same egress
+and invocation allowances, so traffic to `staging-api.bloomlibrary.org` (or straight to the
+staging project) counts too.
+
+**Measured load of what is left to migrate** (Cloudflare zone analytics, 30 days, 2026-10-06 to
+11-04; bytes as delivered, i.e. compressed — Supabase compresses function responses and the
+worker's requests accept compression, so this approximates what Supabase would bill):
+
+| Function | Requests / 30 d | Bytes / 30 d | Avg response | Worst day | Risk |
+| --- | --- | --- | --- | --- | --- |
+| `opds` (Phase 4) | 10,388 | 3.8 GB | ~370 KB | 1.2 GB | **High**: large responses, mostly crawled |
+| `books` (Phase 8) | 148,195 | 1.6 GB | ~10 KB | 0.39 GB | Medium: unbounded result sets |
+| `stats` (Phase 5) | 742,437 | 0.6 GB | <1 KB | 0.04 GB | Low bytes, **high invocations** |
+| `status` (Phase 8) | 39,298 | 0.03 GB | <1 KB | — | Low |
+| `social`, `subscriptionInfo` (Phases 1–2) | ~16,400 | ~0 | ~1 KB | — | Low |
+| `fs` (done) | 108,556 | ~0 from Supabase | — | was 106 GB | Fixed: the worker carries the bytes |
+
+Ordinary use of everything migrated is ~6 GB/month. Crawlers are the risk, not ordinary use.
+
+**Rules for every phase:**
+1. **Egress check before cutover:** average response size × the worst plausible request rate
+   (a crawler, not today's average). A function whose responses are large or crawlable needs an
+   edge cache in the worker, a hand-off of the bytes to the worker (as `fs` does), or rate
+   limiting before it goes live.
+2. **Never stream files through a function.** Files go from S3 to the client via the worker, and
+   from the client to S3 directly (STS). Functions only return small JSON, XML or redirects.
+3. **Answer CORS preflights in the worker**, not in the function: they are ~9k requests/day for
+   `stats` alone, and each one is a billed invocation.
+4. **Watch invocations, not just egress.** With everything migrated we'd run ~1.05M
+   invocations/month (`stats` 742k, `books` 148k, `fs` 108k, `status` 39k), about half the
+   Pro allowance. Direct calls to a function's Supabase URL are invocations even when they get 401.
+5. **Supabase log drains** (a possible follow-up for monitoring) are billed per drain and for the
+   data they ship; check the price and filter the drain before enabling one.
+6. After each cutover, compare the Supabase usage page's daily egress and invocations with the
+   numbers above for a week.
 
 ---
 

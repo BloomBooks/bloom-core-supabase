@@ -30,7 +30,7 @@
  * carries them without egress fees. fs only answers requests carrying the
  * BLOOM_WORKER_SECRET this worker adds (see supabaseHeaders). The function
  * and this worker must therefore be deployed together (worker first; see
- * README.md).
+ * README.md). Files whose version fs reports are cached here (see handleFs).
  */
 
 // Function names that have been migrated to Supabase.
@@ -159,9 +159,145 @@ function supabaseHeaders(publicUrl, env) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Caching fs files
+//
+// fs tells us the version of the file it found (X-Bloom-File-Version): the
+// time (epoch ms) the book's files in that bucket last changed, sent only once
+// they are final (see fileVersion in supabase/functions/fs/BookData.ts). We
+// cache the file from S3 under that version for a year, for every client: a
+// new version is a new cache entry, so nobody gets stale bytes. fs itself is
+// still asked on every request, so a new upload or harvest, or a deleted book,
+// takes effect at once.
+//
+// Clients may also put the version in the URL, so that browsers can keep the
+// file too (Cache-Control: immutable):
+//   /v1/fs/{bucket}/{bookId}/{path}?v={epochMs}   single files
+//   /v1/fs/{bucket}/{bookId}@{epochMs}/{path}     read-online, so the relative
+//                                                 links inside the book keep it
+// ("@" never occurs in a Parse id.) We strip it before asking fs. It only
+// counts when it matches fs's version; it never decides what is cached.
+//
+// A download button adds download=1 (also stripped): the response is then
+// saved, under the file's real name (see downloadDisposition), rather than
+// whatever S3's headers would make the browser do.
+// ---------------------------------------------------------------------------
+
+const VERSION_DIGITS = "\\d{1,16}";
+const VERSION_PATTERN = new RegExp(`^${VERSION_DIGITS}$`);
+// The book id segment of the path form; the "@" may arrive percent-encoded.
+const VERSIONED_BOOK_SEGMENT = new RegExp(`^(.+?)(?:@|%40)(${VERSION_DIGITS})$`, "i");
+const ONE_YEAR_SECONDS = 31536000;
+
+// Splits our own parameters out of an fs request. `fsPath` is the part of the
+// public path after /v1/fs (/{bucket}/{bookId}/{path...}) and `search` the
+// request's query string. Returns the version (null when unversioned),
+// whether the client asked for a download (download=1), and the path and
+// query to send the fs function, without those. A path-form version wins over
+// a v= in the query. An "@" or v= that isn't a valid version is left in
+// place, so fs answers that request as it always has.
+function parseFsRequest(fsPath, search) {
+  const segments = fsPath.split("/");
+  // segments: ["", bucket, bookId, ...path]
+  const pathMatch =
+    segments.length > 3 ? VERSIONED_BOOK_SEGMENT.exec(segments[2]) : null;
+  const params = new URLSearchParams(search);
+  const queryVersion = params.get("v") ?? "";
+  const download = params.get("download") === "1";
+
+  let version = null;
+  if (pathMatch) {
+    version = pathMatch[2];
+    segments[2] = pathMatch[1];
+  } else if (VERSION_PATTERN.test(queryVersion)) {
+    version = queryVersion;
+  }
+  if (version === null && !download) {
+    return { version, download, fnPath: fsPath, fnSearch: search };
+  }
+  if (version !== null) {
+    params.delete("v");
+  }
+  if (download) {
+    params.delete("download");
+  }
+  const rest = params.toString();
+  return {
+    version,
+    download,
+    fnPath: segments.join("/"),
+    fnSearch: rest ? `?${rest}` : "",
+  };
+}
+
+// How Cloudflare caches an S3 file whose version fs reported: everything,
+// whatever its type, for a year, but only successes. A 404 (say, a file
+// requested before it was uploaded) must not stick.
+const VERSIONED_S3_CACHE = {
+  cacheEverything: true,
+  cacheTtlByStatus: { "200-299": ONE_YEAR_SECONDS, "300-599": -1 },
+};
+
+// Content-Disposition naming a download after the file's real name, so titles
+// containing "+" or "%" keep them. The name comes from the S3 URL the fs
+// function resolved, whose last segment is the URL-encoded name of the S3
+// object; the public URL's encoding is fs's business.
+function downloadDisposition(location) {
+  let name;
+  try {
+    name = decodeURIComponent(new URL(location).pathname.split("/").pop());
+  } catch {
+    return null;
+  }
+  if (!name) {
+    return null;
+  }
+  // filename= for old clients (printable ASCII, no quotes or backslashes);
+  // filename* (RFC 5987/6266) carries the exact UTF-8 name.
+  const fallback = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  const encoded = encodeURIComponent(name).replace(
+    /['()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+// Special caching rule for harvest thumbnails
+// see https://docs.google.com/document/d/1Vub0SeQL6BQqyGoQBN6-cfi6AIRbcBHeV87KjnzZXDU/edit
+// `fnPath` is /{bucket}/{bookid}/{path...}. The function has already rejected
+// malformed percent-encoding, so decoding here can't throw.
+function isHarvestThumbnail(fnPath) {
+  const [bucket, , firstPathSegment] = fnPath
+    .split("/")
+    .filter((segment) => segment !== "")
+    .map(decodeURIComponent);
+  return (
+    ["harvest", "dev-harvest"].includes(bucket?.toLowerCase()) &&
+    firstPathSegment?.toLowerCase() === "thumbnails"
+  );
+}
+
+// The Cache-Control for a file response, or null to keep S3's.
+// - The URL names the version of the file it gets: browsers may keep it.
+// - Harvest thumbnails: a year, as always.
+// - Otherwise, a file that came through Cloudflare's cache may carry a
+//   Cache-Control Cloudflare made up (the zone's browser TTL), not S3's.
+//   The URL doesn't name a version, so browsers must check back: a new
+//   upload has to show.
+function cacheControlFor(fs, fileVersion) {
+  if (fileVersion !== null && fs.version === fileVersion) {
+    return `public, max-age=${ONE_YEAR_SECONDS}, immutable`;
+  }
+  if (isHarvestThumbnail(fs.fnPath)) {
+    return `max-age=${ONE_YEAR_SECONDS}`;
+  }
+  return fileVersion !== null ? "no-cache" : null;
+}
+
 // fs: ask the function where the file is, then fetch it from S3 ourselves.
-// `fsPath` is the part of the public path after /v1/fs.
-async function handleFs(url, request, supabaseRequestHeaders, fsPath) {
+// `url` is the Supabase URL for the request, with any version already
+// removed; `fs` is what parseFsRequest made of the public URL.
+async function handleFs(url, request, supabaseRequestHeaders, fs) {
   // redirect: "manual" so we get the function's 302 rather than fetch
   // following it with all the client's headers.
   const fnResponse = await proxy(url, request, supabaseRequestHeaders, {
@@ -171,13 +307,16 @@ async function handleFs(url, request, supabaseRequestHeaders, fsPath) {
     // OPTIONS preflights, 400/401/404/405/500 and our own 502: already final.
     return fnResponse;
   }
-
-  const cors = corsHeadersFrom(fnResponse);
   const location = fnResponse.headers.get("location");
+  const cors = corsHeadersFrom(fnResponse);
   if (!location || !isAllowedS3Url(location)) {
     console.error(`fs redirected somewhere unexpected: ${location}`);
     return textResponse("Bad Gateway", 502, cors);
   }
+  // The version fs reported, or null if it reported none (or nonsense).
+  const reported = fnResponse.headers.get("x-bloom-file-version") ?? "";
+  const fileVersion = VERSION_PATTERN.test(reported) ? reported : null;
+  const cacheable = fileVersion !== null;
 
   const forwardHeaders = new Headers();
   for (const name of S3_FORWARD_HEADERS) {
@@ -187,13 +326,22 @@ async function handleFs(url, request, supabaseRequestHeaders, fsPath) {
     }
   }
 
+  // ?v= goes on the S3 URL: S3 ignores it, but it is part of Cloudflare's
+  // cache key, so each version of a file gets its own cache entry. (A custom
+  // cf.cacheKey would need an Enterprise plan.)
+  const s3Url = new URL(location);
+  if (cacheable) {
+    s3Url.searchParams.set("v", fileVersion);
+  }
+
   let s3Response;
   try {
-    // Preserve GET vs HEAD (the function only redirects those two).
-    s3Response = await fetch(location, {
+    s3Response = await fetch(s3Url.toString(), {
+      // Preserve GET vs HEAD (the function only redirects those two).
       method: request.method,
       headers: forwardHeaders,
       redirect: "manual",
+      cf: cacheable ? VERSIONED_S3_CACHE : undefined,
     });
   } catch (err) {
     console.error(`Error fetching from S3: ${err.message}`);
@@ -215,19 +363,18 @@ async function handleFs(url, request, supabaseRequestHeaders, fsPath) {
     }
   });
 
-  // Special caching rule for harvest thumbnails
-  // see https://docs.google.com/document/d/1Vub0SeQL6BQqyGoQBN6-cfi6AIRbcBHeV87KjnzZXDU/edit
-  // fsPath is /{bucket}/{bookid}/{path...}; the function has already
-  // rejected malformed percent-encoding, so decoding here can't throw.
-  const [bucket, , firstPathSegment] = fsPath
-    .split("/")
-    .filter((segment) => segment !== "")
-    .map(decodeURIComponent);
-  if (
-    ["harvest", "dev-harvest"].includes(bucket?.toLowerCase()) &&
-    firstPathSegment?.toLowerCase() === "thumbnails"
-  ) {
-    headers.set("Cache-Control", "max-age=31536000");
+  const cacheControl = cacheControlFor(fs, fileVersion);
+  if (cacheControl) {
+    headers.set("Cache-Control", cacheControl);
+  }
+  if (cacheable) {
+    // The age of the cached copy, which can approach a year; it would only
+    // shorten how long a browser may keep an immutable file.
+    headers.delete("Age");
+  }
+  const disposition = fs.download && downloadDisposition(location);
+  if (disposition) {
+    headers.set("Content-Disposition", disposition);
   }
 
   // Vary is appended rather than set so an existing Vary from S3 (e.g.
@@ -260,11 +407,16 @@ export default {
     if (match && SUPABASE_FUNCTIONS.has(match[1])) {
       // Migrated: rewrite https://<host>/v1/<fn>/<rest>?<query>
       //     to https://<project>.supabase.co/functions/v1/<fn>/<rest>?<query>
+      // For fs, <rest> and <query> lose any version first: the function
+      // doesn't know about versions and would take "id@version" for the id.
+      const rest = match[2] ?? "";
+      const fs = match[1] === "fs" ? parseFsRequest(rest, url.search) : null;
       url.hostname = env.SUPABASE_FUNCTIONS_HOST;
-      url.pathname = `/functions/v1/${match[1]}${match[2] ?? ""}`;
+      url.pathname = `/functions/v1/${match[1]}${fs ? fs.fnPath : rest}`;
       const headers = supabaseHeaders(publicUrl, env);
-      if (match[1] === "fs") {
-        return handleFs(url, request, headers, match[2] ?? "");
+      if (fs) {
+        url.search = fs.fnSearch;
+        return handleFs(url, request, headers, fs);
       }
       return proxy(url, request, headers);
     }

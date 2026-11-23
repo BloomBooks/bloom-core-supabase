@@ -1,4 +1,8 @@
-import BookData, { ContentUrlParams, isValidBucket } from "./BookData.ts";
+import BookData, {
+  Content,
+  ContentUrlParams,
+  isValidBucket,
+} from "./BookData.ts";
 import { getCorsHeaders, secretsMatch } from "../_shared/utils.ts";
 
 // Resolves a request for a file in a book to its S3 URL without the caller
@@ -89,10 +93,10 @@ export async function handleFsRequest(req: Request): Promise<Response> {
   }
 
   // decodeURIComponent throws URIError on malformed percent-encoding (e.g. a
-  // lone "%"); that is a client error, not a server crash. getContentUrl can
+  // lone "%"); that is a client error, not a server crash. getContent can
   // hit the same thing when it re-encodes path segments.
   let params: ContentUrlParams;
-  let urlArtifact: string | null;
+  let content: Content | null;
   try {
     params = {
       bucket: decodeURIComponent(segments[0]),
@@ -107,7 +111,7 @@ export async function handleFsRequest(req: Request): Promise<Response> {
       });
     }
 
-    urlArtifact = await BookData.getContentUrl(params);
+    content = await BookData.getContent(params);
   } catch (error) {
     if (error instanceof URIError) {
       return respond("Bad Request: malformed percent-encoding in URL", {
@@ -125,7 +129,7 @@ export async function handleFsRequest(req: Request): Promise<Response> {
     });
   }
 
-  if (!urlArtifact) {
+  if (!content) {
     // The bucket was valid, so the book id didn't resolve to a book with content.
     return respond("Not Found", {
       status: 404,
@@ -144,22 +148,30 @@ export async function handleFsRequest(req: Request): Promise<Response> {
   // used to live here. It copies our CORS headers from this response, so
   // getCorsHeaders stays the single source of truth for them.
   //
-  // The start of urlArtifact is the book's raw baseUrl from Parse, which can
+  // The start of content.url is the book's raw baseUrl from Parse, which can
   // hold unencoded non-ASCII (e.g. a title). fetch() used to percent-encode
   // that for us; a header value can't carry it, so let the URL parser apply
   // the same encoding fetch did. Existing %xx escapes and "+" are kept.
   let location: string;
   try {
-    location = new URL(urlArtifact).href;
+    location = new URL(content.url).href;
   } catch (error) {
-    console.error("Error in fs function: bad S3 URL", urlArtifact, error);
+    console.error("Error in fs function: bad S3 URL", content.url, error);
     return respond("Internal Server Error", {
       status: 500,
       statusText: "Internal Server Error",
     });
   }
-  return respond(null, {
-    status: 302,
-    headers: { Location: location },
-  });
+  // X-Bloom-File-Version tells the worker which version of the file this is,
+  // so it can cache the file under it (see fileVersion). Without it, the
+  // worker doesn't cache the file. This response itself must never be cached:
+  // it carries the S3 address.
+  const headers: Record<string, string> = {
+    Location: location,
+    "Cache-Control": "private, no-store",
+  };
+  if (content.version !== null) {
+    headers["X-Bloom-File-Version"] = String(content.version);
+  }
+  return respond(null, { status: 302, headers });
 }
